@@ -53,7 +53,7 @@ Localhost-only ports:
 Clone the repo:
 
 ```bash
-git clone <your-repo-url> dune-docker-lab
+git clone <[your-repo-url](https://github.com/Red-Blink/dune-awakening-selfhost-docker)> dune-docker-lab
 cd dune-docker-lab
 ```
 
