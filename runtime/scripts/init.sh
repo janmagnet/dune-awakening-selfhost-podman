@@ -10,13 +10,7 @@ require_docker_prereqs() {
     echo "Docker is required but was not found in PATH."
     echo
     echo "Install Docker Engine and Docker Compose first, then run:"
-    echo "  https://docs.docker.com/engine/install/"
-    echo "  https://docs.docker.com/compose/install/"
-    echo
-    echo "On Ubuntu, Docker Compose is usually installed as the Docker Compose plugin."
-    echo "After installation, verify:"
-    echo "  docker --version"
-    echo "  docker compose version"
+    echo '  sudo apt-get update && sudo apt-get install -y ca-certificates curl && sudo install -m 0755 -d /etc/apt/keyrings && sudo curl -fsSL https://download.docker.com/linux/$(. /etc/os-release && echo "$ID")/gpg -o /etc/apt/keyrings/docker.asc && sudo chmod a+r /etc/apt/keyrings/docker.asc && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null && sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && sudo systemctl enable --now docker && docker --version && docker compose version'
     echo
     echo "Then run:"
     echo "  dune init"
