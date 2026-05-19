@@ -9,8 +9,6 @@
 
 A RedBlink community project for running Dune: Awakening self-host servers with Docker.
 
-Docker-based launcher for Dune: Awakening self-host servers.
-
 This project provides a simple `dune` command and an interactive manager for running a self-host server without remembering every script.
 
 This is an unofficial community project. It is not affiliated with, endorsed by, sponsored by, or supported by Funcom.
@@ -42,7 +40,25 @@ cd dune-awakening-selfhost-docker
 sudo runtime/scripts/install-command.sh
 ```
 
-Start with the friendly menu:
+Start by deploying the stack and creating the local world:
+
+```bash
+dune init
+```
+
+`dune init` is the first step. It creates the local config, saves your Funcom token, generates the battlegroup ID, deploys the stack, applies the database/world setup, and starts the services.
+
+If `dune init` says `docker: command not found`, install Docker Engine first.
+
+If Docker is installed but `dune init` says the Docker daemon is not reachable, make sure Docker is running and that your user can access it:
+
+```bash
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+After `dune init` finishes, use the friendly menu:
 
 ```bash
 dune manager
@@ -63,13 +79,7 @@ When starting or restarting from the manager, the configured player-facing IP is
 
 Manager menus use a colored `[X]` selector in interactive terminals. Use Up and Down to move, Enter to select, and the explicit Back items to return. Ctrl+C exits normal menu screens cleanly; inside an input prompt it cancels the current action without saving changes. Plain numbered menus are used automatically when the terminal is not interactive.
 
-Or run first-time setup directly:
-
-```bash
-dune init
-```
-
-`dune init` creates a fresh local world. Running it again resets the local database/world after backing up local state.
+Running `dune init` again later resets the local database/world after backing up local state.
 
 ## Public vs Local/LAN
 

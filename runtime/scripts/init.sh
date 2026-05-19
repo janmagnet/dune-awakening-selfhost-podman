@@ -5,6 +5,27 @@ cd "$(dirname "$0")/../.."
 
 mkdir -p runtime/secrets runtime/generated
 
+require_docker_prereqs() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker is required but was not found in PATH."
+    echo
+    echo "Install Docker Engine first, then run:"
+    echo "  dune init"
+    exit 1
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    echo "Docker is installed, but the Docker daemon is not reachable."
+    echo
+    echo "Make sure Docker is running and that your user can access it."
+    echo "Common fixes:"
+    echo "  sudo systemctl enable --now docker"
+    echo "  sudo usermod -aG docker \$USER"
+    echo "  newgrp docker"
+    exit 1
+  fi
+}
+
 prompt_default() {
   local prompt="$1"
   local default="$2"
@@ -210,6 +231,7 @@ echo "Important: dune init creates a fresh local world and resets the local Post
 echo "Existing local config/state is backed up first, but players should treat this as a reset."
 echo
 
+require_docker_prereqs
 check_running_stack
 confirm_overwrite
 
