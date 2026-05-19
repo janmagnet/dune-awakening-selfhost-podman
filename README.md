@@ -70,9 +70,9 @@ The manager is organized around the main jobs most hosts need:
 | Menu | What It Does |
 |---|---|
 | Battlegroup Overview | Status, readiness, version, containers, and ports |
-| Battlegroup Settings | Battlegroup name, Start, Stop, Restart, Redeploy, dynamic maps, autoscaler, database maintenance, and current config |
+| Battlegroup Settings | Battlegroup name, Start, Stop, Restart, Scheduled Restart, Redeploy, dynamic maps, autoscaler, database maintenance, and current config |
 | Sietches | Map list, current map memory usage, and supported map settings |
-| Updates | Manual and automatic update controls |
+| Updates | Installed versions, stack update checks, game server update checks, and automatic game updates |
 | Logs | Redacted logs for the main services |
 | Advanced Tools | Diagnostics and safe low-level details |
 
@@ -153,6 +153,8 @@ dune logs director --raw
 ## Updates
 
 ```bash
+dune self-update check
+dune self-update install latest
 dune update check
 dune update
 dune update --yes
@@ -161,7 +163,7 @@ dune update auto disable
 dune update auto status
 ```
 
-Automatic updates use a systemd timer when systemd is available.
+`dune self-update` is for this self-host stack itself. `dune update` is for Funcom game server files and images. Automatic updates apply only to game server updates and use a systemd timer when systemd is available.
 
 ## Autoscaler And Dynamic Maps
 

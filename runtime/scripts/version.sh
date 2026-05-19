@@ -69,7 +69,7 @@ if [ -z "$SERVER_MODE_VALUE" ] || [ "$SERVER_MODE_VALUE" = "unknown" ]; then
   fi
 fi
 
-echo "=== Dune launcher version ==="
+echo "=== Self-Host Stack Version ==="
 printf "%-18s %s\n" "Project version:" "$PROJECT_VERSION"
 printf "%-18s %s\n" "Git branch:" "$GIT_BRANCH"
 printf "%-18s %s\n" "Git commit:" "$GIT_COMMIT"

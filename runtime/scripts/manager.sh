@@ -1105,13 +1105,14 @@ battlegroup_overview_menu() {
 }
 
 battlegroup_settings_menu() {
-  local choice
+  local choice restart_hours
   while true; do
     menu_or_back "Battlegroup Settings" \
       "Change Name" \
       "Start" \
       "Stop" \
       "Restart" \
+      "Scheduled Restart" \
       "Redeploy" \
       "Dynamic Maps And Autoscaler" \
       "Database Maintenance" \
@@ -1163,11 +1164,45 @@ battlegroup_settings_menu() {
         fi
         pause
         ;;
-      5) redeploy_battlegroup_flow; pause ;;
-      6) dynamic_maps_menu ;;
-      7) database_maintenance_menu ;;
-      8) show_config_summary; pause ;;
-      9) return ;;
+      5)
+        while true; do
+          menu_or_back "Scheduled Restart" \
+            "Status" \
+            "Enable" \
+            "Disable" \
+            "Back" || break
+          choice="$MENU_CHOICE"
+
+          case "$choice" in
+            1) run_cmd "$DUNE" restart-schedule status; pause ;;
+            2)
+              echo
+              prompt_positive_integer "Restart Every How Many Hours:" restart_hours "Hours must be a positive integer." || { pause; continue; }
+              if confirm "Enable scheduled restart every $restart_hours hour(s)?"; then
+                run_cmd "$DUNE" restart-schedule enable "$restart_hours"
+              else
+                echo "Cancelled."
+              fi
+              pause
+              ;;
+            3)
+              echo
+              if confirm "Disable scheduled restart?"; then
+                run_cmd "$DUNE" restart-schedule disable
+              else
+                echo "Cancelled."
+              fi
+              pause
+              ;;
+            4) break ;;
+          esac
+        done
+        ;;
+      6) redeploy_battlegroup_flow; pause ;;
+      7) dynamic_maps_menu ;;
+      8) database_maintenance_menu ;;
+      9) show_config_summary; pause ;;
+      10) return ;;
     esac
   done
 }
@@ -1392,24 +1427,73 @@ edit_dedicated_scaling_menu() {
 }
 
 updates_menu() {
-  local choice
+  local choice rc
   while true; do
     menu_or_back "Updates" \
-      "Check Update" \
-      "Apply Update" \
-      "Enable Automatic Updates" \
-      "Disable Automatic Updates" \
-      "Automatic Update Status" \
+      "Show Installed Versions" \
+      "Check Stack Update" \
+      "Check Game Server Update" \
+      "Automatic Updates" \
       "Back" || return
     choice="$MENU_CHOICE"
 
     case "$choice" in
-      1) run_cmd "$DUNE" update check; pause ;;
-      2) run_cmd "$DUNE" update; pause ;;
-      3) run_cmd "$DUNE" update auto enable; pause ;;
-      4) run_cmd "$DUNE" update auto disable; pause ;;
-      5) run_cmd "$DUNE" update auto status; pause ;;
-      6) return ;;
+      1) run_cmd "$DUNE" version; pause ;;
+      2)
+        echo
+        set +e
+        "$DUNE" self-update check
+        rc=$?
+        set -e
+        if [ "$rc" -eq 100 ]; then
+          echo
+          if confirm "Install the latest stack version now?"; then
+            run_cmd "$DUNE" self-update install latest
+          fi
+        elif [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+          echo
+          echo "Command exited with status $rc."
+        fi
+        pause
+        ;;
+      3)
+        echo
+        set +e
+        "$DUNE" update check
+        rc=$?
+        set -e
+        if [ "$rc" -eq 100 ]; then
+          echo
+          if confirm "Install the latest game server update now?"; then
+            run_cmd "$DUNE" update
+          fi
+        elif [ "$rc" -ne 0 ]; then
+          echo
+          echo "Command exited with status $rc."
+        fi
+        pause
+        ;;
+      4) automatic_updates_menu ;;
+      5) return ;;
+    esac
+  done
+}
+
+automatic_updates_menu() {
+  local choice
+  while true; do
+    menu_or_back "Automatic Updates" \
+      "Status" \
+      "Enable" \
+      "Disable" \
+      "Back" || return
+    choice="$MENU_CHOICE"
+
+    case "$choice" in
+      1) run_cmd "$DUNE" update auto status; pause ;;
+      2) run_cmd "$DUNE" update auto enable; pause ;;
+      3) run_cmd "$DUNE" update auto disable; pause ;;
+      4) return ;;
     esac
   done
 }

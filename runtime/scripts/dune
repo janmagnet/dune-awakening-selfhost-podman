@@ -108,6 +108,16 @@ case "$cmd" in
     runtime/scripts/update.sh "$@"
     ;;
 
+  self-update|stack-update)
+    shift || true
+    runtime/scripts/self-update.sh "$@"
+    ;;
+
+  restart-schedule)
+    shift || true
+    runtime/scripts/restart-schedule.sh "$@"
+    ;;
+
   version)
     runtime/scripts/version.sh
     ;;
@@ -156,6 +166,8 @@ Usage:
   runtime/scripts/dune logs <service> [--raw]
   runtime/scripts/dune restart <service>
   runtime/scripts/dune update [check|auto enable|auto disable|auto status|--yes]
+  runtime/scripts/dune self-update [check|install [latest|<tag>]]
+  runtime/scripts/dune restart-schedule [enable <hours>|disable|status]
   runtime/scripts/dune db backup [output-dir]
   runtime/scripts/dune db list
   runtime/scripts/dune db status
