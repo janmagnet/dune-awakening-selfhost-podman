@@ -9,7 +9,16 @@ require_docker_prereqs() {
   if ! command -v docker >/dev/null 2>&1; then
     echo "Docker is required but was not found in PATH."
     echo
-    echo "Install Docker Engine first, then run:"
+    echo "Install Docker Engine and Docker Compose first, then run:"
+    echo "  https://docs.docker.com/engine/install/"
+    echo "  https://docs.docker.com/compose/install/"
+    echo
+    echo "On Ubuntu, Docker Compose is usually installed as the Docker Compose plugin."
+    echo "After installation, verify:"
+    echo "  docker --version"
+    echo "  docker compose version"
+    echo
+    echo "Then run:"
     echo "  dune init"
     exit 1
   fi
