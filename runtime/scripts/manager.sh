@@ -5,6 +5,7 @@ cd "$(dirname "$0")/../.."
 
 DUNE="runtime/scripts/dune"
 USERSETTINGS_PY="runtime/scripts/usersettings.py"
+source runtime/scripts/runtime-env.sh
 MENU_INTERRUPTED=0
 ACTION_CANCELLED=0
 MENU_CHOICE=""
@@ -73,336 +74,9 @@ map_info_value() {
   "$DUNE" sietches show "$map" 2>/dev/null | awk -F': ' -v field="$field" '$1 == field { print $2; exit }'
 }
 
-declare -A USERSETTINGS_VALUES
-
-load_usersettings_values() {
-  local scope="$1"
-  shift
-  local rows=()
-  local row key value
-
-  USERSETTINGS_VALUES=()
-  case "$scope" in
-    engine)
-      mapfile -t rows < <(python3 "$USERSETTINGS_PY" engine-values 2>/dev/null || true)
-      ;;
-    map)
-      mapfile -t rows < <(python3 "$USERSETTINGS_PY" map-values "$1" 2>/dev/null || true)
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-
-  for row in "${rows[@]}"; do
-    IFS=$'\t' read -r key value <<< "$row"
-    [ -n "${key:-}" ] || continue
-    USERSETTINGS_VALUES["$key"]="$value"
-  done
-}
-
-usersettings_value() {
-  local key="$1"
-  printf '%s' "${USERSETTINGS_VALUES[$key]:-unknown}"
-}
-
-userengine_about_text() {
-  cat <<'EOF'
-Global UserEngine settings apply to every map and server in the battlegroup.
-These values are the battlegroup-wide baseline.
-Map-specific UserGame settings can customize gameplay for a single map,
-but this menu controls the global defaults used everywhere.
-EOF
-}
-
-usergame_about_text() {
-  local map="$1"
-  cat <<EOF
-UserGame settings for $map apply only to that map.
-These values override the default gameplay baseline for this specific map.
-Special maps may ignore settings that do not apply to their gameplay mode.
-EOF
-}
-
-edit_map_about_text() {
-  local map="$1"
-  cat <<EOF
-Map settings here apply only to $map.
-Memory, dimensions, and browser settings are map-specific.
-UserGame overrides change gameplay for this map and override the global UserEngine baseline where relevant.
-EOF
-}
-
-save_userengine_field() {
-  local field_id="$1"
-  local value="$2"
-  if run_cmd_status python3 "$USERSETTINGS_PY" engine-set "$field_id" "$value"; then
-    ok_msg "Global UserEngine setting updated."
-    info "Running map server containers keep the old values until they are restarted."
-  fi
-}
-
-save_usergame_field() {
-  local map="$1"
-  local field_id="$2"
-  local value="$3"
-  if run_cmd_status python3 "$USERSETTINGS_PY" map-set "$map" "$field_id" "$value"; then
-    ok_msg "Map-specific UserGame setting updated for $map."
-    info "Running containers for $map keep the old values until that map is restarted or respawned."
-  fi
-}
-
-choose_usersettings_boolean() {
-  local title="$1"
-  local current="$2"
-  local true_label="$3"
-  local false_label="$4"
-  local true_value="$5"
-  local false_value="$6"
-
-  MENU_CONTEXT_TEXT="Current value: $current"
-  menu_or_back "$title" \
-    "$true_label" \
-    "$false_label" \
-    "Back" || {
-      MENU_CONTEXT_TEXT=""
-      return 1
-    }
-  MENU_CONTEXT_TEXT=""
-
-  case "$MENU_CHOICE" in
-    1) CHOSEN_BOOL_VALUE="$true_value"; return 0 ;;
-    2) CHOSEN_BOOL_VALUE="$false_value"; return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-prompt_usersettings_number() {
-  local prompt="$1"
-  local kind="$2"
-  local __var_name="$3"
-  local entered_value=""
-
-  USERSETTINGS_INPUT_CANCELLED=0
-
-  while true; do
-    echo
-    prompt_text "$prompt Press Enter to go back, or type /back to cancel:" entered_value allow-empty || {
-      USERSETTINGS_INPUT_CANCELLED=1
-      return 0
-    }
-    entered_value="$(sanitize_numeric_prompt_value "$entered_value")"
-
-    if [ -z "$entered_value" ] || [ "$entered_value" = "/back" ]; then
-      info "No changes made."
-      USERSETTINGS_INPUT_CANCELLED=1
-      return 0
-    fi
-
-    case "$kind" in
-      float)
-        if printf '%s' "$entered_value" | grep -Eq '^(0|[1-9][0-9]*)(\.[0-9]+)?$'; then
-          printf -v "$__var_name" '%s' "$entered_value"
-          return 0
-        fi
-        error_msg "Enter a number like 0, 1, 1.0, or 10.5."
-        ;;
-      int)
-        if printf '%s' "$entered_value" | grep -Eq '^[0-9]+$'; then
-          printf -v "$__var_name" '%s' "$entered_value"
-          return 0
-        fi
-        error_msg "Enter digits only, like 0, 1, 6, or 10."
-        ;;
-      *)
-        error_msg "Unsupported numeric field type: $kind"
-        return 1
-        ;;
-    esac
-  done
-}
-
-edit_userengine_numeric_field() {
-  local field_id="$1"
-  local prompt="$2"
-  local kind="$3"
-  local max_dimensions=""
-
-  prompt_usersettings_number "$prompt" "$kind" value
-  if [ "${USERSETTINGS_INPUT_CANCELLED:-0}" -eq 1 ]; then
-    return
-  fi
-  save_userengine_field "$field_id" "$value"
-}
-
-edit_usergame_numeric_field() {
-  local map="$1"
-  local field_id="$2"
-  local prompt="$3"
-  local kind="$4"
-  local value=""
-
-  prompt_usersettings_number "$prompt" "$kind" value
-  if [ "${USERSETTINGS_INPUT_CANCELLED:-0}" -eq 1 ]; then
-    return
-  fi
-  save_usergame_field "$map" "$field_id" "$value"
-}
-
-edit_userengine_boolean_field() {
-  local field_id="$1"
-  local title="$2"
-  local true_label="$3"
-  local false_label="$4"
-  local true_value="$5"
-  local false_value="$6"
-  local current
-
-  current="$(usersettings_value "$field_id")"
-  echo
-  choose_usersettings_boolean "$title" "$current" "$true_label" "$false_label" "$true_value" "$false_value" || {
-    info "No changes made."
-    return
-  }
-  save_userengine_field "$field_id" "$CHOSEN_BOOL_VALUE"
-}
-
-edit_usergame_boolean_field() {
-  local map="$1"
-  local field_id="$2"
-  local title="$3"
-  local true_label="$4"
-  local false_label="$5"
-  local true_value="$6"
-  local false_value="$7"
-  local current
-
-  current="$(usersettings_value "$field_id")"
-  echo
-  choose_usersettings_boolean "$title" "$current" "$true_label" "$false_label" "$true_value" "$false_value" || {
-    info "No changes made."
-    return
-  }
-  save_usergame_field "$map" "$field_id" "$CHOSEN_BOOL_VALUE"
-}
-
-reset_all_usersettings() {
-  echo
-  echo "This removes all custom UserEngine and UserGame overrides."
-  echo "The battlegroup will go back to the built-in default values."
-  echo "Running maps keep their current values until they are restarted."
-  if run_cmd_status python3 "$USERSETTINGS_PY" reset-all; then
-    ok_msg "All UserEngine/UserGame overrides were removed."
-    info "Restart running maps to apply the default values again."
-  fi
-}
-
-edit_userengine_menu() {
-  local choice
-
-  while true; do
-    load_usersettings_values engine
-    MENU_CONTEXT_TEXT="$(userengine_about_text)"
-    menu_or_back "Edit UserEngine (Global Defaults)" \
-      "Mining Output Multiplier  Current: $(usersettings_value mining_output_multiplier)" \
-      "Vehicle Mining Multiplier  Current: $(usersettings_value vehicle_mining_output_multiplier)" \
-      "PvP Resource Multiplier  Current: $(usersettings_value pvp_resource_multiplier)" \
-      "Vehicle Durability Damage  Current: $(usersettings_value vehicle_durability_damage_multiplier)" \
-      "Sandstorm Enabled  Current: $(usersettings_value sandstorm_enabled)" \
-      "Sandstorm Treasure Enabled  Current: $(usersettings_value sandstorm_treasure_enabled)" \
-      "Sandworm Enabled  Current: $(usersettings_value sandworm_enabled)" \
-      "Sandworm Collision Interaction  Current: $(usersettings_value sandworm_collision_interaction)" \
-      "Sandworm Danger Zones Enabled  Current: $(usersettings_value sandworm_danger_zones_enabled)" \
-      "Sandworm Invulnerability On Exit  Current: $(usersettings_value sandworm_invulnerability_on_exit)" \
-      "Sandworm Invulnerability On Restart  Current: $(usersettings_value sandworm_invulnerability_on_restart)" \
-      "Back" || return
-    MENU_CONTEXT_TEXT=""
-    choice="$MENU_CHOICE"
-
-    case "$choice" in
-      1) edit_userengine_numeric_field mining_output_multiplier "New mining output multiplier (example: 1.0 or 10.0):" float; pause ;;
-      2) edit_userengine_numeric_field vehicle_mining_output_multiplier "New vehicle mining multiplier (example: 1.0 or 10.0):" float; pause ;;
-      3) edit_userengine_numeric_field pvp_resource_multiplier "New PvP resource multiplier (example: 2.5):" float; pause ;;
-      4) edit_userengine_numeric_field vehicle_durability_damage_multiplier "New vehicle durability damage multiplier (0-10, 0 disables):" float; pause ;;
-      5) edit_userengine_boolean_field sandstorm_enabled "Set Sandstorm" "Enabled (1)" "Disabled (0)" "1" "0"; pause ;;
-      6) edit_userengine_boolean_field sandstorm_treasure_enabled "Set Sandstorm Treasure" "Enabled (1)" "Disabled (0)" "1" "0"; pause ;;
-      7) edit_userengine_boolean_field sandworm_enabled "Set Sandworm" "Enabled (1)" "Disabled (0)" "1" "0"; pause ;;
-      8) edit_userengine_boolean_field sandworm_collision_interaction "Set Sandworm Collision Interaction" "True" "False" "true" "false"; pause ;;
-      9) edit_userengine_boolean_field sandworm_danger_zones_enabled "Set Sandworm Danger Zones" "True" "False" "true" "false"; pause ;;
-      10) edit_userengine_numeric_field sandworm_invulnerability_on_exit "Seconds of sandworm invulnerability on exit:" float; pause ;;
-      11) edit_userengine_numeric_field sandworm_invulnerability_on_restart "Seconds of sandworm invulnerability after restart:" float; pause ;;
-      12) return ;;
-    esac
-  done
-}
-
-edit_usergame_menu() {
-  local map="$1"
-  local choice
-
-  while true; do
-    load_usersettings_values map "$map"
-    MENU_CONTEXT_TEXT="$(usergame_about_text "$map")"
-    menu_or_back "Edit UserGame: $map" \
-      "Force PvP On All Partitions  Current: $(usersettings_value force_enable_pvp_all_partitions)" \
-      "Security Zones Enabled  Current: $(usersettings_value security_zones_enabled)" \
-      "Item Deterioration Rate  Current: $(usersettings_value item_deterioration_rate)" \
-      "Coriolis Storm Enabled  Current: $(usersettings_value coriolis_auto_spawn_enabled)" \
-      "Max Landclaim Segments  Current: $(usersettings_value max_landclaim_segments)" \
-      "Building Blueprint Max Extensions  Current: $(usersettings_value building_blueprint_max_extensions)" \
-      "Base Backup Max Extensions  Current: $(usersettings_value base_backup_max_extensions)" \
-      "Building Restriction Limits Enabled  Current: $(usersettings_value building_restriction_limits_enabled)" \
-      "Back" || return
-    MENU_CONTEXT_TEXT=""
-    choice="$MENU_CHOICE"
-
-    case "$choice" in
-      1) edit_usergame_boolean_field "$map" force_enable_pvp_all_partitions "Set Force PvP On All Partitions" "True" "False" "True" "False"; pause ;;
-      2) edit_usergame_boolean_field "$map" security_zones_enabled "Set Security Zones" "True" "False" "True" "False"; pause ;;
-      3) edit_usergame_numeric_field "$map" item_deterioration_rate "New deterioration rate (0-10, 0 disables):" float; pause ;;
-      4) edit_usergame_boolean_field "$map" coriolis_auto_spawn_enabled "Set Coriolis Storm Auto Spawn" "True" "False" "True" "False"; pause ;;
-      5) edit_usergame_numeric_field "$map" max_landclaim_segments "Maximum landclaim segments:" int; pause ;;
-      6) edit_usergame_numeric_field "$map" building_blueprint_max_extensions "Building blueprint max extensions:" int; pause ;;
-      7) edit_usergame_numeric_field "$map" base_backup_max_extensions "Base backup max extensions:" int; pause ;;
-      8) edit_usergame_boolean_field "$map" building_restriction_limits_enabled "Set Building Restriction Limits" "True" "False" "True" "False"; pause ;;
-      9) return ;;
-    esac
-  done
-}
-
 map_available_partition_count() {
   local map="$1"
   "$DUNE" sietches dimensions "$map" --ids 2>/dev/null | sed '/^$/d' | wc -l | tr -d '[:space:]'
-}
-
-memory_env_key_for_map() {
-  local map="$1"
-  local normalized
-
-  normalized="$(printf '%s' "$map" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')"
-  printf 'DUNE_MEMORY_%s' "$normalized"
-}
-
-map_memory_override_present() {
-  local map="$1"
-  local key
-
-  key="$(memory_env_key_for_map "$map")"
-  grep -Eq "^${key}=" .env 2>/dev/null
-}
-
-map_is_dedicated_scaling() {
-  [ "$(map_info_value "$1" "Type")" = "Dedicated Scaling" ]
-}
-
-map_supports_active_dimensions() {
-  local map="$1"
-
-  [ "$map" != "Overmap" ] && ! map_is_dedicated_scaling "$map"
-}
-
-map_supports_display_settings() {
-  [ "$1" = "Survival_1" ]
 }
 
 sanitize_prompt_value() {
@@ -417,9 +91,10 @@ sanitize_numeric_prompt_value() {
 
 prompt_positive_integer() {
   local prompt="$1"
-  local __var_name="$2"
+  local __var="$2"
   local error_text="$3"
   local value=""
+  local -n __out_ref="$__var"
 
   prompt_text "$prompt" value || return $?
   value="$(sanitize_numeric_prompt_value "$value")"
@@ -428,7 +103,7 @@ prompt_positive_integer() {
     return 1
   fi
 
-  printf -v "$__var_name" '%s' "$value"
+  __out_ref="$value"
 }
 
 pause() {
@@ -469,9 +144,6 @@ show_runtime_files_status() {
 
   echo "=== Runtime Files Status ==="
   echo
-  echo "This check only verifies the generated runtime catalog files on disk."
-  echo "It does not verify that live battlegroup services or dune.world_partition are healthy."
-  echo
 
   if [ -s "$partition_catalog" ]; then
     echo "OK   $partition_catalog"
@@ -487,95 +159,32 @@ show_runtime_files_status() {
 
   echo
   if runtime_catalogs_available; then
-    echo "Runtime catalog files are present."
-    echo "Manager features that read these files, like map selection and memory menus, should work normally."
-    echo "If maps are still stuck in WARMING after an update, use Repair Runtime Files or check dune ready."
+    echo "Runtime map catalogs are present."
+    echo "Map selection and memory menus should work normally."
   else
-    echo "Runtime catalog files are missing."
+    echo "Runtime map catalogs are missing."
     echo "Map selection and some manager map actions will not work until they are rebuilt."
   fi
 }
 
 repair_runtime_files() {
-  local services_were_running=0
-  local partition_sql="runtime/generated/reset-world-partitions.sql"
-  local partition_count
-  local actual_count
-
   echo "=== Repair Runtime Files ==="
   echo
-  echo "This repairs runtime partition data from the installed server files."
-  echo "It refreshes dune.world_partition and rebuilds the generated map catalogs."
+  echo "This rebuilds the generated map catalogs from the installed server files."
   echo "It does not run dune init or redeploy the battlegroup."
-  echo "Battlegroup services will be stopped and started again during the repair."
-  echo "Players will be disconnected while the repair runs."
   echo
-  echo "This repair is intended for runtime partition/layout mismatches after updates."
-  echo "It may not fix every future Funcom server change automatically."
-  echo
-  if ! confirm "Continue with runtime repair?"; then
-    echo "Cancelled."
-    return
-  fi
-  echo
-
-  if battlegroup_services_running; then
-    services_were_running=1
-    echo "Stopping battlegroup services so runtime data can be repaired safely..."
-    echo
-    "$DUNE" stop
-    echo
-  fi
-
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
-    echo "Starting Postgres for runtime repair..."
-    echo
-    runtime/scripts/start-postgres.sh
-    echo
-  fi
-
-  echo "Generating canonical world partition SQL from installed server files..."
-  runtime/scripts/generate-world-partitions-sql.sh
-
-  if [ ! -s "$partition_sql" ]; then
-    echo "Generated partition SQL is missing or empty: $partition_sql"
-    return 1
-  fi
-
-  partition_count="$(grep -c '^insert into dune.world_partition' "$partition_sql" || true)"
-  if [ "${partition_count:-0}" -le 0 ]; then
-    echo "Generated partition SQL contains no world_partition inserts."
-    return 1
-  fi
-
-  echo
-  echo "Applying $partition_count canonical world partitions..."
-  docker exec -i dune-postgres psql -U dune -d dune < "$partition_sql"
-
-  echo
-  echo "Verifying world_partition data..."
-  actual_count="$(docker exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" 2>/dev/null | tr -d '[:space:]' || true)"
-  if [ "${actual_count:-0}" -le 0 ]; then
-    echo "world_partition is still empty after runtime repair."
-    return 1
-  fi
-  echo "World partitions ready: $actual_count rows"
-
-  echo
-  echo "Refreshing generated map catalogs..."
   runtime/scripts/extract-server-catalog.sh
   runtime/scripts/extract-partition-catalog.sh
   echo
   show_runtime_files_status
 
-  echo
-  if [ "$services_were_running" -eq 1 ]; then
-    echo "Restarting the battlegroup now so the repaired runtime data is used."
-  else
-    echo "Starting the battlegroup now so the repaired runtime data is used."
+  if ! battlegroup_services_running; then
+    echo
+    echo "Battlegroup services are not running."
+    echo "Starting the battlegroup now so the repaired runtime files can be used."
+    echo
+    "$DUNE" start
   fi
-  echo
-  "$DUNE" start
 }
 
 read_choice() {
@@ -593,15 +202,16 @@ read_choice() {
 
 prompt_text() {
   local prompt="$1"
-  local __var_name="$2"
+  local __var="$2"
   local allow_empty="${3:-}"
-  local input_value=""
+  local value=""
   local rc
+  local -n __out_ref="$__var"
 
   MENU_INTERRUPTED=0
   trap 'MENU_INTERRUPTED=1' INT
   set +e
-  read -r -p "$prompt " input_value
+  read -r -p "$prompt " value
   rc=$?
   set -e
   trap handle_manager_int INT
@@ -616,26 +226,27 @@ prompt_text() {
     return 1
   fi
 
-  if [ -z "$input_value" ] && [ "$allow_empty" != "allow-empty" ]; then
+  if [ -z "$value" ] && [ "$allow_empty" != "allow-empty" ]; then
     echo "Value is required."
     return 1
   fi
 
-  input_value="$(sanitize_prompt_value "$input_value")"
-  printf -v "$__var_name" '%s' "$input_value"
+  value="$(sanitize_prompt_value "$value")"
+  __out_ref="$value"
 }
 
 prompt_secret() {
   local prompt="$1"
-  local __var_name="$2"
+  local __var="$2"
   local allow_empty="${3:-}"
-  local input_value=""
+  local value=""
   local rc
+  local -n __out_ref="$__var"
 
   MENU_INTERRUPTED=0
   trap 'MENU_INTERRUPTED=1' INT
   set +e
-  read -r -s -p "$prompt " input_value
+  read -r -s -p "$prompt " value
   rc=$?
   set -e
   trap handle_manager_int INT
@@ -651,20 +262,19 @@ prompt_secret() {
   fi
   echo
 
-  if [ -z "$input_value" ] && [ "$allow_empty" != "allow-empty" ]; then
+  if [ -z "$value" ] && [ "$allow_empty" != "allow-empty" ]; then
     echo "Value is required."
     return 1
   fi
 
-  input_value="$(sanitize_prompt_value "$input_value")"
-  printf -v "$__var_name" '%s' "$input_value"
+  value="$(sanitize_prompt_value "$value")"
+  __out_ref="$value"
 }
 
 select_menu() {
   local title="$1"
   shift
   local options=("$@")
-  local context="${MENU_CONTEXT_TEXT:-}"
   local selected=0
   local key rest i
   local old_tty=""
@@ -679,11 +289,6 @@ select_menu() {
     local choice
     echo "${C_BOLD}${C_CYAN}$title${C_RESET}" >&2
     printf '%*s\n' "${#title}" '' | tr ' ' '=' >&2
-    if [ -n "$context" ]; then
-      echo >&2
-      printf '%s\n' "$context" >&2
-      echo >&2
-    fi
     for i in "${!options[@]}"; do
       printf " %2d) %s\n" "$((i + 1))" "${options[$i]}" >&2
     done
@@ -715,11 +320,6 @@ select_menu() {
     printf '\033[H' >&2
     echo "${C_BOLD}${C_CYAN}$title${C_RESET}" >&2
     printf '%*s\n' "${#title}" '' | tr ' ' '=' >&2
-    if [ -n "$context" ]; then
-      echo >&2
-      printf '%s\n' "$context" >&2
-      echo >&2
-    fi
     echo >&2
     for i in "${!options[@]}"; do
       if [ "$i" -eq "$selected" ]; then
@@ -975,17 +575,25 @@ verify_player_ip_before_battlegroup_action() {
   local configured_ip
   local mode
   local current_ip
+  configured_ip="$(resolve_server_ip)"
+  mode="$(first_known_value "$(config_value .env SERVER_IP_MODE 2>/dev/null || true)" "${SERVER_IP_MODE:-}" || true)"
 
-  if [ ! -f .env ]; then
-    echo ".env was not found. Run dune init before starting the battlegroup."
-    return 1
+  if [ -z "$mode" ] || [ "$mode" = "unknown" ]; then
+    if value_is_known "$configured_ip"; then
+      if is_private_ipv4 "$configured_ip"; then
+        mode="local"
+      else
+        mode="public"
+      fi
+    fi
   fi
 
-  configured_ip="$(config_value .env SERVER_IP || true)"
-  mode="$(config_value .env SERVER_IP_MODE || true)"
-
-  if [ -z "$configured_ip" ] || [ -z "$mode" ]; then
-    echo "SERVER_IP or SERVER_IP_MODE is missing from .env."
+  if ! value_is_known "$configured_ip" || [ -z "$mode" ] || [ "$mode" = "unknown" ]; then
+    echo "Could not resolve the player-facing IP or IP mode from the current config/runtime state."
+    if confirm "Continue anyway"; then
+      return 0
+    fi
+    echo "Cancelled. Battlegroup was not started."
     return 1
   fi
 
@@ -1027,23 +635,68 @@ EOF
   return 1
 }
 
+persist_runtime_identity_snapshot() {
+  local battlegroup_id server_title server_region server_ip existing_battlegroup_id
+
+  battlegroup_id="$(resolve_battlegroup_id 2>/dev/null || true)"
+  server_title="$(resolve_server_title 2>/dev/null || true)"
+  server_region="$(resolve_server_region 2>/dev/null || true)"
+  server_ip="$(resolve_server_ip 2>/dev/null || true)"
+  existing_battlegroup_id="$(config_value runtime/generated/battlegroup.env BATTLEGROUP_ID 2>/dev/null || true)"
+
+  if { [ -z "$battlegroup_id" ] || [ "$battlegroup_id" = "unknown" ] || [ "$battlegroup_id" = "dune-docker" ]; } \
+    && [ -n "$existing_battlegroup_id" ] \
+    && [ "$existing_battlegroup_id" != "unknown" ] \
+    && [ "$existing_battlegroup_id" != "dune-docker" ]; then
+    battlegroup_id="$existing_battlegroup_id"
+  fi
+
+  mkdir -p runtime/generated
+  {
+    printf 'BATTLEGROUP_ID=%q\n' "${battlegroup_id:-dune-docker}"
+    printf 'SERVER_TITLE=%q\n' "${server_title:-My Dune Server}"
+    printf 'SERVER_REGION=%q\n' "${server_region:-Europe}"
+    printf 'SERVER_IP=%q\n' "${server_ip:-auto}"
+  } > runtime/generated/battlegroup.env
+}
+
 show_config_summary() {
   echo
   echo "=== Current Configuration ==="
 
-  if [ ! -f .env ]; then
-    echo "No .env file found. Run first-time setup when you are ready."
-    return
+  local title region mode server_ip steam_app battlegroup
+
+  title="$(resolve_server_title)"
+  region="$(resolve_server_region)"
+  server_ip="$(resolve_server_ip)"
+  steam_app="$(first_known_value "$(config_value .env STEAM_APP_ID 2>/dev/null || true)" "${STEAM_APP_ID:-}" "4754530" || echo "4754530")"
+  battlegroup="$(first_known_value \
+    "$(config_value runtime/generated/battlegroup.env BATTLEGROUP_ID 2>/dev/null || true)" \
+    "$(container_env_value_any_state dune-director BATTLEGROUP 2>/dev/null || true)" \
+    "$(container_env_value_any_state dune-server-gateway BATTLEGROUP 2>/dev/null || true)" \
+    "$(container_env_value_any_state dune-server-overmap BATTLEGROUP 2>/dev/null || true)" \
+    "$(container_env_value_any_state dune-server-survival-1 BATTLEGROUP 2>/dev/null || true)" \
+    || true)"
+  mode="$(first_known_value "$(config_value .env SERVER_IP_MODE 2>/dev/null || true)" "${SERVER_IP_MODE:-}" || true)"
+  if [ -z "$mode" ] || [ "$mode" = "unknown" ]; then
+    if value_is_known "$server_ip"; then
+      if is_private_ipv4 "$server_ip"; then
+        mode="local"
+      else
+        mode="public"
+      fi
+    else
+      mode="unknown"
+    fi
   fi
 
-  printf "%-14s %s\n" "Title:" "$(config_value .env SERVER_TITLE || echo unknown)"
-  printf "%-14s %s\n" "Region:" "$(config_value .env SERVER_REGION || echo unknown)"
-  printf "%-14s %s\n" "Mode:" "$(config_value .env SERVER_IP_MODE || echo unknown)"
-  printf "%-14s %s\n" "Server IP:" "$(config_value .env SERVER_IP || echo unknown)"
-  printf "%-14s %s\n" "Steam app:" "$(config_value .env STEAM_APP_ID || echo unknown)"
-
-  if [ -f runtime/generated/battlegroup.env ]; then
-    printf "%-14s %s\n" "Battlegroup:" "$(config_value runtime/generated/battlegroup.env BATTLEGROUP_ID || echo unknown)"
+  printf "%-14s %s\n" "Title:" "${title:-unknown}"
+  printf "%-14s %s\n" "Region:" "${region:-unknown}"
+  printf "%-14s %s\n" "Mode:" "$mode"
+  printf "%-14s %s\n" "Server IP:" "${server_ip:-unknown}"
+  printf "%-14s %s\n" "Steam app:" "$steam_app"
+  if [ -n "$battlegroup" ]; then
+    printf "%-14s %s\n" "Battlegroup:" "$battlegroup"
   else
     printf "%-14s %s\n" "Battlegroup:" "not generated yet"
   fi
@@ -1147,72 +800,6 @@ show_current_memory_usage() {
   done
 }
 
-fit_menu_column() {
-  local text="$1"
-  local width="$2"
-  if [ "${#text}" -le "$width" ]; then
-    printf "%-${width}s" "$text"
-    return
-  fi
-
-  if [ "$width" -le 1 ]; then
-    printf '%s' "${text:0:$width}"
-    return
-  fi
-
-  printf '%s…' "${text:0:$((width - 1))}"
-}
-
-map_kind_badge() {
-  case "$1" in
-    "Dedicated Scaling") printf '%s' "dedicated" ;;
-    "Always-On") printf '%s' "always-on" ;;
-    "Dynamic") printf '%s' "dynamic" ;;
-    *) printf '%s' "$1" ;;
-  esac
-}
-
-format_map_summary_row() {
-  local map="$1"
-  local max_dimensions="$2"
-  local active_dimensions="$3"
-  local memory="$4"
-  local kind="$5"
-  local kind_badge
-
-  kind_badge="$(map_kind_badge "$kind")"
-  printf "%s  max %2s  active %-7s  mem %-5s  %s" \
-    "$(fit_menu_column "$map" 34)" \
-    "$max_dimensions" \
-    "$active_dimensions" \
-    "$memory" \
-    "$kind_badge"
-}
-
-show_maps_table() {
-  local rows=()
-  local row map max_dimensions active_dimensions memory kind
-
-  mapfile -t rows < <("$DUNE" sietches --picker-raw-tsv)
-  if [ "${#rows[@]}" -eq 0 ]; then
-    echo "No maps found."
-    return
-  fi
-
-  echo
-  echo "Map                                Max  Active    Mem    Type"
-  echo "--------------------------------------------------------------"
-  for row in "${rows[@]}"; do
-    IFS=$'\t' read -r map max_dimensions active_dimensions memory kind <<< "$row"
-    if [ -z "$map" ] || [ -z "$max_dimensions" ] || [ -z "$active_dimensions" ] || [ -z "$memory" ] || [ -z "$kind" ]; then
-      error_msg "Could not load map data."
-      echo "Try syncing the latest scripts and reopening the manager."
-      return 1
-    fi
-    printf "%s\n" "$(format_map_summary_row "$map" "$max_dimensions" "$active_dimensions" "$memory" "$kind")"
-  done
-}
-
 follow_dune_logs() {
   local target="$1"
 
@@ -1255,34 +842,14 @@ choose_sietch_map() {
   local choice
   local maps=()
   local labels=()
-  local rows=()
-  local row map max_dimensions active_dimensions memory kind label
 
-  mapfile -t rows < <("$DUNE" sietches --picker-raw-tsv)
-  if [ "${#rows[@]}" -eq 0 ]; then
-    echo "No maps found."
-    return 1
-  fi
-
-  for row in "${rows[@]}"; do
-    IFS=$'\t' read -r map max_dimensions active_dimensions memory kind <<< "$row"
-    [ -n "$map" ] || continue
-    if [ -z "$max_dimensions" ] || [ -z "$active_dimensions" ] || [ -z "$memory" ] || [ -z "$kind" ]; then
-      error_msg "Could not load map data."
-      echo "Try syncing the latest scripts and reopening the manager."
-      return 1
-    fi
-    maps+=("$map")
-    label="$(format_map_summary_row "$map" "$max_dimensions" "$active_dimensions" "$memory" "$kind")"
-    labels+=("$label")
-  done
-
+  mapfile -t maps < <("$DUNE" sietches --names)
   if [ "${#maps[@]}" -eq 0 ]; then
     echo "No maps found."
     return 1
   fi
 
-  labels+=("Back")
+  labels=("${maps[@]}" "Back")
   menu_or_back "Pick Map" "${labels[@]}" || return 1
   choice="$MENU_CHOICE"
   if [ "$choice" -eq "${#labels[@]}" ]; then
@@ -1291,12 +858,6 @@ choose_sietch_map() {
 
   CHOSEN_SIETCH_MAP="${maps[$((choice - 1))]}"
   [ -n "$CHOSEN_SIETCH_MAP" ] || return 1
-}
-
-show_map_dimension_details() {
-  local map="$1"
-
-  run_cmd "$DUNE" sietches dimensions "$map"
 }
 
 change_memory_for_map() {
@@ -1326,6 +887,111 @@ remove_memory_for_map() {
   fi
 }
 
+restore_builtin_memory_defaults() {
+  local changes=()
+  local line kind target value
+
+  mapfile -t changes < <(python3 - <<'PY'
+import json
+import re
+from pathlib import Path
+
+env = {}
+env_path = Path(".env")
+if env_path.exists():
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip()
+
+catalog = []
+catalog_path = Path("runtime/generated/server-catalog.json")
+if catalog_path.exists():
+    try:
+        catalog = json.loads(catalog_path.read_text())
+    except Exception:
+        catalog = []
+
+def normalize(name: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")
+
+seen_keys = set()
+for row in catalog:
+    name = str(row.get("map", "")).strip()
+    if not name:
+        continue
+    env_key = f"DUNE_MEMORY_{normalize(name)}"
+    if env_key in env:
+        print(f"map\t{name}\t{env[env_key]}")
+        seen_keys.add(env_key)
+
+if "DUNE_MEMORY_DEFAULT" in env:
+    print(f"default\tdefault\t{env['DUNE_MEMORY_DEFAULT']}")
+    seen_keys.add("DUNE_MEMORY_DEFAULT")
+
+for key, value in env.items():
+    if key.startswith("DUNE_MEMORY_") and key not in seen_keys:
+        print(f"raw\t{key}\t{value}")
+PY
+  )
+
+  if [ "${#changes[@]}" -eq 0 ]; then
+    echo "No custom memory settings are configured."
+    return
+  fi
+
+  echo
+  echo "This will remove custom memory overrides and restore built-in per-map defaults."
+  echo
+  for line in "${changes[@]}"; do
+    IFS=$'\t' read -r kind target value <<< "$line"
+    case "$kind" in
+      map) printf "%s\n" "  $target: $value -> catalog default" ;;
+      default) printf "%s\n" "  global default: $value -> removed" ;;
+      raw) printf "%s\n" "  $target: $value -> removed" ;;
+    esac
+  done
+  echo
+
+  if ! confirm "Restore built-in memory defaults now?"; then
+    echo "Cancelled."
+    return
+  fi
+
+  for line in "${changes[@]}"; do
+    IFS=$'\t' read -r kind target value <<< "$line"
+    case "$kind" in
+      map)
+        run_cmd env DUNE_MEMORY_ASSUME_YES=1 "$DUNE" memory unset "$target"
+        ;;
+      default)
+        run_cmd env DUNE_MEMORY_ASSUME_YES=1 "$DUNE" memory unset default
+        ;;
+      raw)
+        python3 - "$target" <<'PY'
+import sys
+from pathlib import Path
+
+target = sys.argv[1]
+env_path = Path(".env")
+if not env_path.exists():
+    raise SystemExit(0)
+
+lines = env_path.read_text().splitlines()
+filtered = [line for line in lines if not line.startswith(f"{target}=")]
+output = "\n".join(filtered)
+if output:
+    output += "\n"
+env_path.write_text(output)
+PY
+        echo "Removed $target"
+        ;;
+    esac
+  done
+}
+
 set_max_dimensions_for_map() {
   local map="$1"
   local max_dimensions=""
@@ -1335,7 +1001,12 @@ set_max_dimensions_for_map() {
     return
   fi
 
-  prompt_positive_integer "New Max Dimensions For $map:" max_dimensions "Max dimensions must be a positive integer." || return
+  prompt_text "New Max Dimensions For $map:" max_dimensions || return
+  max_dimensions="$(sanitize_numeric_prompt_value "$max_dimensions")"
+  if ! printf '%s' "$max_dimensions" | grep -Eq '^[1-9][0-9]*$'; then
+    error_msg "Max dimensions must be a positive integer."
+    return 1
+  fi
 
   echo
   echo "Maximum number of world partitions or servers this map can have."
@@ -1351,23 +1022,356 @@ set_max_dimensions_for_map() {
 set_active_dimensions_for_map() {
   local map="$1"
   local active_dimensions=""
+  local max_dimensions=""
 
   if [ "$map" = "Overmap" ]; then
     warn "Overmap active dimensions are fixed at 1."
     return
   fi
 
-  prompt_positive_integer "New Active Dimensions For $map:" active_dimensions "Active dimensions must be a positive integer." || return
+  prompt_text "New Active Dimensions For $map:" active_dimensions || return
+  active_dimensions="$(sanitize_numeric_prompt_value "$active_dimensions")"
+  if ! printf '%s' "$active_dimensions" | grep -Eq '^[1-9][0-9]*$'; then
+    error_msg "Active dimensions must be a positive integer."
+    return 1
+  fi
+  max_dimensions="$(map_info_value "$map" "Max dimensions")"
+  max_dimensions="$(sanitize_numeric_prompt_value "$max_dimensions")"
+  if printf '%s' "$max_dimensions" | grep -Eq '^[1-9][0-9]*$' && [ "$active_dimensions" -gt "$max_dimensions" ]; then
+    error_msg "Max dimensions for $map are currently $max_dimensions. Increase max dimensions first if you want more active dimensions."
+    return 1
+  fi
 
   echo
   echo "Active dimensions control how many non-dedicated dimensions should be active when supported."
   if confirm "Set active dimensions for $map to $active_dimensions?"; then
     if run_cmd_status "$DUNE" sietches set-active "$map" "$active_dimensions"; then
-      info "This applies to future starts. Existing running containers are not restarted automatically."
+      info "Active dimensions are reconciled immediately. Extra dimensions may spawn or stop now to match the requested count."
     fi
   else
     echo "Cancelled."
   fi
+}
+
+declare -A USERSETTINGS_VALUES
+
+load_usersettings_values() {
+  local scope="$1"
+  shift
+  local rows=()
+  local row key value
+
+  USERSETTINGS_VALUES=()
+  case "$scope" in
+    engine)
+      mapfile -t rows < <(python3 "$USERSETTINGS_PY" engine-values 2>/dev/null || true)
+      ;;
+    map)
+      mapfile -t rows < <(python3 "$USERSETTINGS_PY" map-values "$1" 2>/dev/null || true)
+      ;;
+    partition)
+      mapfile -t rows < <(python3 "$USERSETTINGS_PY" partition-values "$1" "$2" 2>/dev/null || true)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r key value <<< "$row"
+    [ -n "${key:-}" ] || continue
+    USERSETTINGS_VALUES["$key"]="$value"
+  done
+}
+
+usersettings_value() {
+  local key="$1"
+  printf '%s' "${USERSETTINGS_VALUES[$key]:-unknown}"
+}
+
+userengine_about_text() {
+  cat <<'EOF'
+Global UserEngine settings apply to every map and server in the battlegroup.
+These values are the battlegroup-wide baseline.
+Map-specific UserGame settings can customize gameplay for a single map,
+but this menu controls the global defaults used everywhere.
+EOF
+}
+
+usergame_about_text() {
+  local map="$1"
+  local partition_id="${2:-}"
+  cat <<EOF
+Global UserEngine settings apply to every map and server in the battlegroup.
+These values are the battlegroup-wide baseline.
+Map-specific UserGame settings can customize gameplay for a single map,
+but this menu controls the gameplay overrides used for ${map}${partition_id:+ partition $partition_id}.
+EOF
+}
+
+save_userengine_field() {
+  local field_id="$1"
+  local value="$2"
+  if run_cmd_status python3 "$USERSETTINGS_PY" engine-set "$field_id" "$value"; then
+    ok_msg "Global UserEngine setting updated."
+    info "Running map server containers keep the old values until they are restarted."
+  fi
+}
+
+save_usergame_field() {
+  local map="$1"
+  local field_id="$2"
+  local value="$3"
+  local partition_id="${4:-}"
+  if [ -n "$partition_id" ]; then
+    if run_cmd_status python3 "$USERSETTINGS_PY" partition-set "$map" "$partition_id" "$field_id" "$value"; then
+      ok_msg "UserGame setting updated for $map partition $partition_id."
+      restart_partition_if_requested "$map" "$partition_id"
+    fi
+    return
+  fi
+  if run_cmd_status python3 "$USERSETTINGS_PY" map-set "$map" "$field_id" "$value"; then
+    ok_msg "Map-specific UserGame setting updated for $map."
+    info "Running containers for $map keep the old values until that map is restarted or respawned."
+  fi
+}
+
+prompt_usersettings_number() {
+  local prompt="$1"
+  local kind="$2"
+  local value=""
+
+  while true; do
+    read -r -p "$prompt " value || { USERSETTINGS_INPUT_CANCELLED=1; return; }
+    value="$(printf '%s' "$value" | tr -d '[:cntrl:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    case "$value" in
+      ""|"/back")
+        USERSETTINGS_INPUT_CANCELLED=1
+        USERSETTINGS_INPUT_VALUE=""
+        return
+        ;;
+    esac
+    case "$kind" in
+      int)
+        if printf '%s' "$value" | grep -Eq '^[0-9]+$'; then
+          USERSETTINGS_INPUT_CANCELLED=0
+          USERSETTINGS_INPUT_VALUE="$value"
+          return
+        fi
+        echo "Please enter a whole number."
+        ;;
+      float)
+        if printf '%s' "$value" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+          USERSETTINGS_INPUT_CANCELLED=0
+          USERSETTINGS_INPUT_VALUE="$value"
+          return
+        fi
+        echo "Please enter a numeric value."
+        ;;
+      *)
+        USERSETTINGS_INPUT_CANCELLED=1
+        return
+        ;;
+    esac
+  done
+}
+
+choose_usersettings_boolean() {
+  local title="$1"
+  local current="$2"
+  local true_label="$3"
+  local false_label="$4"
+  local true_value="$5"
+  local false_value="$6"
+  local choice
+
+  MENU_CONTEXT_TEXT="Current: $current"
+  menu_or_back "$title" "$true_label" "$false_label" "Back" || { MENU_CONTEXT_TEXT=""; return 1; }
+  MENU_CONTEXT_TEXT=""
+  choice="$MENU_CHOICE"
+
+  case "$choice" in
+    1) CHOSEN_BOOL_VALUE="$true_value"; return 0 ;;
+    2) CHOSEN_BOOL_VALUE="$false_value"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+edit_userengine_numeric_field() {
+  local field_id="$1"
+  local prompt="$2"
+  local kind="$3"
+
+  prompt_usersettings_number "$prompt" "$kind"
+  if [ "${USERSETTINGS_INPUT_CANCELLED:-0}" = "1" ]; then
+    info "No changes made."
+    return
+  fi
+  save_userengine_field "$field_id" "$USERSETTINGS_INPUT_VALUE"
+}
+
+edit_usergame_numeric_field() {
+  local map="$1"
+  local field_id="$2"
+  local prompt="$3"
+  local kind="$4"
+  local partition_id="${5:-}"
+
+  prompt_usersettings_number "$prompt" "$kind"
+  if [ "${USERSETTINGS_INPUT_CANCELLED:-0}" = "1" ]; then
+    info "No changes made."
+    return
+  fi
+  save_usergame_field "$map" "$field_id" "$USERSETTINGS_INPUT_VALUE" "$partition_id"
+}
+
+edit_userengine_boolean_field() {
+  local field_id="$1"
+  local title="$2"
+  local true_label="$3"
+  local false_label="$4"
+  local true_value="$5"
+  local false_value="$6"
+  local current
+
+  current="$(usersettings_value "$field_id")"
+  echo
+  choose_usersettings_boolean "$title" "$current" "$true_label" "$false_label" "$true_value" "$false_value" || {
+    info "No changes made."
+    return
+  }
+  save_userengine_field "$field_id" "$CHOSEN_BOOL_VALUE"
+}
+
+edit_usergame_boolean_field() {
+  local map="$1"
+  local field_id="$2"
+  local title="$3"
+  local true_label="$4"
+  local false_label="$5"
+  local true_value="$6"
+  local false_value="$7"
+  local partition_id="${8:-}"
+  local current
+
+  current="$(usersettings_value "$field_id")"
+  echo
+  choose_usersettings_boolean "$title" "$current" "$true_label" "$false_label" "$true_value" "$false_value" || {
+    info "No changes made."
+    return
+  }
+  save_usergame_field "$map" "$field_id" "$CHOSEN_BOOL_VALUE" "$partition_id"
+}
+
+reset_all_usersettings() {
+  echo
+  echo "This removes all custom UserEngine and UserGame overrides."
+  echo "The battlegroup will go back to the built-in default values."
+  echo "Running maps keep their current values until they are restarted."
+  if run_cmd_status python3 "$USERSETTINGS_PY" reset-all; then
+    ok_msg "All UserEngine/UserGame overrides were removed."
+    info "Restart running maps to apply the default values again."
+  fi
+}
+
+edit_userengine_menu() {
+  local choice
+
+  while true; do
+    load_usersettings_values engine
+    MENU_CONTEXT_TEXT="$(userengine_about_text)"
+    menu_or_back "Edit UserEngine (Global Defaults)" \
+      "Mining Output Multiplier  Current: $(usersettings_value mining_output_multiplier)" \
+      "Vehicle Mining Multiplier  Current: $(usersettings_value vehicle_mining_output_multiplier)" \
+      "PvP Resource Multiplier  Current: $(usersettings_value pvp_resource_multiplier)" \
+      "Vehicle Durability Damage  Current: $(usersettings_value vehicle_durability_damage_multiplier)" \
+      "Sandstorm Enabled  Current: $(usersettings_value sandstorm_enabled)" \
+      "Sandstorm Treasure Enabled  Current: $(usersettings_value sandstorm_treasure_enabled)" \
+      "Sandworm Enabled  Current: $(usersettings_value sandworm_enabled)" \
+      "Sandworm Collision Interaction  Current: $(usersettings_value sandworm_collision_interaction)" \
+      "Sandworm Danger Zones Enabled  Current: $(usersettings_value sandworm_danger_zones_enabled)" \
+      "Sandworm Invulnerability On Exit  Current: $(usersettings_value sandworm_invulnerability_on_exit)" \
+      "Sandworm Invulnerability On Restart  Current: $(usersettings_value sandworm_invulnerability_on_restart)" \
+      "Back" || return
+    MENU_CONTEXT_TEXT=""
+    choice="$MENU_CHOICE"
+
+    case "$choice" in
+      1) edit_userengine_numeric_field mining_output_multiplier "New mining output multiplier (example: 1.0 or 10.0, /back to cancel):" float; pause ;;
+      2) edit_userengine_numeric_field vehicle_mining_output_multiplier "New vehicle mining multiplier (example: 1.0 or 10.0, /back to cancel):" float; pause ;;
+      3) edit_userengine_numeric_field pvp_resource_multiplier "New PvP resource multiplier (example: 2.5, /back to cancel):" float; pause ;;
+      4) edit_userengine_numeric_field vehicle_durability_damage_multiplier "New vehicle durability damage multiplier (example: 1.0, /back to cancel):" float; pause ;;
+      5) edit_userengine_boolean_field sandstorm_enabled "Set Sandstorm" "Enabled (1)" "Disabled (0)" "1" "0"; pause ;;
+      6) edit_userengine_boolean_field sandstorm_treasure_enabled "Set Sandstorm Treasure" "Enabled (1)" "Disabled (0)" "1" "0"; pause ;;
+      7) edit_userengine_boolean_field sandworm_enabled "Set Sandworm" "Enabled (1)" "Disabled (0)" "1" "0"; pause ;;
+      8) edit_userengine_boolean_field sandworm_collision_interaction "Set Sandworm Collision Interaction" "True" "False" "true" "false"; pause ;;
+      9) edit_userengine_boolean_field sandworm_danger_zones_enabled "Set Sandworm Danger Zones" "True" "False" "true" "false"; pause ;;
+      10) edit_userengine_numeric_field sandworm_invulnerability_on_exit "Seconds of sandworm invulnerability on exit (/back to cancel):" float; pause ;;
+      11) edit_userengine_numeric_field sandworm_invulnerability_on_restart "Seconds of sandworm invulnerability after restart (/back to cancel):" float; pause ;;
+      12) return ;;
+    esac
+  done
+}
+
+edit_usergame_menu() {
+  local map="$1"
+  local partition_id="${2:-}"
+  local choice
+
+  while true; do
+    if [ -n "$partition_id" ]; then
+      load_usersettings_values partition "$map" "$partition_id"
+    else
+      load_usersettings_values map "$map"
+    fi
+    MENU_CONTEXT_TEXT="$(usergame_about_text "$map" "$partition_id")"
+    menu_or_back "Edit UserGame: $map${partition_id:+ (Dimension $partition_id)}" \
+      "Force PvP On All Partitions  Current: $(usersettings_value force_enable_pvp_all_partitions)" \
+      "Security Zones Enabled  Current: $(usersettings_value security_zones_enabled)" \
+      "Item Deterioration Rate  Current: $(usersettings_value item_deterioration_rate)" \
+      "Coriolis Storm Enabled  Current: $(usersettings_value coriolis_auto_spawn_enabled)" \
+      "Max Landclaim Segments  Current: $(usersettings_value max_landclaim_segments)" \
+      "Building Blueprint Max Extensions  Current: $(usersettings_value building_blueprint_max_extensions)" \
+      "Base Backup Max Extensions  Current: $(usersettings_value base_backup_max_extensions)" \
+      "Building Restriction Limits Enabled  Current: $(usersettings_value building_restriction_limits_enabled)" \
+      "Back" || return
+    MENU_CONTEXT_TEXT=""
+    choice="$MENU_CHOICE"
+
+    case "$choice" in
+      1) edit_usergame_boolean_field "$map" force_enable_pvp_all_partitions "Set Force PvP On All Partitions" "True" "False" "True" "False" "$partition_id"; pause ;;
+      2) edit_usergame_boolean_field "$map" security_zones_enabled "Set Security Zones" "True" "False" "True" "False" "$partition_id"; pause ;;
+      3) edit_usergame_numeric_field "$map" item_deterioration_rate "New deterioration rate (0-10, 0 disables, /back to cancel):" float "$partition_id"; pause ;;
+      4) edit_usergame_boolean_field "$map" coriolis_auto_spawn_enabled "Set Coriolis Storm Auto Spawn" "True" "False" "True" "False" "$partition_id"; pause ;;
+      5) edit_usergame_numeric_field "$map" max_landclaim_segments "Maximum landclaim segments (/back to cancel):" int "$partition_id"; pause ;;
+      6) edit_usergame_numeric_field "$map" building_blueprint_max_extensions "Building blueprint max extensions (/back to cancel):" int "$partition_id"; pause ;;
+      7) edit_usergame_numeric_field "$map" base_backup_max_extensions "Base backup max extensions (/back to cancel):" int "$partition_id"; pause ;;
+      8) edit_usergame_boolean_field "$map" building_restriction_limits_enabled "Set Building Restriction Limits" "True" "False" "True" "False" "$partition_id"; pause ;;
+      9) return ;;
+    esac
+  done
+}
+
+map_memory_override_present() {
+  local map="$1"
+  local key
+  key="DUNE_MEMORY_$(printf '%s' "$map" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')"
+  [ -f .env ] || return 1
+  grep -q "^${key}=" .env
+}
+
+map_is_dedicated_scaling() {
+  [ "$(map_info_value "$1" "Type")" = "Dedicated Scaling" ]
+}
+
+map_supports_active_dimensions() {
+  local map="$1"
+  [ "$map" != "Overmap" ] && ! map_is_dedicated_scaling "$map"
+}
+
+show_map_dimension_details() {
+  local map="$1"
+  run_cmd "$DUNE" sietches dimensions "$map"
 }
 
 choose_dimension_for_map() {
@@ -1418,7 +1422,14 @@ restart_partition_if_requested() {
   fi
 
   case "$map" in
-    Survival_1) run_cmd "$DUNE" restart survival ;;
+    Survival_1)
+      if [ "$partition_id" = "1" ]; then
+        run_cmd "$DUNE" restart survival
+      else
+        run_cmd "$DUNE" despawn "$partition_id"
+        run_cmd "$DUNE" spawn "$partition_id"
+      fi
+      ;;
     Overmap) run_cmd "$DUNE" restart overmap ;;
     *)
       run_cmd "$DUNE" despawn "$partition_id"
@@ -1437,6 +1448,22 @@ apply_survival_browser_change() {
   run_cmd runtime/scripts/publish-sietch-overrides.sh restart
 }
 
+apply_survival_partition_change() {
+  local partition_id="$1"
+
+  if [ "$partition_id" = "1" ]; then
+    apply_survival_browser_change
+    return
+  fi
+
+  echo
+  echo "Applying Survival_1 dimension browser changes now."
+  echo "This respawns the selected Survival_1 dimension and republishes the sietch overrides."
+  run_cmd "$DUNE" despawn "$partition_id"
+  run_cmd "$DUNE" spawn "$partition_id"
+  run_cmd runtime/scripts/publish-sietch-overrides.sh restart
+}
+
 set_display_name_for_map() {
   local map="$1"
   local partition_id display_name
@@ -1449,7 +1476,7 @@ set_display_name_for_map() {
   if confirm "Set display name for $map partition $partition_id to '$display_name'?"; then
     if run_cmd_status "$DUNE" sietches set-display "$partition_id" "$display_name"; then
       if [ "$map" = "Survival_1" ]; then
-        apply_survival_browser_change
+        apply_survival_partition_change "$partition_id"
       else
         restart_partition_if_requested "$map" "$partition_id"
       fi
@@ -1487,7 +1514,83 @@ set_password_for_map() {
       return
     fi
     if [ "$map" = "Survival_1" ]; then
-      apply_survival_browser_change
+      apply_survival_partition_change "$partition_id"
+    else
+      restart_partition_if_requested "$map" "$partition_id"
+    fi
+  else
+    echo "Cancelled."
+  fi
+}
+
+edit_survival_dimension_menu() {
+  local partition_id="$1"
+  local choice
+
+  while true; do
+    MENU_CONTEXT_TEXT=""
+    menu_or_back "Survival_1 Dimension $partition_id Actions" \
+      "Edit UserGame" \
+      "Set Display Name" \
+      "Set Password" \
+      "Back" || return
+    choice="$MENU_CHOICE"
+
+    case "$choice" in
+      1) edit_usergame_menu Survival_1 "$partition_id" ;;
+      2) set_display_name_for_partition Survival_1 "$partition_id"; pause ;;
+      3) set_password_for_partition Survival_1 "$partition_id"; pause ;;
+      4) return ;;
+    esac
+  done
+}
+
+set_display_name_for_partition() {
+  local map="$1"
+  local partition_id="$2"
+  local display_name
+
+  prompt_text "New Display Name:" display_name || return
+  if confirm "Set display name for $map partition $partition_id to '$display_name'?"; then
+    if run_cmd_status "$DUNE" sietches set-display "$partition_id" "$display_name"; then
+      if [ "$map" = "Survival_1" ]; then
+        apply_survival_partition_change "$partition_id"
+      else
+        restart_partition_if_requested "$map" "$partition_id"
+      fi
+    fi
+  else
+    echo "Cancelled."
+  fi
+}
+
+set_password_for_partition() {
+  local map="$1"
+  local partition_id="$2"
+  local password
+  local confirm_text
+
+  prompt_secret "New Password (leave empty to clear):" password allow-empty || return
+  if [ -n "$password" ]; then
+    confirm_text="Set password for $map partition $partition_id?"
+  else
+    confirm_text="Clear password for $map partition $partition_id?"
+  fi
+  if confirm "$confirm_text"; then
+    echo
+    echo ">>> dune sietches set-password $partition_id"
+    echo
+    set +e
+    SIETCH_PASSWORD="$password" "$DUNE" sietches set-password "$partition_id"
+    local rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      echo
+      echo "Command exited with status $rc."
+      return
+    fi
+    if [ "$map" = "Survival_1" ]; then
+      apply_survival_partition_change "$partition_id"
     else
       restart_partition_if_requested "$map" "$partition_id"
     fi
@@ -1510,13 +1613,13 @@ redeploy_battlegroup_flow() {
 }
 
 valid_backup_basename() {
-  printf '%s' "$1" | grep -Eq '^(dune-db-([a-z0-9][a-z0-9_-]*__)?[0-9]{8}-[0-9]{6}\.(dump|sql)|[a-z0-9][a-z0-9_-]*-[0-9]{8}-[0-9]{6}\.backup)$'
+  printf '%s' "$1" | grep -Eq '^dune-db-([a-z0-9][a-z0-9_-]*__)?[0-9]{8}-[0-9]{6}\.(dump|sql)$'
 }
 
 backup_names() {
   local backup_dir="runtime/backups/db"
   [ -d "$backup_dir" ] || return 0
-  find "$backup_dir" -maxdepth 1 -type f \( -name 'dune-db-*.dump' -o -name 'dune-db-*.sql' -o -name '*.backup' \) -printf '%f\n' \
+  find "$backup_dir" -maxdepth 1 -type f \( -name 'dune-db-*.dump' -o -name 'dune-db-*.sql' \) -printf '%f\n' \
     | while IFS= read -r name; do
         valid_backup_basename "$name" && printf '%s\n' "$name"
       done \
@@ -1561,227 +1664,6 @@ choose_backup() {
   fi
 
   CHOSEN_BACKUP="${names[$((choice - 1))]}"
-}
-
-copy_backup_sidecar_if_present() {
-  local source_path="$1"
-  local destination_dir="$2"
-  local sidecar_source
-
-  sidecar_source="${source_path}.yaml"
-  if [ -f "$sidecar_source" ]; then
-    cp -f -- "$sidecar_source" "$destination_dir/"
-    echo "Copied sidecar:"
-    echo "  $destination_dir/$(basename "$sidecar_source")"
-  fi
-}
-
-restore_specific_backup_path() {
-  local backup_path="$1"
-  local backup_name
-
-  backup_name="$(basename "$backup_path")"
-  echo
-  echo "Restoring a database backup will replace the current battlegroup database."
-  if confirm "Restore backup '$backup_name'?"; then
-    run_cmd env DUNE_DB_ASSUME_YES=1 "$DUNE" db restore "$backup_path"
-  else
-    echo "Cancelled."
-  fi
-}
-
-import_local_backup_file_flow() {
-  local source_path=""
-  local destination_dir="runtime/backups/db"
-  local destination_path
-  local backup_name
-
-  echo
-  echo "Import a backup file already available on this machine."
-  echo "Supported files: official .backup, dune-db-*.dump, and .sql"
-  prompt_text "Local backup path (Press Enter to go back):" source_path allow-empty || return
-
-  source_path="$(sanitize_prompt_value "$source_path")"
-  if [ -z "$source_path" ] || [ "$source_path" = "/back" ]; then
-    info "No changes made."
-    return
-  fi
-
-  if [ ! -f "$source_path" ]; then
-    error_msg "Backup file not found: $source_path"
-    return
-  fi
-
-  backup_name="$(basename "$source_path")"
-  if ! valid_backup_basename "$backup_name"; then
-    error_msg "Unsupported backup filename: $backup_name"
-    echo "Expected an official .backup, dune-db-*.dump, or dune-db-*.sql file."
-    return
-  fi
-
-  mkdir -p "$destination_dir"
-  destination_path="$destination_dir/$backup_name"
-  cp -f -- "$source_path" "$destination_path"
-  echo "Copied backup file:"
-  echo "  $destination_path"
-  copy_backup_sidecar_if_present "$source_path" "$destination_dir"
-  restore_specific_backup_path "$destination_path"
-}
-
-remote_backup_rows() {
-  local remote_user="$1"
-  local remote_host="$2"
-  local remote_port="$3"
-  local remote_dir="$4"
-
-  ssh -p "$remote_port" -o StrictHostKeyChecking=accept-new "$remote_user@$remote_host" \
-    "find '$remote_dir' -maxdepth 2 -type f -name '*.backup' -printf '%f\t%p\n' | sort"
-}
-
-choose_remote_backup() {
-  local remote_user="$1"
-  local remote_host="$2"
-  local remote_port="$3"
-  local remote_dir="$4"
-  local rows=()
-  local labels=()
-  local paths=()
-  local row name path choice
-
-  mapfile -t rows < <(remote_backup_rows "$remote_user" "$remote_host" "$remote_port" "$remote_dir")
-  if [ "${#rows[@]}" -eq 0 ]; then
-    echo "No remote .backup files were found in $remote_dir"
-    return 1
-  fi
-
-  for row in "${rows[@]}"; do
-    IFS=$'\t' read -r name path <<< "$row"
-    [ -n "$name" ] || continue
-    [ -n "$path" ] || continue
-    labels+=("$name  $path")
-    paths+=("$path")
-  done
-
-  if [ "${#paths[@]}" -eq 0 ]; then
-    echo "No remote .backup files were found in $remote_dir"
-    return 1
-  fi
-
-  labels+=("Back")
-  menu_or_back "Pick Remote Backup" "${labels[@]}" || return 1
-  choice="$MENU_CHOICE"
-  if [ "$choice" -eq "${#labels[@]}" ]; then
-    return 1
-  fi
-
-  CHOSEN_REMOTE_BACKUP="${paths[$((choice - 1))]}"
-  [ -n "$CHOSEN_REMOTE_BACKUP" ] || return 1
-}
-
-copy_remote_backup_to_local() {
-  local remote_user="$1"
-  local remote_host="$2"
-  local remote_port="$3"
-  local remote_path="$4"
-  local destination_dir="runtime/backups/db"
-  local backup_name
-  local destination_path
-
-  mkdir -p "$destination_dir"
-  backup_name="$(basename "$remote_path")"
-  destination_path="$destination_dir/$backup_name"
-
-  echo
-  echo "Copying remote backup..."
-  if ! run_cmd_status scp -P "$remote_port" -p "$remote_user@$remote_host:$remote_path" "$destination_path"; then
-    return 1
-  fi
-
-  if ssh -p "$remote_port" -o StrictHostKeyChecking=accept-new "$remote_user@$remote_host" "[ -f '$remote_path.yaml' ]"; then
-    echo
-    echo "Copying remote sidecar..."
-    run_cmd_status scp -P "$remote_port" -p "$remote_user@$remote_host:$remote_path.yaml" "$destination_dir/$(basename "$remote_path").yaml" || true
-  fi
-
-  COPIED_BACKUP_PATH="$destination_path"
-  return 0
-}
-
-import_remote_backup_over_ssh_flow() {
-  local remote_host=""
-  local remote_user="dune"
-  local remote_port="22"
-  local remote_dir="/funcom/artifacts/database-dumps"
-
-  if ! command -v ssh >/dev/null 2>&1 || ! command -v scp >/dev/null 2>&1; then
-    error_msg "ssh and scp are required for remote import."
-    return
-  fi
-
-  echo
-  echo "Import a backup directly from another machine over SSH."
-  prompt_text "Remote host or IP (Press Enter to go back):" remote_host allow-empty || return
-  remote_host="$(sanitize_prompt_value "$remote_host")"
-  if [ -z "$remote_host" ] || [ "$remote_host" = "/back" ]; then
-    info "No changes made."
-    return
-  fi
-
-  prompt_text "SSH user (default: dune):" remote_user allow-empty || return
-  remote_user="$(sanitize_prompt_value "$remote_user")"
-  [ -n "$remote_user" ] || remote_user="dune"
-
-  prompt_text "SSH port (default: 22):" remote_port allow-empty || return
-  remote_port="$(sanitize_numeric_prompt_value "$remote_port")"
-  [ -n "$remote_port" ] || remote_port="22"
-  if ! printf '%s' "$remote_port" | grep -Eq '^[0-9]+$'; then
-    error_msg "SSH port must be digits only."
-    return
-  fi
-
-  prompt_text "Remote backup directory (default: /funcom/artifacts/database-dumps):" remote_dir allow-empty || return
-  remote_dir="$(sanitize_prompt_value "$remote_dir")"
-  [ -n "$remote_dir" ] || remote_dir="/funcom/artifacts/database-dumps"
-
-  echo
-  echo "Checking remote backup directory..."
-  if ! run_cmd_status ssh -p "$remote_port" -o StrictHostKeyChecking=accept-new "$remote_user@$remote_host" "test -d '$remote_dir'"; then
-    error_msg "Could not access remote directory: $remote_dir"
-    return
-  fi
-
-  CHOSEN_REMOTE_BACKUP=""
-  choose_remote_backup "$remote_user" "$remote_host" "$remote_port" "$remote_dir" || return
-  if [ -z "$CHOSEN_REMOTE_BACKUP" ]; then
-    return
-  fi
-
-  COPIED_BACKUP_PATH=""
-  copy_remote_backup_to_local "$remote_user" "$remote_host" "$remote_port" "$CHOSEN_REMOTE_BACKUP" || return
-  restore_specific_backup_path "$COPIED_BACKUP_PATH"
-}
-
-import_remote_database_menu() {
-  local choice
-
-  while true; do
-    MENU_CONTEXT_TEXT="Choose how to bring a backup into this dune-docker server before restoring it."
-    menu_or_back "Import Remote Database" \
-      "Import From SSH Server" \
-      "Import From Local File" \
-      "Back" || {
-        MENU_CONTEXT_TEXT=""
-        return
-      }
-    MENU_CONTEXT_TEXT=""
-    choice="$MENU_CHOICE"
-
-    case "$choice" in
-      1) import_remote_backup_over_ssh_flow; pause ;;
-      2) import_local_backup_file_flow; pause ;;
-      3) return ;;
-    esac
-  done
 }
 
 restore_backup_flow() {
@@ -1832,91 +1714,6 @@ delete_all_backups_flow() {
   else
     echo "Cancelled."
   fi
-}
-
-check_database_health() {
-  local partition_count
-  local duplicate_partition_ids
-  local blank_map_rows
-  local recent_log_alerts
-  local actionable_log_errors
-  local benign_log_warnings
-  local overall_status=0
-
-  echo
-  echo "=== Database Health ==="
-  echo
-
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
-    error_msg "dune-postgres is not running."
-    echo "Start the battlegroup or Postgres service before running this check."
-    return 1
-  fi
-
-  if docker exec dune-postgres pg_isready -U postgres -d dune >/dev/null 2>&1; then
-    ok_msg "Postgres is reachable."
-  else
-    error_msg "Postgres container is running but not ready."
-    overall_status=1
-  fi
-
-  if docker exec dune-postgres psql -U postgres -d dune -Atc "select 1;" >/dev/null 2>&1; then
-    ok_msg "Basic SQL query succeeded."
-  else
-    error_msg "Basic SQL query failed."
-    overall_status=1
-  fi
-
-  partition_count="$(docker exec dune-postgres psql -U postgres -d dune -Atc "select count(*) from dune.world_partition;" 2>/dev/null | tr -d '[:space:]' || true)"
-  if [ -n "$partition_count" ] && [ "${partition_count:-0}" -gt 0 ] 2>/dev/null; then
-    ok_msg "world_partition rows: $partition_count"
-  else
-    error_msg "world_partition has no rows."
-    echo "A healthy battlegroup should have canonical world partition data."
-    overall_status=1
-  fi
-
-  duplicate_partition_ids="$(docker exec dune-postgres psql -U postgres -d dune -Atc "select count(*) from (select partition_id from dune.world_partition group by partition_id having count(*) > 1) dup;" 2>/dev/null | tr -d '[:space:]' || true)"
-  if [ "${duplicate_partition_ids:-0}" = "0" ]; then
-    ok_msg "No duplicate partition_id rows were found."
-  else
-    error_msg "Duplicate partition_id rows found: ${duplicate_partition_ids:-unknown}"
-    overall_status=1
-  fi
-
-  blank_map_rows="$(docker exec dune-postgres psql -U postgres -d dune -Atc "select count(*) from dune.world_partition where coalesce(trim(map), '') = '';" 2>/dev/null | tr -d '[:space:]' || true)"
-  if [ "${blank_map_rows:-0}" = "0" ]; then
-    ok_msg "All world_partition rows have a map name."
-  else
-    error_msg "world_partition rows missing map names: ${blank_map_rows:-unknown}"
-    overall_status=1
-  fi
-
-  recent_log_alerts="$(docker logs --tail 200 dune-postgres 2>&1 | grep -iE '\b(ERROR|FATAL|PANIC)\b' | tail -n 20 || true)"
-  actionable_log_errors="$(printf '%s\n' "$recent_log_alerts" | grep -vi 'terminating connection due to administrator command' | sed '/^[[:space:]]*$/d' || true)"
-  benign_log_warnings="$(printf '%s\n' "$recent_log_alerts" | grep -i 'terminating connection due to administrator command' | sed '/^[[:space:]]*$/d' || true)"
-
-  if [ -n "$actionable_log_errors" ]; then
-    overall_status=1
-    error_msg "Recent actionable Postgres error logs were found."
-    echo
-    echo "$actionable_log_errors"
-  elif [ -n "$benign_log_warnings" ]; then
-    info "Recent Postgres restart/shutdown log lines were found, but they are usually benign."
-    echo
-    echo "$benign_log_warnings"
-  else
-    ok_msg "No recent actionable ERROR/FATAL/PANIC lines found in the last 200 Postgres log lines."
-  fi
-
-  echo
-  if [ "$overall_status" -eq 0 ]; then
-    ok_msg "Database health looks good."
-  else
-    error_msg "Database health check found issues."
-  fi
-
-  return "$overall_status"
 }
 
 main_menu() {
@@ -2007,6 +1804,7 @@ battlegroup_settings_menu() {
         ;;
       2)
         if verify_player_ip_before_battlegroup_action; then
+          persist_runtime_identity_snapshot
           run_cmd "$DUNE" start
         fi
         pause
@@ -2026,6 +1824,7 @@ battlegroup_settings_menu() {
         echo "Restart will stop and start the battlegroup. Players will be disconnected."
         if confirm "Continue"; then
           if verify_player_ip_before_battlegroup_action; then
+            persist_runtime_identity_snapshot
             run_cmd "$DUNE" stop
             run_cmd "$DUNE" start
           fi
@@ -2046,10 +1845,17 @@ battlegroup_settings_menu() {
           case "$choice" in
             1) run_cmd "$DUNE" restart-schedule status; pause ;;
             2)
+              scheduled_restart_hours=""
               echo
-              prompt_positive_integer "Restart Every How Many Hours:" restart_hours "Hours must be a positive integer." || { pause; continue; }
-              if confirm "Enable scheduled restart every $restart_hours hour(s)?"; then
-                run_cmd "$DUNE" restart-schedule enable "$restart_hours"
+              prompt_text "Restart Every How Many Hours:" scheduled_restart_hours || { pause; continue; }
+              scheduled_restart_hours="$(sanitize_numeric_prompt_value "$scheduled_restart_hours")"
+              if ! printf '%s' "$scheduled_restart_hours" | grep -Eq '^[1-9][0-9]*$'; then
+                error_msg "Hours must be a positive integer."
+                pause
+                continue
+              fi
+              if confirm "Enable scheduled restart every $scheduled_restart_hours hour(s)?"; then
+                run_cmd sudo "$DUNE" restart-schedule enable "$scheduled_restart_hours"
               else
                 echo "Cancelled."
               fi
@@ -2058,7 +1864,7 @@ battlegroup_settings_menu() {
             3)
               echo
               if confirm "Disable scheduled restart?"; then
-                run_cmd "$DUNE" restart-schedule disable
+                run_cmd sudo "$DUNE" restart-schedule disable
               else
                 echo "Cancelled."
               fi
@@ -2113,28 +1919,24 @@ database_maintenance_menu() {
   while true; do
     menu_or_back "Database Maintenance" \
       "Run Database Backup Now" \
-      "Import Remote Database" \
       "Restore A Database Backup" \
       "List Database Backups" \
       "Delete A Backup" \
       "Delete All Backups" \
       "Automatic Database Backups" \
       "Database Status" \
-      "Check Database Health" \
       "Back" || return
     choice="$MENU_CHOICE"
 
     case "$choice" in
       1) run_cmd "$DUNE" db backup; pause ;;
-      2) import_remote_database_menu ;;
-      3) restore_backup_flow; pause ;;
-      4) run_cmd "$DUNE" db list; pause ;;
-      5) delete_backup_flow; pause ;;
-      6) delete_all_backups_flow; pause ;;
-      7) automatic_database_backups_menu ;;
-      8) run_cmd "$DUNE" db status; pause ;;
-      9) check_database_health; pause ;;
-      10) return ;;
+      2) restore_backup_flow; pause ;;
+      3) run_cmd "$DUNE" db list; pause ;;
+      4) delete_backup_flow; pause ;;
+      5) delete_all_backups_flow; pause ;;
+      6) automatic_database_backups_menu ;;
+      7) run_cmd "$DUNE" db status; pause ;;
+      8) return ;;
     esac
   done
 }
@@ -2159,13 +1961,13 @@ automatic_database_backups_menu() {
         if [ -z "$backup_hours" ]; then
           echo "Backup interval is required."
         elif [ -n "$retention_days" ]; then
-          run_cmd "$DUNE" db auto enable "$backup_hours" "$retention_days"
+          run_cmd sudo "$DUNE" db auto enable "$backup_hours" "$retention_days"
         else
-          run_cmd "$DUNE" db auto enable "$backup_hours"
+          run_cmd sudo "$DUNE" db auto enable "$backup_hours"
         fi
         pause
         ;;
-      2) run_cmd "$DUNE" db auto disable; pause ;;
+      2) run_cmd sudo "$DUNE" db auto disable; pause ;;
       3) run_cmd "$DUNE" db auto status; pause ;;
       4)
         echo
@@ -2189,13 +1991,12 @@ sietches_menu() {
       "Revert All UserSettings To Defaults" \
       "Current Memory Usage" \
       "Show Memory Settings" \
-      "Set Default Memory" \
-      "Remove Default Memory Setting" \
+      "Restore Built-In Memory Defaults" \
       "Back" || return
     choice="$MENU_CHOICE"
 
     case "$choice" in
-      1) show_maps_table; pause ;;
+      1) run_cmd "$DUNE" sietches list; pause ;;
       2) edit_userengine_menu ;;
       3)
         if ! runtime_catalogs_available; then
@@ -2224,130 +2025,129 @@ sietches_menu() {
         ;;
       5) show_current_memory_usage; pause ;;
       6) run_cmd "$DUNE" memory status; pause ;;
-      7)
-        echo
-        prompt_text "Default Memory Value, Example 8g Or 4096m:" memory_value || { pause; continue; }
-        if confirm "Set default memory to $memory_value?"; then
-          run_cmd env DUNE_MEMORY_ASSUME_YES=1 "$DUNE" memory set default "$memory_value"
-        else
-          echo "Cancelled."
-        fi
-        pause
-        ;;
-      8)
-        if confirm "Remove default memory setting?"; then
-          run_cmd env DUNE_MEMORY_ASSUME_YES=1 "$DUNE" memory unset default
-        else
-          echo "Cancelled."
-        fi
-        pause
-        ;;
-      9) return ;;
+      7) restore_builtin_memory_defaults; pause ;;
+      8) return ;;
     esac
   done
 }
 
 edit_sietch_menu() {
   local map="$1"
+
+  case "$map" in
+    Survival_1) edit_survival_menu ;;
+    Overmap) edit_overmap_menu ;;
+    *) edit_dedicated_scaling_menu "$map" ;;
+  esac
+}
+
+edit_survival_menu() {
   local choice
-  local memory max active display password
+  local memory max active
+  local memory_override=0
+  while true; do
+    memory="$(map_info_value Survival_1 "Memory")"
+    max="$(map_info_value Survival_1 "Max dimensions")"
+    active="$(map_info_value Survival_1 "Active dimensions")"
+    memory_override=0
+    if map_memory_override_present Survival_1; then
+      memory_override=1
+    fi
+
+    menu_or_back "Survival_1 Actions" \
+      "Memory Limit  Current: ${memory:-unknown}" \
+      "Remove Memory Override" \
+      "Max Dimensions  Current: ${max:-unknown}" \
+      "Active Dimensions  Current: ${active:-unknown}" \
+      "Edit A Dimension" \
+      "Show Dimension Details" \
+      "Back To Map List" || return
+    choice="$MENU_CHOICE"
+
+    case "$choice" in
+      1) change_memory_for_map Survival_1; pause ;;
+      2)
+        if [ "$memory_override" -eq 1 ]; then
+          remove_memory_for_map Survival_1
+        else
+          info "No memory override is currently set for Survival_1."
+        fi
+        pause
+        ;;
+      3) set_max_dimensions_for_map Survival_1; pause ;;
+      4) set_active_dimensions_for_map Survival_1; pause ;;
+      5)
+        CHOSEN_PARTITION_ID=""
+        choose_dimension_for_map Survival_1 "Pick Dimension To Edit On Survival_1" || { pause; continue; }
+        edit_survival_dimension_menu "$CHOSEN_PARTITION_ID"
+        ;;
+      6) show_map_dimension_details Survival_1; pause ;;
+      7) return ;;
+    esac
+  done
+}
+
+edit_overmap_menu() {
+  local choice
+  local memory
+  local memory_override=0
+  while true; do
+    memory="$(map_info_value Overmap "Memory")"
+    memory_override=0
+    if map_memory_override_present Overmap; then
+      memory_override=1
+    fi
+
+    menu_or_back "Overmap Actions" \
+      "Memory Limit  Current: ${memory:-unknown}" \
+      "Remove Memory Override" \
+      "Show Dimension Details" \
+      "Back To Map List" || return
+    choice="$MENU_CHOICE"
+
+    case "$choice" in
+      1) change_memory_for_map Overmap; pause ;;
+      2)
+        if [ "$memory_override" -eq 1 ]; then
+          remove_memory_for_map Overmap
+        else
+          info "No memory override is currently set for Overmap."
+        fi
+        pause
+        ;;
+      3) show_map_dimension_details Overmap; pause ;;
+      4) return ;;
+    esac
+  done
+}
+
+edit_dedicated_scaling_menu() {
+  local map="$1"
+  local choice
+  local memory max active
   local memory_override=0
   local supports_active=0
-  local supports_display=0
 
   while true; do
     memory="$(map_info_value "$map" "Memory")"
     max="$(map_info_value "$map" "Max dimensions")"
     active="$(map_info_value "$map" "Active dimensions")"
-    display="$(map_info_value "$map" "Display name")"
-    password="$(map_info_value "$map" "Password")"
 
     memory_override=0
     if map_memory_override_present "$map"; then
       memory_override=1
     fi
-
     supports_active=0
     if map_supports_active_dimensions "$map"; then
       supports_active=1
-    fi
-
-    supports_display=0
-    if map_supports_display_settings "$map"; then
-      supports_display=1
-    fi
-    MENU_CONTEXT_TEXT="$(edit_map_about_text "$map")"
-
-    if [ "$supports_display" -eq 1 ]; then
-      menu_or_back "Edit Map: $map" \
-        "Memory Limit  Current: ${memory:-unknown}" \
-        "Remove Memory Override" \
-        "Max Dimensions  Current: ${max:-unknown}" \
-        "Active Dimensions  Current: ${active:-unknown}" \
-        "Edit UserGame" \
-        "Set Display Name  Current: ${display:-unknown}" \
-        "Set Password  Current: ${password:-unknown}" \
-        "Show Dimension Details" \
-        "Back To Map List" || return
-      MENU_CONTEXT_TEXT=""
-      choice="$MENU_CHOICE"
-
-      case "$choice" in
-        1) change_memory_for_map "$map"; pause ;;
-        2)
-          if [ "$memory_override" -eq 1 ]; then
-            remove_memory_for_map "$map"
-          else
-            info "No memory override is currently set for $map."
-          fi
-          pause
-          ;;
-        3) set_max_dimensions_for_map "$map"; pause ;;
-        4) set_active_dimensions_for_map "$map"; pause ;;
-        5) edit_usergame_menu "$map" ;;
-        6) set_display_name_for_map "$map"; pause ;;
-        7) set_password_for_map "$map"; pause ;;
-        8) show_map_dimension_details "$map"; pause ;;
-        9) return ;;
-      esac
-      continue
-    fi
-
-    if [ "$map" = "Overmap" ]; then
-      menu_or_back "Edit Map: $map" \
-        "Memory Limit  Current: ${memory:-unknown}" \
-        "Remove Memory Override" \
-        "Edit UserGame" \
-        "Show Dimension Details" \
-        "Back To Map List" || return
-      MENU_CONTEXT_TEXT=""
-      choice="$MENU_CHOICE"
-
-      case "$choice" in
-        1) change_memory_for_map "$map"; pause ;;
-        2)
-          if [ "$memory_override" -eq 1 ]; then
-            remove_memory_for_map "$map"
-          else
-            info "No memory override is currently set for $map."
-          fi
-          pause
-          ;;
-        3) edit_usergame_menu "$map" ;;
-        4) show_map_dimension_details "$map"; pause ;;
-        5) return ;;
-      esac
-      continue
     fi
 
     if map_is_dedicated_scaling "$map"; then
       menu_or_back "Edit Map: $map" \
         "Memory Limit  Current: ${memory:-unknown}" \
         "Remove Memory Override" \
-        "Edit UserGame" \
         "Show Dimension Details" \
         "Back To Map List" || return
-      MENU_CONTEXT_TEXT=""
       choice="$MENU_CHOICE"
 
       case "$choice" in
@@ -2360,9 +2160,8 @@ edit_sietch_menu() {
           fi
           pause
           ;;
-        3) edit_usergame_menu "$map" ;;
-        4) show_map_dimension_details "$map"; pause ;;
-        5) return ;;
+        3) show_map_dimension_details "$map"; pause ;;
+        4) return ;;
       esac
       continue
     fi
@@ -2373,10 +2172,8 @@ edit_sietch_menu() {
         "Remove Memory Override" \
         "Max Dimensions  Current: ${max:-unknown}" \
         "Active Dimensions  Current: ${active:-unknown}" \
-        "Edit UserGame" \
         "Show Dimension Details" \
         "Back To Map List" || return
-      MENU_CONTEXT_TEXT=""
       choice="$MENU_CHOICE"
 
       case "$choice" in
@@ -2391,9 +2188,8 @@ edit_sietch_menu() {
           ;;
         3) set_max_dimensions_for_map "$map"; pause ;;
         4) set_active_dimensions_for_map "$map"; pause ;;
-        5) edit_usergame_menu "$map" ;;
-        6) show_map_dimension_details "$map"; pause ;;
-        7) return ;;
+        5) show_map_dimension_details "$map"; pause ;;
+        6) return ;;
       esac
       continue
     fi
@@ -2402,10 +2198,8 @@ edit_sietch_menu() {
       "Memory Limit  Current: ${memory:-unknown}" \
       "Remove Memory Override" \
       "Max Dimensions  Current: ${max:-unknown}" \
-      "Edit UserGame" \
       "Show Dimension Details" \
       "Back To Map List" || return
-    MENU_CONTEXT_TEXT=""
     choice="$MENU_CHOICE"
 
     case "$choice" in
@@ -2419,9 +2213,8 @@ edit_sietch_menu() {
         pause
         ;;
       3) set_max_dimensions_for_map "$map"; pause ;;
-      4) edit_usergame_menu "$map" ;;
-      5) show_map_dimension_details "$map"; pause ;;
-      6) return ;;
+      4) show_map_dimension_details "$map"; pause ;;
+      5) return ;;
     esac
   done
 }
@@ -2475,7 +2268,10 @@ updates_menu() {
         rc=$?
         set -e
         if [ "$rc" -eq 100 ]; then
-          run_cmd "$DUNE" update
+          echo
+          if confirm "Install the latest game server update now?"; then
+            run_cmd "$DUNE" update
+          fi
         elif [ "$rc" -ne 0 ]; then
           echo
           echo "Command exited with status $rc."

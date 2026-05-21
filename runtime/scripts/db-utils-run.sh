@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DB_UTILS_IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-db-utils:1960494-0-shipping"
+cd "$(dirname "$0")/../.."
+[ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+source runtime/scripts/image-tags.sh
+DB_UTILS_IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-db-utils:$(resolve_world_image_tag)"
 
 docker run --rm \
   --network dune-net \

@@ -7,7 +7,8 @@ cd "$(dirname "$0")/../.."
 [ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 
 [ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
-POSTGRES_IMAGE_TAG="${DUNE_POSTGRES_IMAGE_TAG:-17.4-alpine-fc-13}"
+source runtime/scripts/image-tags.sh
+POSTGRES_IMAGE_TAG="$(resolve_postgres_image_tag)"
 IMAGE="registry.funcom.com/funcom/self-hosting/igw-postgres:${POSTGRES_IMAGE_TAG}"
 
 mkdir -p runtime/postgres/initdb

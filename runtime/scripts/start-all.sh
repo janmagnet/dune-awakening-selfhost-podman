@@ -16,10 +16,6 @@ echo "=== Starting Postgres ==="
 runtime/scripts/start-postgres.sh
 
 echo
-echo "=== Running database update/migration ==="
-runtime/scripts/update-db.sh
-
-echo
 echo "=== Starting RabbitMQ ==="
 runtime/scripts/start-rabbitmq.sh
 

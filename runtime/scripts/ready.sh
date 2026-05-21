@@ -137,62 +137,6 @@ check_game_server_ready() {
     "This is normal after init/start/restart; game maps can take several minutes to finish loading."
 }
 
-logs_have_runtime_partition_mismatch() {
-  local logs="$1"
-
-  grep -Eiq \
-    'Invalid PartitionId|has no partition definition|thinks farm size is|waiting for persistence to finish initial load' \
-    <<< "$logs"
-}
-
-runtime_partition_repair_hint_needed() {
-  local survival_logs overmap_logs
-
-  if ! is_running dune-server-survival-1 || ! is_running dune-server-overmap; then
-    return 1
-  fi
-
-  survival_logs="$(container_logs dune-server-survival-1)"
-  overmap_logs="$(container_logs dune-server-overmap)"
-
-  if logs_have_runtime_partition_mismatch "$survival_logs" || logs_have_runtime_partition_mismatch "$overmap_logs"; then
-    return 0
-  fi
-
-  return 1
-}
-
-director_fls_ready() {
-  local logs
-
-  if ! is_running dune-director; then
-    return 1
-  fi
-
-  logs="$(docker logs --tail 3000 dune-director 2>&1 || true)"
-
-  # Avoid `printf ... | grep -q` here because this script uses pipefail.
-  # With large Docker logs, grep -q can exit early and make printf hit SIGPIPE,
-  # causing the whole pipeline to look like a failure even when a match exists.
-
-  # Old debug-style success line.
-  if grep -q 'Battlegroups_SendBattlegroupHeartbeat.*Request successful' <<< "$logs"; then
-    return 0
-  fi
-
-  # LIVE useful success signal: Director is declaring a non-zero unlocked population.
-  if grep -Eq 'Population declaration: .*"BattlegroupMaxPlayerCapacity":[1-9][0-9]*.*"IsLocked":false' <<< "$logs"; then
-    return 0
-  fi
-
-  # Startup heartbeat wording used by newer logs.
-  if grep -q 'RMQ connection successful.*Initiating heartbeat' <<< "$logs"; then
-    return 0
-  fi
-
-  return 1
-}
-
 game_server_rmq_connections_ready() {
   local attempt
 
@@ -208,6 +152,43 @@ game_server_rmq_connections_ready() {
   done
 
   return 1
+}
+
+director_fls_ready() {
+  local logs
+
+  if ! is_running dune-director; then
+    return 1
+  fi
+
+  logs="$(docker logs --tail 3000 dune-director 2>&1 || true)"
+
+  if grep -q 'Battlegroups_SendBattlegroupHeartbeat.*Request successful' <<< "$logs"; then
+    return 0
+  fi
+
+  if grep -Eq 'Population declaration: .*"IsLocked":false' <<< "$logs"; then
+    return 0
+  fi
+
+  if grep -q 'RMQ connection successful.*Initiating heartbeat' <<< "$logs"; then
+    return 0
+  fi
+
+  return 1
+}
+
+partition_mismatch_hint_needed() {
+  local logs
+
+  logs="$(
+    {
+      docker logs --tail 3000 dune-server-survival-1 2>&1 || true
+      docker logs --tail 3000 dune-server-overmap 2>&1 || true
+    }
+  )"
+
+  grep -Eq 'Invalid PartitionId|has no partition definition|thinks farm size is|waiting for persistence to finish initial load' <<< "$logs"
 }
 
 echo "=== Container checks ==="
@@ -320,14 +301,14 @@ elif [ "$fail" -eq 0 ]; then
   echo "WARMING: required containers are up; one or more services/maps are still starting."
   echo "Run again in a few minutes:"
   echo "  dune ready"
-  if runtime_partition_repair_hint_needed; then
-    echo
+  echo
+  if partition_mismatch_hint_needed; then
     echo "Possible runtime partition mismatch detected."
     echo "If maps stay WARMING after an update, run:"
     echo "  dune manager"
     echo "  Updates -> Repair Runtime Files"
+    echo
   fi
-  echo
   echo "After READY, population and sietch availability may still take a few minutes"
   echo "to appear in the in-game server browser."
   exit 2

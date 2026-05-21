@@ -7,7 +7,8 @@ cd "$(dirname "$0")/../.."
 [ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 
 [ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
-WORLD_IMAGE_TAG="${DUNE_WORLD_IMAGE_TAG:-1960494-0-shipping}"
+source runtime/scripts/image-tags.sh
+WORLD_IMAGE_TAG="$(resolve_world_image_tag)"
 IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-rabbitmq:${WORLD_IMAGE_TAG}"
 
 mkdir -p runtime/rabbitmq-admin/config

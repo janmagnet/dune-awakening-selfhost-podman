@@ -26,7 +26,7 @@ Usage:
   dune db auto retention <days>
   dune db auto retention off
 
-Backups use pg_dump custom format and can import official Funcom .backup files.
+Backups use pg_dump custom format and do not include Funcom token files.
 Import requires confirmation and creates a pre-import backup first.
 EOF
 }
@@ -56,34 +56,18 @@ config_value() {
 
 valid_backup_basename() {
   local name="$1"
-  printf '%s' "$name" | grep -Eq '^(dune-db-([a-z0-9][a-z0-9_-]*__)?[0-9]{8}-[0-9]{6}\.(dump|sql)|[a-z0-9][a-z0-9_-]*-[0-9]{8}-[0-9]{6}\.backup)$'
-}
-
-backup_file_kind() {
-  local name="$1"
-  case "$name" in
-    *.sql) echo "sql" ;;
-    *.dump) echo "dump" ;;
-    *.backup) echo "backup" ;;
-    *) echo "unknown" ;;
-  esac
+  printf '%s' "$name" | grep -Eq '^dune-db-([a-z0-9][a-z0-9_-]*__)?[0-9]{8}-[0-9]{6}\.(dump|sql)$'
 }
 
 backup_timestamp_from_name() {
   local name="$1"
-  if printf '%s' "$name" | grep -Eq '^dune-db-([a-z0-9][a-z0-9_-]*__)?[0-9]{8}-[0-9]{6}\.(dump|sql)$'; then
-    printf '%s' "$name" | sed -E 's/^dune-db-([a-z0-9][a-z0-9_-]*__)?([0-9]{8}-[0-9]{6})\.(dump|sql)$/\2/'
-  else
-    printf '%s' "$name" | sed -E 's/^([a-z0-9][a-z0-9_-]*)-([0-9]{8}-[0-9]{6})\.backup$/\2/'
-  fi
+  printf '%s' "$name" | sed -E 's/^dune-db-([a-z0-9][a-z0-9_-]*__)?([0-9]{8}-[0-9]{6})\.(dump|sql)$/\2/'
 }
 
 backup_scope_from_name() {
   local name="$1"
   if printf '%s' "$name" | grep -Eq '^dune-db-[a-z0-9][a-z0-9_-]*__[0-9]{8}-[0-9]{6}\.(dump|sql)$'; then
     printf '%s' "$name" | sed -E 's/^dune-db-([a-z0-9][a-z0-9_-]*)__[0-9]{8}-[0-9]{6}\.(dump|sql)$/\1/'
-  elif printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9_-]*-[0-9]{8}-[0-9]{6}\.backup$'; then
-    printf '%s' "$name" | sed -E 's/^([a-z0-9][a-z0-9_-]*)-[0-9]{8}-[0-9]{6}\.backup$/\1/'
   else
     echo "legacy"
   fi
@@ -183,35 +167,18 @@ backup_path_for_name() {
   printf '%s/%s' "$backup_dir" "$name"
 }
 
-backup_sidecar_for_name() {
-  local name="$1"
-  local backup_dir="${2:-$BACKUP_DIR_DEFAULT}"
-  local kind ts scope
-
-  kind="$(backup_file_kind "$name")"
-  case "$kind" in
-    backup)
-      printf '%s/%s.yaml' "$backup_dir" "$name"
-      ;;
-    dump|sql)
-      ts="$(backup_timestamp_from_name "$name")"
-      scope="$(backup_scope_from_name "$name")"
-      printf '%s/dune-db-%s__%s.meta' "$backup_dir" "$scope" "$ts"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
 delete_backup_files_for_name() {
   local name="$1"
   local backup_dir="${2:-$BACKUP_DIR_DEFAULT}"
   local file
-  local sidecar
+  local ts
+  local scope
+  local meta
 
   file="$(backup_path_for_name "$name" "$backup_dir")"
-  sidecar="$(backup_sidecar_for_name "$name" "$backup_dir" || true)"
+  ts="$(backup_timestamp_from_name "$name")"
+  scope="$(backup_scope_from_name "$name")"
+  meta="$backup_dir/dune-db-$scope""__""$ts.meta"
 
   if [ ! -f "$file" ]; then
     echo "Backup file does not exist: $file"
@@ -219,7 +186,7 @@ delete_backup_files_for_name() {
   fi
 
   command rm -f -- "$file"
-  [ -n "$sidecar" ] && [ -f "$sidecar" ] && command rm -f -- "$sidecar"
+  [ -f "$meta" ] && command rm -f -- "$meta"
 }
 
 iter_valid_backup_names() {
@@ -227,7 +194,7 @@ iter_valid_backup_names() {
 
   [ -d "$backup_dir" ] || return 0
 
-  find "$backup_dir" -maxdepth 1 -type f \( -name 'dune-db-*.dump' -o -name 'dune-db-*.sql' -o -name '*.backup' \) -printf '%f\n' \
+  find "$backup_dir" -maxdepth 1 -type f \( -name 'dune-db-*.dump' -o -name 'dune-db-*.sql' \) -printf '%f\n' \
     | while IFS= read -r name; do
         if valid_backup_basename "$name"; then
           printf '%s\n' "$name"
@@ -240,10 +207,8 @@ backup_db() {
   local ts
   local scope
   local scope_maps
-  local battlegroup_id
-  local artifact_id
   local backup_file
-  local sidecar_file
+  local meta_file
   local tmp_file
 
   require_postgres
@@ -253,12 +218,9 @@ backup_db() {
   scope="$(backup_scope_slug)"
   [ -n "$scope" ] || scope="all_maps"
   scope_maps="$(backup_scope_maps)"
-  battlegroup_id="$(config_value runtime/generated/battlegroup.env BATTLEGROUP_ID || true)"
-  artifact_id="$(printf '%s' "${battlegroup_id:-$scope}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/--*/-/g; s/^-//; s/-$//')"
-  [ -n "$artifact_id" ] || artifact_id="dune-docker"
-  backup_file="$out_dir/$artifact_id-$ts.backup"
-  sidecar_file="$backup_file.yaml"
-  tmp_file="/tmp/$artifact_id-$ts.backup"
+  backup_file="$out_dir/dune-db-$scope""__""$ts.dump"
+  meta_file="$out_dir/dune-db-$scope""__""$ts.meta"
+  tmp_file="/tmp/dune-db-$scope""__""$ts.dump"
 
   echo "Creating database backup..."
   docker exec dune-postgres pg_dump -U postgres -d dune -Fc -f "$tmp_file"
@@ -266,29 +228,23 @@ backup_db() {
   docker exec dune-postgres rm -f "$tmp_file" >/dev/null 2>&1 || true
 
   {
-    echo "created_at: \"$(date -Iseconds)\""
-    echo "database: dune"
-    echo "format: pg_dump_custom"
-    echo "backup_layout: funcom_compatible"
-    echo "scope: $scope"
-    echo "battlegroup_id: \"${battlegroup_id:-unknown}\""
-    echo "server_title: \"$(config_value .env SERVER_TITLE || echo unknown)\""
-    echo "server_region: \"$(config_value .env SERVER_REGION || echo unknown)\""
-    echo "server_ip_mode: \"$(config_value .env SERVER_IP_MODE || echo unknown)\""
-    echo "maps:"
-    if [ -n "${scope_maps:-}" ]; then
-      printf '%s' "$scope_maps" | tr ',' '\n' | sed '/^$/d; s/^/  - /'
-    else
-      echo "  - unknown"
-    fi
-  } > "$sidecar_file"
+    echo "created_at=$(date -Iseconds)"
+    echo "database=dune"
+    echo "format=pg_dump_custom"
+    echo "scope=$scope"
+    echo "maps=${scope_maps:-unknown}"
+    echo "server_title=$(config_value .env SERVER_TITLE || echo unknown)"
+    echo "server_region=$(config_value .env SERVER_REGION || echo unknown)"
+    echo "server_ip_mode=$(config_value .env SERVER_IP_MODE || echo unknown)"
+    echo "battlegroup_id=$(config_value runtime/generated/battlegroup.env BATTLEGROUP_ID || echo unknown)"
+  } > "$meta_file"
 
-  chmod 600 "$backup_file" "$sidecar_file"
+  chmod 600 "$backup_file" "$meta_file"
 
   echo "Backup written:"
   echo "  $backup_file"
-  echo "Spec snapshot:"
-  echo "  $sidecar_file"
+  echo "Metadata:"
+  echo "  $meta_file"
 
   if [ "${DB_BACKUP_PRUNE_AFTER_SUCCESS:-0}" = "1" ]; then
     prune_old_db_backups "$out_dir" "${DB_AUTO_BACKUP_RETENTION_DAYS:-0}"
@@ -300,7 +256,7 @@ list_backups() {
 
   echo "=== Database backups ==="
   if [ -d "$out_dir" ]; then
-    find "$out_dir" -maxdepth 1 -type f \( -name 'dune-db-*.dump' -o -name 'dune-db-*.sql' -o -name '*.backup' \) -printf '%TY-%Tm-%Td %TH:%TM  %p\n' | sort || true
+    find "$out_dir" -maxdepth 1 -type f \( -name 'dune-db-*.dump' -o -name 'dune-db-*.sql' \) -printf '%TY-%Tm-%Td %TH:%TM  %p\n' | sort || true
   else
     echo "No backup directory found: $out_dir"
   fi
@@ -439,8 +395,6 @@ import_db() {
   local backup_file="${1:-}"
   local restore_after
   local tmp_file
-  local backup_name
-  local backup_kind
 
   if [ -z "$backup_file" ]; then
     usage
@@ -468,25 +422,11 @@ import_db() {
   stop_db_dependents
   recreate_dune_database
 
-  backup_name="$(basename "$backup_file")"
-  backup_kind="$(backup_file_kind "$backup_name")"
-  tmp_file="/tmp/dune-db-import-$(date +%Y%m%d-%H%M%S).$backup_kind"
+  tmp_file="/tmp/dune-db-import-$(date +%Y%m%d-%H%M%S).dump"
   docker cp "$backup_file" "dune-postgres:$tmp_file"
 
   echo "Restoring database..."
-  case "$backup_kind" in
-    sql)
-      docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -f "$tmp_file"
-      ;;
-    dump|backup)
-      docker exec dune-postgres pg_restore -U postgres -d dune "$tmp_file"
-      ;;
-    *)
-      echo "Unsupported backup file type: $backup_file"
-      docker exec dune-postgres rm -f "$tmp_file" >/dev/null 2>&1 || true
-      exit 1
-      ;;
-  esac
+  docker exec dune-postgres pg_restore -U postgres -d dune "$tmp_file"
   docker exec dune-postgres rm -f "$tmp_file" >/dev/null 2>&1 || true
 
   echo "Database import finished."
@@ -500,6 +440,10 @@ import_db() {
 validate_positive_integer() {
   local value="$1"
   printf '%s' "$value" | grep -Eq '^[1-9][0-9]*$'
+}
+
+can_manage_systemd_units() {
+  [ -d /etc/systemd/system ] && [ -w /etc/systemd/system ]
 }
 
 load_auto_state() {
@@ -576,6 +520,14 @@ auto_backup_enable() {
     return 0
   fi
 
+  if ! can_manage_systemd_units; then
+    echo "Auto DB backup preference saved, but this user cannot install systemd units."
+    echo "Saved: $AUTO_STATE_FILE"
+    echo "To install the timer, run this command with sudo/root:"
+    echo "  runtime/scripts/dune db auto enable $hours${retention_days:+ $retention_days}"
+    return 0
+  fi
+
   cat > "$AUTO_SERVICE_FILE" <<EOF
 [Unit]
 Description=Dune Awakening battlegroup database backup
@@ -628,7 +580,7 @@ auto_backup_disable() {
 
   write_auto_state 0 "$hours" "$retention_days"
 
-  if command -v systemctl >/dev/null 2>&1; then
+  if command -v systemctl >/dev/null 2>&1 && can_manage_systemd_units; then
     systemctl disable --now dune-awakening-db-backup.timer >/dev/null 2>&1 || true
     rm -f "$AUTO_SERVICE_FILE" "$AUTO_TIMER_FILE"
     systemctl daemon-reload
@@ -641,7 +593,11 @@ auto_backup_status() {
   load_auto_state
 
   echo "=== Automatic database backups ==="
-  echo "Enabled:          ${DB_AUTO_BACKUP_ENABLED:-0}"
+  if [ "${DB_AUTO_BACKUP_ENABLED:-0}" = "1" ]; then
+    echo "Enabled:          true"
+  else
+    echo "Enabled:          false"
+  fi
   echo "Interval hours:   ${DB_AUTO_BACKUP_INTERVAL_HOURS:-24}"
   if [ "${DB_AUTO_BACKUP_RETENTION_DAYS:-0}" -gt 0 ] 2>/dev/null; then
     echo "Retention:        ${DB_AUTO_BACKUP_RETENTION_DAYS} days"

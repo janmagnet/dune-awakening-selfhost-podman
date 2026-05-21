@@ -4,34 +4,35 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 [ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
-WORLD_IMAGE_TAG="${DUNE_WORLD_IMAGE_TAG:-1960494-0-shipping}"
+source runtime/scripts/image-tags.sh
+WORLD_IMAGE_TAG="$(resolve_world_image_tag)"
 
 IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-db-utils:${WORLD_IMAGE_TAG}"
-DUMP_DIR="$PWD/runtime/postgres/dumps"
 
 echo "=== Running Dune DB update/migration ==="
 echo "Image: $IMAGE"
 
-mkdir -p "$DUMP_DIR"
-
 docker run --rm \
   --network dune-net \
-  -e DW_PSQL_DIR=/usr \
-  -e PYTHONUNBUFFERED=1 \
-  -v "$DUMP_DIR:/root/DuneSandbox/Saved/DatabaseDumps" \
   --entrypoint sh \
   "$IMAGE" \
   -lc '
 set -e
 
-python /root/PSQL/updatedb.py \
-  --dbhost=dune-postgres:5432 \
-  --dbname=dune \
-  --user=dune \
-  --password=dune \
-  --connect_timeout=30 \
-  --unattended \
-  --verbose \
-  --admin-user=postgres \
-  --admin-password=postgres
+mkdir -p /tmp/pg17/bin
+ln -sf /usr/bin/psql /tmp/pg17/bin/psql
+ln -sf /usr/bin/pg_dump /tmp/pg17/bin/pg_dump
+ln -sf /usr/bin/pg_restore /tmp/pg17/bin/pg_restore
+ln -sf /usr/bin/pg_isready /tmp/pg17/bin/pg_isready
+
+python /root/PSQL/initdb.py \
+  --host dune-postgres:5432 \
+  --project-database dune \
+  --project-user dune \
+  --project-password dune \
+  --admin-user postgres \
+  --admin-password postgres \
+  --admin-database postgres \
+  --postgres-installation /tmp/pg17 \
+  --unattended
 '

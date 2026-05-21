@@ -7,6 +7,10 @@ PARTITION_CATALOG="runtime/generated/partition-catalog.json"
 SERVER_CATALOG="runtime/generated/server-catalog.json"
 CONFIG_FILE="runtime/generated/sietch-config.json"
 
+set_config_permissions() {
+  chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+}
+
 generate_partition_catalog_from_server_catalog() {
   [ -s "$SERVER_CATALOG" ] || return 1
 
@@ -47,9 +51,6 @@ Usage:
   dune sietches
   dune sietches list
   dune sietches show <map-name>
-  dune sietches --picker-labels
-  dune sietches --picker-tsv
-  dune sietches --picker-raw-tsv
   dune sietches dimensions <map-name> [--numbered|--labels|--ids|--partition-at=N]
   dune sietches set-max <map-name> <count>
   dune sietches set-active <map-name> <count>
@@ -78,11 +79,33 @@ require_catalog() {
 }
 
 ensure_config() {
+  local content tmp
+
   mkdir -p runtime/generated
   if [ ! -f "$CONFIG_FILE" ]; then
     printf '{\n  "maps": {},\n  "partitions": {}\n}\n' > "$CONFIG_FILE"
   fi
-  chmod 600 "$CONFIG_FILE"
+
+  if [ ! -r "$CONFIG_FILE" ] || [ ! -w "$CONFIG_FILE" ]; then
+    content='{
+  "maps": {},
+  "partitions": {}
+}
+'
+    if [ -r "$CONFIG_FILE" ]; then
+      content="$(cat "$CONFIG_FILE")"
+      case "$content" in
+        *$'\n') ;;
+        *) content="${content}"$'\n' ;;
+      esac
+    fi
+
+    tmp="${CONFIG_FILE}.tmp.$$"
+    printf '%s' "$content" > "$tmp"
+    mv -f "$tmp" "$CONFIG_FILE"
+  fi
+
+  set_config_permissions
 }
 
 validate_positive_integer() {
@@ -216,32 +239,6 @@ for name in order:
 if mode == "--names":
     for row in rows:
         print(row[0])
-elif mode == "--picker-labels":
-    for name, max_dimensions, active_dimensions, memory, kind in rows:
-        details = []
-        if kind == "Dedicated Scaling":
-            details.append("dedicatedScaling")
-        elif kind == "Always-On":
-            details.append("always-on")
-        elif kind == "Dynamic":
-            details.append("dynamic")
-        suffix = f"  {' '.join(details)}" if details else ""
-        print(f"{name}  max: {max_dimensions}  active: {active_dimensions}  memory: {memory}{suffix}")
-elif mode == "--picker-tsv":
-    for name, max_dimensions, active_dimensions, memory, kind in rows:
-        details = []
-        if kind == "Dedicated Scaling":
-            details.append("dedicatedScaling")
-        elif kind == "Always-On":
-            details.append("always-on")
-        elif kind == "Dynamic":
-            details.append("dynamic")
-        suffix = f"  {' '.join(details)}" if details else ""
-        label = f"{name}  max: {max_dimensions}  active: {active_dimensions}  memory: {memory}{suffix}"
-        print(f"{name}\t{label}")
-elif mode == "--picker-raw-tsv":
-    for name, max_dimensions, active_dimensions, memory, kind in rows:
-        print(f"{name}\t{max_dimensions}\t{active_dimensions}\t{memory}\t{kind}")
 elif mode == "--numbered":
     print(f"{'#':>3}  {'MAP':<28} {'MAX DIMENSIONS':<14} {'ACTIVE DIMENSIONS':<18} {'MEMORY':<10} TYPE")
     for idx, (name, max_dimensions, active_dimensions, memory, kind) in enumerate(rows, 1):
@@ -480,7 +477,7 @@ if key == "max_dimensions":
         entry["active_dimensions"] = value
 config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 PY
-  chmod 600 "$CONFIG_FILE"
+  set_config_permissions
 }
 
 sync_partition_catalog_from_db() {
@@ -703,7 +700,7 @@ if not entry:
     config.get("partitions", {}).pop(partition_id, None)
 config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 PY
-  chmod 600 "$CONFIG_FILE"
+  set_config_permissions
 }
 
 runtime_args() {
@@ -794,7 +791,7 @@ case "$cmd" in
     [ "$#" -eq 2 ] || { usage; exit 2; }
     reconcile_map_dimensions "$2"
     ;;
-  --names|--numbered|--picker-labels|--picker-tsv|--picker-raw-tsv)
+  --names|--numbered)
     list_sietches "$cmd"
     ;;
   --map-at=*)

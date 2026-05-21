@@ -20,6 +20,39 @@ config_value() {
   ' "$file"
 }
 
+value_is_known() {
+  local value="${1:-}"
+  [ -n "$value" ] && [ "$value" != "unknown" ]
+}
+
+is_running() {
+  local name="$1"
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+}
+
+container_env_value() {
+  local container="$1"
+  local key="$2"
+
+  if ! is_running "$container"; then
+    return 1
+  fi
+
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+    | awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); exit }'
+}
+
+first_known_value() {
+  local candidate
+  for candidate in "$@"; do
+    if value_is_known "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 steam_build_id() {
   local app_id="$1"
   local manifest="/tmp/dune-appmanifest-${app_id}.acf"
@@ -55,9 +88,30 @@ if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/n
   fi
 fi
 
-STEAM_APP_ID_VALUE="$(config_value .env STEAM_APP_ID || echo "${STEAM_APP_ID:-4754530}")"
-SERVER_IP_VALUE="$(config_value .env SERVER_IP || echo unknown)"
-SERVER_MODE_VALUE="$(config_value .env SERVER_IP_MODE || true)"
+STEAM_APP_ID_VALUE="$(first_known_value \
+  "$(config_value .env STEAM_APP_ID 2>/dev/null || true)" \
+  "${STEAM_APP_ID:-}" \
+  "4754530" \
+  || echo "4754530")"
+SERVER_TITLE_VALUE="$(first_known_value \
+  "$(config_value .env SERVER_TITLE 2>/dev/null || true)" \
+  "$(container_env_value dune-director BATTLEGROUP_TITLE 2>/dev/null || true)" \
+  "$(container_env_value dune-server-gateway gateway_display_name 2>/dev/null || true)" \
+  || echo "unknown")"
+SERVER_REGION_VALUE="$(first_known_value \
+  "$(config_value .env SERVER_REGION 2>/dev/null || true)" \
+  "$(container_env_value dune-director BATTLEGROUP_REGION_NAME 2>/dev/null || true)" \
+  "$(container_env_value dune-server-gateway OnlineSubsystem_DatacenterId 2>/dev/null || true)" \
+  || echo "unknown")"
+SERVER_IP_VALUE="$(first_known_value \
+  "$(config_value .env SERVER_IP 2>/dev/null || true)" \
+  "$(container_env_value dune-director HOST_DATACENTER_IP_ADDRESS 2>/dev/null || true)" \
+  "$(container_env_value dune-server-gateway HOST_DATACENTER_IP_ADDRESS 2>/dev/null || true)" \
+  || echo "unknown")"
+SERVER_MODE_VALUE="$(first_known_value \
+  "$(config_value .env SERVER_IP_MODE 2>/dev/null || true)" \
+  "${SERVER_IP_MODE:-}" \
+  || true)"
 
 if [ -z "$SERVER_MODE_VALUE" ] || [ "$SERVER_MODE_VALUE" = "unknown" ]; then
   if printf '%s' "$SERVER_IP_VALUE" | grep -Eq '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)'; then
@@ -77,16 +131,11 @@ printf "%-18s %s\n" "Working tree:" "$GIT_STATE"
 
 echo
 echo "=== Server config ==="
-if [ -f .env ]; then
-  printf "%-18s %s\n" "Title:" "$(config_value .env SERVER_TITLE || echo unknown)"
-  printf "%-18s %s\n" "Region:" "$(config_value .env SERVER_REGION || echo unknown)"
-  printf "%-18s %s\n" "Mode:" "$SERVER_MODE_VALUE"
-  printf "%-18s %s\n" "Server IP:" "$SERVER_IP_VALUE"
-  printf "%-18s %s\n" "Steam app ID:" "$STEAM_APP_ID_VALUE"
-else
-  echo ".env not found"
-  printf "%-18s %s\n" "Steam app ID:" "$STEAM_APP_ID_VALUE"
-fi
+printf "%-18s %s\n" "Title:" "${SERVER_TITLE_VALUE:-unknown}"
+printf "%-18s %s\n" "Region:" "${SERVER_REGION_VALUE:-unknown}"
+printf "%-18s %s\n" "Mode:" "$SERVER_MODE_VALUE"
+printf "%-18s %s\n" "Server IP:" "$SERVER_IP_VALUE"
+printf "%-18s %s\n" "Steam app ID:" "$STEAM_APP_ID_VALUE"
 
 echo
 echo "=== Installed server build ==="
@@ -97,5 +146,19 @@ echo "=== Image tags ==="
 if [ -f runtime/generated/image-tags.env ]; then
   sed -n '1,80p' runtime/generated/image-tags.env
 else
-  echo "runtime/generated/image-tags.env not found"
+  if is_running dune-director; then
+    printf "%-24s %s\n" "Director image:" "$(docker inspect --format '{{.Config.Image}}' dune-director 2>/dev/null || echo unknown)"
+  fi
+  if is_running dune-server-gateway; then
+    printf "%-24s %s\n" "Gateway image:" "$(docker inspect --format '{{.Config.Image}}' dune-server-gateway 2>/dev/null || echo unknown)"
+  fi
+  if is_running dune-server-overmap; then
+    printf "%-24s %s\n" "Overmap image:" "$(docker inspect --format '{{.Config.Image}}' dune-server-overmap 2>/dev/null || echo unknown)"
+  fi
+  if is_running dune-server-survival-1; then
+    printf "%-24s %s\n" "Survival_1 image:" "$(docker inspect --format '{{.Config.Image}}' dune-server-survival-1 2>/dev/null || echo unknown)"
+  fi
+  if ! is_running dune-director && ! is_running dune-server-gateway && ! is_running dune-server-overmap && ! is_running dune-server-survival-1; then
+    echo "runtime/generated/image-tags.env not found"
+  fi
 fi

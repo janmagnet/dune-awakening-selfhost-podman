@@ -7,9 +7,31 @@ set -a
 [ -f .env ] && . ./.env
 [ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 set +a
+source runtime/scripts/runtime-env.sh
 
 issue=0
 warming=0
+
+config_value() {
+  local file="$1"
+  local key="$2"
+
+  [ -f "$file" ] || return 1
+  awk -F= -v key="$key" '
+    $1 == key {
+      value = substr($0, length(key) + 2)
+      gsub(/^"/, "", value)
+      gsub(/"$/, "", value)
+      print value
+      exit
+    }
+  ' "$file"
+}
+
+value_is_known() {
+  local value="${1:-}"
+  [ -n "$value" ] && [ "$value" != "unknown" ]
+}
 
 is_running() {
   local name="$1"
@@ -92,8 +114,31 @@ count_rmq_prefix() {
 
 recent_director_logs() {
   if is_running dune-director; then
-    docker logs --since 15m dune-director 2>&1 || true
+    docker logs --since 4h dune-director 2>&1 || true
   fi
+}
+
+container_env_value() {
+  local container="$1"
+  local key="$2"
+
+  if ! is_running "$container"; then
+    return 1
+  fi
+
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+    | awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); exit }'
+}
+
+first_known_value() {
+  local candidate
+  for candidate in "$@"; do
+    if value_is_known "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
 }
 
 latest_number_from_director_logs() {
@@ -116,29 +161,9 @@ signal_state() {
   fi
 }
 
-logs_have_runtime_partition_mismatch() {
-  local logs="$1"
-
-  grep -Eiq \
-    'Invalid PartitionId|has no partition definition|thinks farm size is|waiting for persistence to finish initial load' \
-    <<< "$logs"
-}
-
-runtime_partition_repair_hint_needed() {
-  local survival_logs overmap_logs
-
-  if ! is_running dune-server-survival-1 || ! is_running dune-server-overmap; then
-    return 1
-  fi
-
-  survival_logs="$(docker logs dune-server-survival-1 2>&1 || true)"
-  overmap_logs="$(docker logs dune-server-overmap 2>&1 || true)"
-
-  if logs_have_runtime_partition_mismatch "$survival_logs" || logs_have_runtime_partition_mismatch "$overmap_logs"; then
-    return 0
-  fi
-
-  return 1
+director_log_has() {
+  local pattern="$1"
+  grep -Eq "$pattern" <<< "$director_logs"
 }
 
 autoscaler_state() {
@@ -166,10 +191,38 @@ auto_update_state() {
   fi
 }
 
-display_mode="${SERVER_IP_MODE:-}"
+resolved_title="$(first_known_value \
+  "${SERVER_TITLE:-}" \
+  "$(config_value .env SERVER_TITLE 2>/dev/null || true)" \
+  "$(container_env_value dune-director BATTLEGROUP_TITLE 2>/dev/null || true)" \
+  "$(container_env_value dune-server-gateway gateway_display_name 2>/dev/null || true)" \
+  || true)"
+resolved_region="$(first_known_value \
+  "${SERVER_REGION:-}" \
+  "$(config_value .env SERVER_REGION 2>/dev/null || true)" \
+  "$(container_env_value dune-director BATTLEGROUP_REGION_NAME 2>/dev/null || true)" \
+  "$(container_env_value dune-server-gateway OnlineSubsystem_DatacenterId 2>/dev/null || true)" \
+  || true)"
+resolved_server_ip="$(first_known_value \
+  "${SERVER_IP:-}" \
+  "$(config_value .env SERVER_IP 2>/dev/null || true)" \
+  "$(container_env_value dune-director HOST_DATACENTER_IP_ADDRESS 2>/dev/null || true)" \
+  "$(container_env_value dune-server-gateway HOST_DATACENTER_IP_ADDRESS 2>/dev/null || true)" \
+  || true)"
+resolved_battlegroup_id="$(first_known_value \
+  "$(resolve_battlegroup_id 2>/dev/null || true)" \
+  "$(container_env_value dune-director BATTLEGROUP 2>/dev/null || true)" \
+  "$(container_env_value dune-server-gateway BATTLEGROUP 2>/dev/null || true)" \
+  "${BATTLEGROUP_ID:-}" \
+  || true)"
+display_mode="$(first_known_value \
+  "${SERVER_IP_MODE:-}" \
+  "$(config_value .env SERVER_IP_MODE 2>/dev/null || true)" \
+  || true)"
+
 if [ -z "$display_mode" ] || [ "$display_mode" = "unknown" ]; then
-  if [ -n "${SERVER_IP:-}" ]; then
-    if is_private_ipv4 "$SERVER_IP"; then
+  if value_is_known "$resolved_server_ip"; then
+    if is_private_ipv4 "$resolved_server_ip"; then
       display_mode="local"
     else
       display_mode="public"
@@ -220,19 +273,99 @@ fi
 survival_state="$(map_state dune-server-survival-1 'Server farm is READY .*partition 1')"
 overmap_state="$(map_state dune-server-overmap 'Server farm is READY .*partition 2')"
 
-heartbeat_state="$(signal_state 'Battlegroups_SendBattlegroupHeartbeat.*Request successful' OK WAIT)"
-population_state="$(signal_state 'Battlegroups_DeclarePopulationAndActivity.*Request successful' OK WAIT)"
-capacity_state="$(signal_state 'Battlegroups_DeclareMaxPlayerCapacities.*Request successful' OK WAIT)"
+active="$(latest_number_from_director_logs 'BattlegroupCurrentActive' || true)"
+capacity="$(latest_number_from_director_logs 'BattlegroupMaxPlayerCapacity' || true)"
+configured_capacity="$(awk '
+  function flush_section(    effective_update, effective_cap) {
+    if (section == "" || section == "Server" || section == "Battlegroup" || section == "InstancingModes") {
+      return
+    }
 
-if is_running dune-server-gateway && docker logs --tail 5000 dune-server-gateway 2>&1 | grep -q 'Monitoring for servers going up or down'; then
+    effective_update = section_update
+    if (effective_update == "") {
+      effective_update = default_update
+    }
+
+    effective_cap = section_cap
+    if (effective_cap == "") {
+      effective_cap = default_cap
+    }
+
+    if (effective_update == "true" && effective_cap ~ /^[0-9]+$/) {
+      sum += effective_cap
+    }
+  }
+
+  /^\[/ {
+    flush_section()
+    section = $0
+    gsub(/^\[|\]$/, "", section)
+    section_update = ""
+    section_cap = ""
+    next
+  }
+
+  /^ShouldUpdatePlayerCountOnFls=/ {
+    value = substr($0, index($0, "=") + 1)
+    gsub(/[[:space:]]+$/, "", value)
+    if (section == "Server") {
+      default_update = tolower(value)
+    } else {
+      section_update = tolower(value)
+    }
+    next
+  }
+
+  /^PlayerHardCap=/ {
+    value = substr($0, index($0, "=") + 1)
+    gsub(/[[:space:]]+$/, "", value)
+    if (section == "Server") {
+      default_cap = value
+    } else {
+      section_cap = value
+    }
+    next
+  }
+
+  END {
+    flush_section()
+    print sum + 0
+  }
+' runtime/director/config/director_config.ini 2>/dev/null || true)"
+
+if ! [ "${capacity:-0}" -gt 0 ] 2>/dev/null && [ "${configured_capacity:-0}" -gt 0 ] 2>/dev/null; then
+  capacity="$configured_capacity"
+fi
+
+if director_log_has 'Battlegroups_SendBattlegroupHeartbeat.*Request successful|Initiating heartbeat'; then
+  heartbeat_state="OK"
+else
+  heartbeat_state="WAIT"
+fi
+
+if director_log_has 'Battlegroups_DeclarePopulationAndActivity.*Request successful|Population declaration:'; then
+  population_state="OK"
+else
+  population_state="WAIT"
+fi
+
+if director_log_has 'Battlegroups_DeclareMaxPlayerCapacities.*Request successful'; then
+  capacity_state="OK"
+elif director_log_has 'Population declaration:'; then
+  capacity_state="OK"
+elif [ "${configured_capacity:-0}" -gt 0 ] 2>/dev/null; then
+  capacity_state="OK"
+else
+  capacity_state="WAIT"
+fi
+
+if is_running dune-server-gateway && docker logs --tail 5000 dune-server-gateway 2>&1 | grep -Eq 'Monitoring for servers going up or down|Starting gateway for battlegroup'; then
   gateway_db_state="OK"
 else
-gateway_db_state="WAIT"
+  gateway_db_state="WAIT"
   warming=1
 fi
 
-active="$(latest_number_from_director_logs 'BattlegroupCurrentActive' || true)"
-capacity="$(latest_number_from_director_logs 'BattlegroupMaxPlayerCapacity' || true)"
 population="${active:-unknown}/${capacity:-unknown}"
 
 case "$container_rows" in
@@ -273,11 +406,11 @@ fi
 
 echo "=== Dune status ==="
 echo "Overall:     $overall"
-echo "Title:       ${SERVER_TITLE:-unknown}"
-echo "Region:      ${SERVER_REGION:-unknown}"
+echo "Title:       ${resolved_title:-unknown}"
+echo "Region:      ${resolved_region:-unknown}"
 echo "Mode:        $display_mode"
-echo "Server IP:   ${SERVER_IP:-unknown}"
-echo "Battlegroup: ${BATTLEGROUP_ID:-unknown}"
+echo "Server IP:   ${resolved_server_ip:-unknown}"
+echo "Battlegroup: ${resolved_battlegroup_id:-unknown}"
 echo "Population:  $population"
 echo
 
@@ -336,8 +469,3 @@ echo "Gateway DB monitoring:    $gateway_db_state"
 echo
 echo "Tip: use 'dune ready' for pass/wait/fail readiness checks."
 echo "Tip: use 'dune doctor' for troubleshooting suggestions."
-if [ "$overall" = "WARMING" ] && runtime_partition_repair_hint_needed; then
-  echo
-  echo "Hint: runtime partition data may be out of sync with the installed server files."
-  echo "If this happened after an update, run: Updates -> Repair Runtime Files"
-fi

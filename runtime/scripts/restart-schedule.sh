@@ -46,6 +46,10 @@ require_positive_hours() {
   fi
 }
 
+can_manage_systemd_units() {
+  [ -d /etc/systemd/system ] && [ -w /etc/systemd/system ]
+}
+
 install_units() {
   local hours="$1"
 
@@ -66,8 +70,9 @@ EOF
 Description=Run Dune Awakening scheduled battlegroup restart
 
 [Timer]
-OnBootSec=${hours}h
+OnActiveSec=${hours}h
 OnUnitActiveSec=${hours}h
+AccuracySec=1min
 Persistent=true
 Unit=dune-awakening-scheduled-restart.service
 
@@ -88,6 +93,14 @@ enable_schedule() {
     return 0
   fi
 
+  if ! can_manage_systemd_units; then
+    echo "Scheduled restart preference saved, but this user cannot install systemd units."
+    echo "Saved: $STATE_FILE"
+    echo "To install the timer, run this command with sudo/root:"
+    echo "  runtime/scripts/restart-schedule.sh enable $hours"
+    return 0
+  fi
+
   install_units "$hours"
   systemctl daemon-reload
   systemctl enable --now dune-awakening-scheduled-restart.timer
@@ -101,7 +114,7 @@ disable_schedule() {
   read_state
   write_state 0 "${DUNE_SCHEDULED_RESTART_HOURS:-}"
 
-  if command -v systemctl >/dev/null 2>&1; then
+  if command -v systemctl >/dev/null 2>&1 && can_manage_systemd_units; then
     systemctl disable --now dune-awakening-scheduled-restart.timer >/dev/null 2>&1 || true
     rm -f "$SERVICE_FILE" "$TIMER_FILE"
     systemctl daemon-reload
@@ -112,8 +125,13 @@ disable_schedule() {
 
 show_status() {
   read_state
+  local enabled_text="false"
 
-  echo "Scheduled restart enabled: ${DUNE_SCHEDULED_RESTART_ENABLED:-0}"
+  if [ "${DUNE_SCHEDULED_RESTART_ENABLED:-0}" = "1" ]; then
+    enabled_text="true"
+  fi
+
+  echo "Scheduled restart enabled: $enabled_text"
   echo "Restart interval hours:   ${DUNE_SCHEDULED_RESTART_HOURS:-unset}"
 
   if command -v systemctl >/dev/null 2>&1; then

@@ -3,7 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-DB_UTILS_IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-db-utils:1960494-0-shipping"
+cd "$(dirname "$0")/../.."
+[ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+source runtime/scripts/image-tags.sh
+DB_UTILS_IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-db-utils:$(resolve_world_image_tag)"
 PARTITION_PRESET="${PARTITION_PRESET:-full_battlegroup}"
 
 echo "Initializing Dune database with partition preset: ${PARTITION_PRESET}"

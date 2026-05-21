@@ -7,7 +7,9 @@ cd "$(dirname "$0")/../.."
 [ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 
 [ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
-WORLD_IMAGE_TAG="${DUNE_WORLD_IMAGE_TAG:-1960494-0-shipping}"
+source runtime/scripts/runtime-env.sh
+source runtime/scripts/image-tags.sh
+WORLD_IMAGE_TAG="$(resolve_world_image_tag)"
 IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-gateway:${WORLD_IMAGE_TAG}"
 
 TOKEN_FILE="runtime/secrets/funcom-token.txt"
@@ -33,10 +35,10 @@ FUNCOM_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
 RMQ_HTTP_TOKEN_AUTH_SECRET="$(tr -d '\r\n' < "$RMQ_SECRET_FILE")"
 FLS_APIKEY="$(tr -d '\r\n' < "$FLS_APIKEY_FILE")"
 
-SERVER_TITLE="${SERVER_TITLE:-My Dune Server}"
-SERVER_REGION="${SERVER_REGION:-Europe}"
-SERVER_IP="${SERVER_IP:-auto}"
-BATTLEGROUP_ID="${BATTLEGROUP_ID:-dune-docker}"
+SERVER_TITLE="$(resolve_server_title)"
+SERVER_REGION="$(resolve_server_region)"
+SERVER_IP="$(resolve_server_ip)"
+BATTLEGROUP_ID="$(resolve_battlegroup_id)"
 
 if [ "$SERVER_IP" = "auto" ]; then
   SERVER_IP="$(curl -4fsSL https://api.ipify.org || echo 127.0.0.1)"

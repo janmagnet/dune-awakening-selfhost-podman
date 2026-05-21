@@ -30,8 +30,10 @@ TARGET="$1"
 [ -f .env ] && . ./.env
 [ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 [ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+source runtime/scripts/runtime-env.sh
+source runtime/scripts/image-tags.sh
 
-WORLD_IMAGE_TAG="${DUNE_WORLD_IMAGE_TAG:-1960494-0-shipping}"
+WORLD_IMAGE_TAG="$(resolve_world_image_tag)"
 IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server:${WORLD_IMAGE_TAG}"
 
 TOKEN_FILE="runtime/secrets/funcom-token.txt"
@@ -49,11 +51,10 @@ FUNCOM_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
 RMQ_HTTP_TOKEN_AUTH_SECRET="$(tr -d '\r\n' < "$RMQ_SECRET_FILE")"
 FLS_APIKEY="$(tr -d '\r\n' < "$FLS_APIKEY_FILE")"
 
-SERVER_TITLE="${SERVER_TITLE:-My Dune Server}"
-SERVER_REGION="${SERVER_REGION:-Europe}"
-SERVER_IP="${SERVER_IP:-auto}"
-BATTLEGROUP_ID="${BATTLEGROUP_ID:-dune-docker}"
-FAKE_K8S_SERVICEACCOUNT_DIR="${DUNE_FAKE_K8S_SERVICEACCOUNT_DIR:-$PWD/runtime/generated/dune-fake-k8s-serviceaccount}"
+SERVER_TITLE="$(resolve_server_title)"
+SERVER_REGION="$(resolve_server_region)"
+SERVER_IP="$(resolve_server_ip)"
+BATTLEGROUP_ID="$(resolve_battlegroup_id)"
 
 if [ "$SERVER_IP" = "auto" ]; then
   SERVER_IP="$(curl -4fsSL https://api.ipify.org || echo 127.0.0.1)"
@@ -117,6 +118,12 @@ fi
 
 safe_name="$(echo "$MAP_NAME-$PARTITION_ID" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')"
 CONTAINER_NAME="dune-server-${safe_name}"
+
+if [ -n "${DUNE_FAKE_K8S_SERVICEACCOUNT_DIR:-}" ]; then
+  FAKE_K8S_SERVICEACCOUNT_DIR="$DUNE_FAKE_K8S_SERVICEACCOUNT_DIR"
+else
+  FAKE_K8S_SERVICEACCOUNT_DIR="$PWD/runtime/generated/dune-fake-k8s-serviceaccount-${safe_name}-$$"
+fi
 
 memory_for_map() {
   local map="$1"
@@ -213,7 +220,7 @@ mkdir -p "runtime/game/$safe_name/Saved"
 mkdir -p runtime/game/artifacts
 mkdir -p "$FAKE_K8S_SERVICEACCOUNT_DIR"
 mkdir -p runtime/container
-python3 runtime/scripts/usersettings.py materialize "$MAP_NAME" "$PWD/runtime/game/$safe_name/Saved"
+python3 runtime/scripts/usersettings.py materialize "$MAP_NAME" "$PWD/runtime/game/$safe_name/Saved" "$PARTITION_ID"
 
 cat > "$FAKE_K8S_SERVICEACCOUNT_DIR/namespace" <<EOF
 funcom-seabass-$BATTLEGROUP_ID
@@ -230,8 +237,6 @@ docker run -d \
   --name "$CONTAINER_NAME" \
   --network host \
   --restart unless-stopped \
-  --add-host dune-rmq-game:127.0.0.1 \
-  --add-host dune-rmq-admin:127.0.0.1 \
   --privileged \
   --cap-add SYS_ADMIN \
   --security-opt seccomp=unconfined \
@@ -273,9 +278,9 @@ docker run -d \
   "-ini:engine:[URL]:Port=$GAME_PORT" \
   "-ini:engine:[URL]:IGWPort=$IGW_PORT" \
   -battlegroup-director-url=127.0.0.1:11717 \
-  --RMQGameHostname=dune-rmq-game \
+  --RMQGameHostname=127.0.0.1 \
   --RMQGamePort=31982 \
-  --RMQAdminHostname=dune-rmq-admin \
+  --RMQAdminHostname=127.0.0.1 \
   --RMQAdminPort=32573 \
   "${SIETCH_RUNTIME_ARGS[@]}" \
   -stdout \

@@ -27,6 +27,45 @@ config_value() {
   ' "$file"
 }
 
+value_is_known() {
+  local value="${1:-}"
+  [ -n "$value" ] && [ "$value" != "unknown" ]
+}
+
+is_running() {
+  local name="$1"
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+}
+
+container_env_value() {
+  local container="$1"
+  local key="$2"
+
+  if ! is_running "$container"; then
+    return 1
+  fi
+
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+    | awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); exit }'
+}
+
+current_server_title() {
+  local title=""
+
+  for title in \
+    "$(config_value .env SERVER_TITLE 2>/dev/null || true)" \
+    "$(container_env_value dune-director BATTLEGROUP_TITLE 2>/dev/null || true)" \
+    "$(container_env_value dune-server-gateway gateway_display_name 2>/dev/null || true)"
+  do
+    if value_is_known "$title"; then
+      printf '%s' "$title"
+      return 0
+    fi
+  done
+
+  printf '%s' "unknown"
+}
+
 set_env_value() {
   local key="$1"
   local value="$2"
@@ -81,7 +120,7 @@ case "$cmd" in
     done
 
     if [ "${#title_parts[@]}" -eq 0 ]; then
-      echo "Current server title: $(config_value .env SERVER_TITLE || echo unknown)"
+      echo "Current server title: $(current_server_title)"
       exit 0
     fi
 

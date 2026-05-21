@@ -7,7 +7,9 @@ cd "$(dirname "$0")/../.."
 [ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 
 [ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
-WORLD_IMAGE_TAG="${DUNE_WORLD_IMAGE_TAG:-1960494-0-shipping}"
+source runtime/scripts/runtime-env.sh
+source runtime/scripts/image-tags.sh
+WORLD_IMAGE_TAG="$(resolve_world_image_tag)"
 IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server:${WORLD_IMAGE_TAG}"
 
 TOKEN_FILE="runtime/secrets/funcom-token.txt"
@@ -18,13 +20,17 @@ FUNCOM_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
 RMQ_HTTP_TOKEN_AUTH_SECRET="$(tr -d '\r\n' < "$RMQ_SECRET_FILE")"
 FLS_APIKEY="$(tr -d '\r\n' < "$FLS_APIKEY_FILE")"
 
-SERVER_TITLE="${SERVER_TITLE:-My Dune Server}"
-SERVER_REGION="${SERVER_REGION:-Europe}"
-SERVER_IP="${SERVER_IP:-auto}"
-BATTLEGROUP_ID="${BATTLEGROUP_ID:-dune-docker}"
+SERVER_TITLE="$(resolve_server_title)"
+SERVER_REGION="$(resolve_server_region)"
+SERVER_IP="$(resolve_server_ip)"
+BATTLEGROUP_ID="$(resolve_battlegroup_id)"
 MEMORY="${DUNE_MEMORY_OVERMAP:-2g}"
 PARTITION_ID="${DUNE_OVERMAP_PARTITION_ID:-2}"
-FAKE_K8S_SERVICEACCOUNT_DIR="${DUNE_FAKE_K8S_SERVICEACCOUNT_DIR:-$PWD/runtime/generated/dune-fake-k8s-serviceaccount}"
+if [ -n "${DUNE_FAKE_K8S_SERVICEACCOUNT_DIR:-}" ]; then
+  FAKE_K8S_SERVICEACCOUNT_DIR="$DUNE_FAKE_K8S_SERVICEACCOUNT_DIR"
+else
+  FAKE_K8S_SERVICEACCOUNT_DIR="$PWD/runtime/generated/dune-fake-k8s-serviceaccount-overmap-$$"
+fi
 
 if [ "$SERVER_IP" = "auto" ]; then
   SERVER_IP="$(curl -4fsSL https://api.ipify.org || echo 127.0.0.1)"
@@ -58,8 +64,6 @@ docker run -d \
   --name dune-server-overmap \
   --network host \
   --restart unless-stopped \
-  --add-host dune-rmq-game:127.0.0.1 \
-  --add-host dune-rmq-admin:127.0.0.1 \
   --privileged \
   --cap-add SYS_ADMIN \
   --security-opt seccomp=unconfined \
@@ -101,9 +105,9 @@ docker run -d \
   "-ini:engine:[URL]:Port=7777" \
   "-ini:engine:[URL]:IGWPort=7889" \
   -battlegroup-director-url=127.0.0.1:11717 \
-  --RMQGameHostname=dune-rmq-game \
+  --RMQGameHostname=127.0.0.1 \
   --RMQGamePort=31982 \
-  --RMQAdminHostname=dune-rmq-admin \
+  --RMQAdminHostname=127.0.0.1 \
   --RMQAdminPort=32573 \
   "${SIETCH_RUNTIME_ARGS[@]}" \
   -stdout \

@@ -281,12 +281,74 @@ show_status() {
   echo
 
   if [ -s "$CATALOG" ]; then
-    printf "%-28s %s\n" "MAP" "MEMORY"
-    while IFS= read -r map; do
-      key="$(env_key_for "$map")"
-      value="$(env_value "$key" || true)"
-      printf "%-28s %s\n" "$map" "${value:-default}"
-    done < <(list_maps --names)
+    python3 - "$CATALOG" "$SERVER_CATALOG" ".env" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+catalog = json.loads(Path(sys.argv[1]).read_text())
+server_catalog_path = Path(sys.argv[2])
+env_path = Path(sys.argv[3])
+env = {}
+if env_path.exists():
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip()
+
+def env_key(name: str) -> str:
+    lowered = name.lower()
+    if lowered in {"survival", "survival-1", "survival_1"}:
+        return "DUNE_MEMORY_SURVIVAL_1"
+    if lowered == "overmap":
+        return "DUNE_MEMORY_OVERMAP"
+    normalized = re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")
+    return f"DUNE_MEMORY_{normalized}"
+
+server_catalog = []
+if server_catalog_path.exists():
+    try:
+        server_catalog = json.loads(server_catalog_path.read_text())
+    except Exception:
+        server_catalog = []
+
+server_by_map = {}
+for row in server_catalog:
+    name = str(row.get("map", "")).strip()
+    if name and name not in server_by_map:
+        server_by_map[name] = row
+
+rows = []
+seen = set()
+global_default = env.get("DUNE_MEMORY_DEFAULT", "")
+for row in catalog:
+    name = str(row.get("map", ""))
+    if not name or name in seen:
+        continue
+    seen.add(name)
+    override = env.get(env_key(name), "")
+    catalog_memory = str(
+        server_by_map.get(name, {}).get("resources", {}).get("limits", {}).get("memory", "")
+    ).strip()
+
+    if override:
+        display = override
+    elif catalog_memory:
+        display = f"{catalog_memory} default"
+    elif global_default:
+        display = global_default
+    else:
+        display = "3g default"
+
+    rows.append((name, display))
+
+print(f"{'MAP':<28} MEMORY")
+for name, display in rows:
+    print(f"{name:<28} {display}")
+PY
   else
     echo "Map catalog not found. Run dune memory list-maps after init."
     echo

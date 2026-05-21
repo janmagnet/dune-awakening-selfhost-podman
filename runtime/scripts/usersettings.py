@@ -1,226 +1,182 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import shutil
+import configparser
+import json
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-DEFAULTS_DIR = ROOT / "runtime" / "defaults"
-GENERATED_DIR = ROOT / "runtime" / "generated" / "usersettings"
-MAPS_DIR = GENERATED_DIR / "maps"
 
-ENGINE_DEFAULT_PATH = DEFAULTS_DIR / "UserEngine.ini"
-GAME_DEFAULT_PATH = DEFAULTS_DIR / "UserGame.ini"
-ENGINE_CUSTOM_PATH = GENERATED_DIR / "UserEngine.ini"
+ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATH = ROOT / "runtime" / "generated" / "usersettings.json"
 
 ENGINE_FIELDS = {
-    "mining_output_multiplier": ("[ConsoleVariables]", "Dune.GlobalMiningOutputMultiplier", "float"),
-    "vehicle_mining_output_multiplier": ("[ConsoleVariables]", "Dune.GlobalVehicleMiningOutputMultiplier", "float"),
-    "pvp_resource_multiplier": ("[ConsoleVariables]", "SecurityZones.PvpResourceMultiplier", "float"),
-    "vehicle_durability_damage_multiplier": ("[ConsoleVariables]", "dw.VehicleDurabilityDamageMultiplier", "float"),
-    "sandstorm_enabled": ("[ConsoleVariables]", "Sandstorm.Enabled", "bool01"),
-    "sandstorm_treasure_enabled": ("[ConsoleVariables]", "Sandstorm.Treasure.Enabled", "bool01"),
-    "sandworm_enabled": ("[ConsoleVariables]", "sandworm.dune.Enabled", "bool01"),
-    "sandworm_collision_interaction": ("[ConsoleVariables]", "Vehicle.SandwormCollisionInteraction", "boollower"),
-    "sandworm_danger_zones_enabled": ("[ConsoleVariables]", "Sandworm.SandwormDangerZonesEnabled", "boollower"),
-    "sandworm_invulnerability_on_exit": ("[ConsoleVariables]", "Vehicle.SandwormInvulnerabilitySecondsOnExit", "float"),
-    "sandworm_invulnerability_on_restart": ("[ConsoleVariables]", "Vehicle.SandwormInvulnerabilitySecondsOnServerRestart", "float"),
+    "mining_output_multiplier": ("HarvestingSettings", "miningOutputMultiplier", "1.0"),
+    "vehicle_mining_output_multiplier": ("HarvestingSettings", "vehicleMiningOutputMultiplier", "1.0"),
+    "pvp_resource_multiplier": ("HarvestingSettings", "securityZonesPvpResourceMultiplier", "2.5"),
+    "vehicle_durability_damage_multiplier": ("CombatSettings", "vehicleDurabilityDamageMultiplier", "1.0"),
+    "sandstorm_enabled": ("SurvivalSettings", "sandstormEnabled", "1"),
+    "sandstorm_treasure_enabled": ("SurvivalSettings", "sandStormTreasureEnabled", "1"),
+    "sandworm_enabled": ("SurvivalSettings", "sandwormEnabled", "1"),
+    "sandworm_collision_interaction": ("SurvivalSettings", "vehicleSandwormCollisionInteraction", "false"),
+    "sandworm_danger_zones_enabled": ("SurvivalSettings", "sandwormDangerZonesEnabled", "true"),
+    "sandworm_invulnerability_on_exit": ("SurvivalSettings", "vehicleSandwormInvulnerabilitySecondsOnExit", "900.0"),
+    "sandworm_invulnerability_on_restart": ("SurvivalSettings", "vehicleSandwormInvulnerabilitySecondsOnServerRestart", "7200.0"),
 }
 
-GAME_FIELDS = {
-    "force_enable_pvp_all_partitions": ("[/Script/DuneSandbox.PvpPveSettings]", "m_bShouldForceEnablePvpOnAllPartitions", "booltitle"),
-    "security_zones_enabled": ("[/Script/DuneSandbox.SecurityZonesSubsystem]", "m_bAreSecurityZonesEnabled", "booltitle"),
-    "item_deterioration_rate": ("[/DeteriorationSystem.ItemDeteriorationConstants]", "UpdateRateInSeconds", "float"),
-    "coriolis_auto_spawn_enabled": ("[/Script/DuneSandbox.SandStormConfig]", "m_bCoriolisAutoSpawnEnabled", "booltitle"),
-    "max_landclaim_segments": ("[/Script/DuneSandbox.BuildingSettings]", "m_MaxNumLandclaimSegments", "int"),
-    "building_blueprint_max_extensions": ("[/Script/DuneSandbox.BuildingSettings]", "m_BuildingBlueprintMaxExtensions", "int"),
-    "base_backup_max_extensions": ("[/Script/DuneSandbox.BuildingSettings]", "m_BaseBackupMaxExtensions", "int"),
-    "building_restriction_limits_enabled": ("[/Script/DuneSandbox.BuildingSettings]", "m_bBuildingRestrictionLimitsEnabled", "booltitle"),
+MAP_FIELDS = {
+    "force_enable_pvp_all_partitions": ("CombatSettings", "shouldForceEnablePvpOnAllPartitions", "False"),
+    "security_zones_enabled": ("CombatSettings", "areSecurityZonesEnabled", "True"),
+    "item_deterioration_rate": ("CombatSettings", "itemDeteriorationUpdateRate", "1.0"),
+    "coriolis_auto_spawn_enabled": ("SurvivalSettings", "sandStormCoriolisAutoSpawnEnabled", "True"),
+    "max_landclaim_segments": ("PersistenceSettings", "maxLandclaimSegments", ""),
+    "building_blueprint_max_extensions": ("PersistenceSettings", "buildingBlueprintMaxExtensions", "4"),
+    "base_backup_max_extensions": ("PersistenceSettings", "baseBackupMaxExtensions", "8"),
+    "building_restriction_limits_enabled": ("PersistenceSettings", "buildingRestrictionLimitsEnabled", ""),
 }
 
 
-def map_file_path(map_name: str) -> Path:
-    return MAPS_DIR / f"{map_name}.UserGame.ini"
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {"engine": {}, "maps": {}, "partitions": {}}
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    config.setdefault("engine", {})
+    config.setdefault("maps", {})
+    config.setdefault("partitions", {})
+    return config
 
 
-def ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def save_config(config: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def effective_engine_path() -> Path:
-    return ENGINE_CUSTOM_PATH if ENGINE_CUSTOM_PATH.exists() else ENGINE_DEFAULT_PATH
+def canonical_map(value: str) -> str:
+    target = value.strip().lower()
+    aliases = {
+        "survival": "Survival_1",
+        "survival-1": "Survival_1",
+        "survival_1": "Survival_1",
+        "overmap": "Overmap",
+    }
+    if target in aliases:
+        return aliases[target]
+    return value
 
 
-def effective_map_path(map_name: str) -> Path:
-    candidate = map_file_path(map_name)
-    return candidate if candidate.exists() else GAME_DEFAULT_PATH
+def merged_engine_values(config: dict) -> dict[str, str]:
+    values = {key: spec[2] for key, spec in ENGINE_FIELDS.items()}
+    values.update(config.get("engine", {}))
+    return values
 
 
-def read_lines(path: Path) -> list[str]:
-    return path.read_text(encoding="utf-8").splitlines()
+def merged_map_values(config: dict, map_name: str) -> dict[str, str]:
+    values = {key: spec[2] for key, spec in MAP_FIELDS.items()}
+    values.update(config.get("maps", {}).get(map_name, {}))
+    return values
 
 
-def get_value(path: Path, section: str, key: str) -> str:
-    current = None
-    for raw in read_lines(path):
-        line = raw.strip()
-        if not line or line.startswith(";"):
+def merged_partition_values(config: dict, map_name: str, partition_id: str) -> dict[str, str]:
+    values = merged_map_values(config, map_name)
+    partition_entry = config.get("partitions", {}).get(str(partition_id), {})
+    values.update(partition_entry.get("usergame", {}))
+    return values
+
+
+def print_rows(rows: dict[str, str], order: dict[str, tuple[str, str, str]]) -> int:
+    for key in order:
+        print(f"{key}\t{rows.get(key, '')}")
+    return 0
+
+
+def set_field(scope: str, name: str | None, field_id: str, value: str) -> int:
+    config = load_config()
+    if scope == "engine":
+        if field_id not in ENGINE_FIELDS:
+            raise SystemExit(f"Unknown engine field: {field_id}")
+        config.setdefault("engine", {})[field_id] = value
+    else:
+        if field_id not in MAP_FIELDS:
+            raise SystemExit(f"Unknown map field: {field_id}")
+        map_name = canonical_map(name or "")
+        config.setdefault("maps", {}).setdefault(map_name, {})[field_id] = value
+    save_config(config)
+    return 0
+
+
+def set_partition_field(map_name: str, partition_id: str, field_id: str, value: str) -> int:
+    if field_id not in MAP_FIELDS:
+        raise SystemExit(f"Unknown map field: {field_id}")
+    config = load_config()
+    entry = config.setdefault("partitions", {}).setdefault(str(partition_id), {})
+    entry["map"] = canonical_map(map_name)
+    entry.setdefault("usergame", {})[field_id] = value
+    save_config(config)
+    return 0
+
+
+def reset_all() -> int:
+    if CONFIG_PATH.exists():
+        CONFIG_PATH.unlink()
+    return 0
+
+
+def write_ini(path: Path, values: dict[str, str], schema: dict[str, tuple[str, str, str]]) -> None:
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    for field_id, (section, key, _) in schema.items():
+        value = values.get(field_id, "")
+        if value == "":
             continue
-        if line.startswith("[") and line.endswith("]"):
-            current = line
-            continue
-        if current == section and "=" in line:
-            candidate, value = line.split("=", 1)
-            if candidate.strip() == key:
-                return value.strip()
-    raise KeyError(f"Could not find {key} in {path}")
+        if not parser.has_section(section):
+            parser.add_section(section)
+        parser.set(section, key, value)
+    path.write_text("", encoding="utf-8")
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        parser.write(handle, space_around_delimiters=False)
 
 
-def set_value(path: Path, base_path: Path, section: str, key: str, value: str) -> None:
-    if not path.exists():
-        ensure_parent(path)
-        shutil.copyfile(base_path, path)
-
-    lines = read_lines(path)
-    current = None
-    found = False
-    for idx, raw in enumerate(lines):
-        stripped = raw.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            current = stripped
-            continue
-        if current == section and "=" in stripped and not stripped.startswith(";"):
-            candidate, _ = stripped.split("=", 1)
-            if candidate.strip() == key:
-                lines[idx] = f"{key}={value}"
-                found = True
-                break
-
-    if not found:
-        raise KeyError(f"Could not find {key} in {path}")
-
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def normalize_value(value: str, kind: str) -> str:
-    raw = value.strip()
-    if raw == "/back":
-        raise ValueError("cancelled")
-    if raw == "":
-        raise ValueError("Value is required.")
-    if kind == "float":
-        return str(float(raw))
-    if kind == "int":
-        parsed = int(raw)
-        if parsed < 0:
-            raise ValueError("Value must be >= 0")
-        return str(parsed)
-    if kind == "bool01":
-        lowered = raw.lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return "1"
-        if lowered in {"0", "false", "no", "off"}:
-            return "0"
-        raise ValueError("Expected 1/0 or true/false")
-    if kind == "boollower":
-        lowered = raw.lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return "true"
-        if lowered in {"0", "false", "no", "off"}:
-            return "false"
-        raise ValueError("Expected true/false")
-    if kind == "booltitle":
-        lowered = raw.lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return "True"
-        if lowered in {"0", "false", "no", "off"}:
-            return "False"
-        raise ValueError("Expected True/False")
-    raise ValueError(f"Unsupported type: {kind}")
-
-
-def print_values(path: Path, fields: dict[str, tuple[str, str, str]]) -> None:
-    for field_id, (section, key, _kind) in fields.items():
-        print(f"{field_id}\t{get_value(path, section, key)}")
-
-
-def materialize(map_name: str, saved_dir: str) -> None:
+def materialize(map_name: str, saved_dir: str, partition_id: str | None = None) -> int:
+    config = load_config()
+    target_map = canonical_map(map_name)
     user_settings_dir = Path(saved_dir) / "UserSettings"
     user_settings_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(effective_engine_path(), user_settings_dir / "UserEngine.ini")
-    shutil.copyfile(effective_map_path(map_name), user_settings_dir / "UserGame.ini")
-
-
-def reset_all() -> None:
-    if GENERATED_DIR.exists():
-        shutil.rmtree(GENERATED_DIR)
-
-
-def usage() -> int:
-    print(
-        "Usage:\n"
-        "  usersettings.py engine-values\n"
-        "  usersettings.py engine-set <field-id> <value>\n"
-        "  usersettings.py map-values <map-name>\n"
-        "  usersettings.py map-set <map-name> <field-id> <value>\n"
-        "  usersettings.py materialize <map-name> <saved-dir>\n"
-        "  usersettings.py reset-all"
-    )
-    return 2
+    write_ini(user_settings_dir / "UserEngine.ini", merged_engine_values(config), ENGINE_FIELDS)
+    if partition_id:
+        values = merged_partition_values(config, target_map, str(partition_id))
+    else:
+        values = merged_map_values(config, target_map)
+    write_ini(user_settings_dir / "UserGame.ini", values, MAP_FIELDS)
+    return 0
 
 
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
-        return usage()
+        return 2
 
-    cmd = argv[1]
-    if cmd == "engine-values":
-        print_values(effective_engine_path(), ENGINE_FIELDS)
-        return 0
-    if cmd == "engine-set" and len(argv) == 4:
-        field = ENGINE_FIELDS.get(argv[2])
-        if field is None:
-            print(f"Unknown engine field: {argv[2]}", file=sys.stderr)
-            return 1
-        section, key, kind = field
-        try:
-            value = normalize_value(argv[3], kind)
-        except ValueError as exc:
-            if str(exc) == "cancelled":
-                print("No changes made.")
-                return 0
-            print(str(exc), file=sys.stderr)
-            return 1
-        set_value(ENGINE_CUSTOM_PATH, ENGINE_DEFAULT_PATH, section, key, value)
-        return 0
-    if cmd == "map-values" and len(argv) == 3:
-        print_values(effective_map_path(argv[2]), GAME_FIELDS)
-        return 0
-    if cmd == "map-set" and len(argv) == 5:
-        field = GAME_FIELDS.get(argv[3])
-        if field is None:
-            print(f"Unknown map field: {argv[3]}", file=sys.stderr)
-            return 1
-        section, key, kind = field
-        try:
-            value = normalize_value(argv[4], kind)
-        except ValueError as exc:
-            if str(exc) == "cancelled":
-                print("No changes made.")
-                return 0
-            print(str(exc), file=sys.stderr)
-            return 1
-        set_value(map_file_path(argv[2]), GAME_DEFAULT_PATH, section, key, value)
-        return 0
-    if cmd == "materialize" and len(argv) == 4:
-        materialize(argv[2], argv[3])
-        return 0
-    if cmd == "reset-all" and len(argv) == 2:
-        reset_all()
-        return 0
+    command = argv[1]
+    config = load_config()
 
-    return usage()
+    if command == "engine-values":
+        return print_rows(merged_engine_values(config), ENGINE_FIELDS)
+    if command == "map-values" and len(argv) == 3:
+        return print_rows(merged_map_values(config, canonical_map(argv[2])), MAP_FIELDS)
+    if command == "partition-values" and len(argv) == 4:
+        return print_rows(merged_partition_values(config, canonical_map(argv[2]), argv[3]), MAP_FIELDS)
+    if command == "engine-set" and len(argv) == 4:
+        return set_field("engine", None, argv[2], argv[3])
+    if command == "map-set" and len(argv) == 5:
+        return set_field("map", argv[2], argv[3], argv[4])
+    if command == "partition-set" and len(argv) == 6:
+        return set_partition_field(argv[2], argv[3], argv[4], argv[5])
+    if command == "reset-all":
+        return reset_all()
+    if command == "materialize" and len(argv) == 4:
+        return materialize(argv[2], argv[3])
+    if command == "materialize" and len(argv) == 5:
+        return materialize(argv[2], argv[3], argv[4])
+
+    return 2
 
 
 if __name__ == "__main__":

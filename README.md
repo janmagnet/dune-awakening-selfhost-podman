@@ -202,10 +202,10 @@ Dynamic maps use the port ranges listed in the Ports section.
 dune db backup
 dune db list
 dune db status
-dune db delete <backup-file>
+dune db delete dune-db-<scope>__YYYYMMDD-HHMMSS.dump
 dune db delete --all
-dune db import runtime/backups/db/<backup-file>.backup
-dune db restore runtime/backups/db/<backup-file>.backup
+dune db import runtime/backups/db/<backup-file>.dump
+dune db restore runtime/backups/db/<backup-file>.dump
 dune db auto enable 12
 dune db auto enable 1 7
 dune db auto retention 7
@@ -213,8 +213,6 @@ dune db auto retention off
 dune db auto disable
 dune db auto status
 ```
-
-`dune-docker` now writes official-style `.backup` files with a `.backup.yaml` sidecar and can also import older `dune-db-*.dump` / `.sql` backups plus official Funcom `.backup` files.
 
 Backups are saved under `runtime/backups/db/` by default and do not include Funcom tokens or secret files. Backup filenames use the format `dune-db-<scope>__YYYYMMDD-HHMMSS.dump`, where `<scope>` is derived from the currently assigned map set so the file is easier to identify later. The `.meta` file next to each backup also records the full active map list and battlegroup details at backup time.
 
@@ -254,11 +252,9 @@ dune sietches list
 dune sietches show Survival_1
 ```
 
-Inside Sietches, use `List Maps`, `Edit UserEngine`, `Edit Map`, and `Current Memory Usage`. The current memory view shows live memory usage for running map containers and automatically reflects dedicated maps as they spawn and despawn. `Edit Map` opens a picker that shows each map with its current max dimensions, active dimensions, memory, and scaling type before you choose what to edit.
+Inside Sietches, use `List Maps`, `Edit Map`, and `Current Memory Usage`. The current memory view shows live memory usage for running map containers and automatically reflects dedicated maps as they spawn and despawn. In the manager, `Survival_1` supports memory, display name, and password. All other maps, including `Overmap`, are memory-only in the manager. Passwords are stored locally under `runtime/generated/` and are never displayed.
 
-`Edit UserEngine` manages battlegroup-wide defaults that are materialized into every server's `Saved/UserSettings/UserEngine.ini` before launch. `Edit UserGame` lives inside each map's edit menu and manages map-specific gameplay values that are materialized into that map's `Saved/UserSettings/UserGame.ini` before launch.
-
-In the manager, `Survival_1` supports memory, max dimensions, active dimensions, `Edit UserGame`, display name, and password. `Overmap` remains protected for memory/dimension behavior but still has its own `Edit UserGame` menu. Other maps support memory, max dimensions, `Edit UserGame`, and maps without dedicated scaling also expose active dimensions. Passwords are stored locally under `runtime/generated/` and are never displayed.
+`dune sietches` still provides the backend controls for max dimensions and active dimensions, but those controls are intentionally not exposed in the manager for this version.
 
 For `Survival_1`, display name and password changes are applied immediately by restarting `Survival_1`, `director`, and `gateway`, then republishing the browser-facing state. `Overmap` is protected and only supports memory changes. Dedicated scaling maps have active dimensions managed by the autoscaler at runtime.
 
@@ -270,7 +266,7 @@ If a map setting fails validation or cannot be saved, the manager does not ask t
 |---|---|
 | `.env` | Local server settings |
 | `runtime/secrets/` | Local secrets, including Funcom token |
-| `runtime/generated/` | Generated battlegroup, image tags, catalogs, state, UserSettings overrides |
+| `runtime/generated/` | Generated battlegroup, image tags, catalogs, state |
 | `runtime/backups/` | Init and database backups |
 
 These paths are ignored by git.

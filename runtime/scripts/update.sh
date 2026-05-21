@@ -369,45 +369,43 @@ fi
 echo "=== Run database update/migration ==="
 runtime/scripts/update-db.sh
 
-echo
 if [ "$cmd" = "install" ]; then
+  echo
   echo "=== Apply canonical world partitions ==="
-else
-  echo "=== Refresh canonical world partitions for updated server files ==="
-fi
-runtime/scripts/generate-world-partitions-sql.sh
+  runtime/scripts/generate-world-partitions-sql.sh
 
-partition_sql="runtime/generated/reset-world-partitions.sql"
+  partition_sql="runtime/generated/reset-world-partitions.sql"
 
-if [ ! -s "$partition_sql" ]; then
-  echo "Generated partition SQL is missing or empty: $partition_sql"
-  exit 1
-fi
+  if [ ! -s "$partition_sql" ]; then
+    echo "Generated partition SQL is missing or empty: $partition_sql"
+    exit 1
+  fi
 
-partition_count="$(grep -c '^insert into dune.world_partition' "$partition_sql" || true)"
+  partition_count="$(grep -c '^insert into dune.world_partition' "$partition_sql" || true)"
 
-if [ "$partition_count" -le 0 ]; then
-  echo "Generated partition SQL contains no world_partition inserts."
-  exit 1
-fi
+  if [ "$partition_count" -le 0 ]; then
+    echo "Generated partition SQL contains no world_partition inserts."
+    exit 1
+  fi
 
-echo "Applying $partition_count world partitions..."
-docker exec -i dune-postgres psql -U dune -d dune < "$partition_sql"
+  echo "Applying $partition_count world partitions..."
+  docker exec -i dune-postgres psql -U dune -d dune < "$partition_sql"
 
-echo
-echo "=== Verify world partitions ==="
-docker exec dune-postgres psql -U dune -d dune -c "
+  echo
+  echo "=== Verify world partitions ==="
+  docker exec dune-postgres psql -U dune -d dune -c "
 select count(*) as world_partition_rows from world_partition;
 "
 
-actual_count="$(docker exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" | tr -d '[:space:]')"
+  actual_count="$(docker exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" | tr -d '[:space:]')"
 
-if [ "${actual_count:-0}" -le 0 ]; then
-  echo "world_partition is still empty after applying generated SQL."
-  exit 1
+  if [ "${actual_count:-0}" -le 0 ]; then
+    echo "world_partition is still empty after applying generated SQL."
+    exit 1
+  fi
+
+  echo "World partitions ready: $actual_count rows"
 fi
-
-echo "World partitions ready: $actual_count rows"
 
 echo
 echo "=== Refresh generated map catalogs ==="
