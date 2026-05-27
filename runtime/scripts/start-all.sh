@@ -55,12 +55,6 @@ runtime/scripts/publish-sietch-overrides.sh restart || {
 }
 
 echo
-echo "=== Reconciling Active Sietch Dimensions ==="
-runtime/scripts/sietches.sh reconcile Survival_1 || {
-  echo "Could not reconcile Survival_1 active dimensions."
-}
-
-echo
 echo "=== Starting ServerGateway ==="
 runtime/scripts/start-server-gateway.sh
 
@@ -76,6 +70,12 @@ runtime/scripts/start-autoscaler.sh || {
   echo "Autoscaler did not start. Dynamic maps will not spawn automatically."
   echo "Check with: dune autoscaler status"
 }
+
+echo
+echo "=== Scheduling Deferred Dimension Reconcile ==="
+(
+  exec runtime/scripts/deferred-reconcile.sh
+) >/tmp/dune-deferred-reconcile.log 2>&1 &
 
 
 echo
@@ -97,7 +97,8 @@ cat <<'EOF'
 Started. Notes:
 - Survival_1 can take several minutes to become fully READY.
 - Overmap can also take a few minutes.
-- Optional maps are not prestarted; autoscaler will spawn them on demand.
+- Optional maps are reconciled only after Survival_1 and Overmap reach READY.
+- Autoscaler will still spawn optional maps on demand.
 - Autoscaler starts with the battlegroup so dynamic maps can spawn on demand.
 - Use runtime/scripts/status.sh after startup to check readiness.
 EOF

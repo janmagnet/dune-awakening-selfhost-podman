@@ -185,6 +185,7 @@ memory_for_map() {
   local map_key
   local env_key
   local configured
+  local recommended
 
   map_key="$(printf '%s' "$map" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')"
   env_key="DUNE_MEMORY_${map_key}"
@@ -199,6 +200,14 @@ memory_for_map() {
     echo "$DUNE_MEMORY_DEFAULT"
     return 0
   fi
+
+  recommended="$(default_memory_for_map "$map")"
+  case "${map,,}" in
+    survival_1|deepdesert_1|overmap)
+      echo "$recommended"
+      return 0
+      ;;
+  esac
 
   python3 - "$map" <<'PY'
 import json
@@ -228,6 +237,7 @@ PY
 
 MEMORY="$(memory_for_map "$MAP_NAME")"
 mapfile -t SIETCH_RUNTIME_ARGS < <(runtime/scripts/sietches.sh runtime-args "$MAP_NAME" "$PARTITION_ID" 2>/dev/null || true)
+mapfile -t LOG_RUNTIME_ARGS < <(full_stdout_log_args)
 if [ "$MAP_NAME" = "Survival_1" ]; then
   if [ "$DIMENSION_INDEX" -eq 0 ]; then
     SERVER_INDEX=1
@@ -436,8 +446,7 @@ docker run -d \
   --RMQAdminHostname=127.0.0.1 \
   --RMQAdminPort=32573 \
   "${SIETCH_RUNTIME_ARGS[@]}" \
-  -stdout \
-  -FullStdOutLogOutput
+  "${LOG_RUNTIME_ARGS[@]}"
 
 sleep 5
 

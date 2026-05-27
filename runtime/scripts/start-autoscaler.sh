@@ -37,6 +37,7 @@ fi
 echo "Starting autoscaler container..."
 docker run -d \
   --name "$CONTAINER_NAME" \
+  --network host \
   --restart unless-stopped \
   --entrypoint bash \
   -v /var/run/docker.sock:/var/run/docker.sock \

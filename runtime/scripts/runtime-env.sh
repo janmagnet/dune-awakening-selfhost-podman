@@ -325,6 +325,23 @@ resolve_igw_port_base() {
   usersettings_engine_value igw_port 7888
 }
 
+default_memory_for_map() {
+  case "${1,,}" in
+    survival|survival-1|survival_1) printf '%s' "16g" ;;
+    overmap) printf '%s' "3g" ;;
+    deepdesert|deepdesert-1|deepdesert_1) printf '%s' "16g" ;;
+    *) printf '%s' "3g" ;;
+  esac
+}
+
+full_stdout_log_args() {
+  if [ "${DUNE_FULL_STDOUT_LOG_OUTPUT:-0}" = "1" ]; then
+    printf '%s\n' -stdout -FullStdOutLogOutput
+  else
+    printf '%s\n' -stdout
+  fi
+}
+
 ensure_secret_file() {
   local path="$1"
   local bytes="$2"

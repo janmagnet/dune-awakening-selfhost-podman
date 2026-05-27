@@ -50,7 +50,7 @@ Usage:
   dune memory set default <memory>
   dune memory unset default
 
-Memory values use Docker formats such as 512m, 4096m, 4g, 8g, or 12g.
+Memory values use Docker formats such as 512m, 4096m, 4g, 8g, 12g, or 16g.
 Map names come from the generated world partition catalog.
 EOF
 }
@@ -277,7 +277,7 @@ show_status() {
   default_memory="$(env_value DUNE_MEMORY_DEFAULT || true)"
 
   echo "=== Memory configuration ==="
-  echo "Default memory: ${default_memory:-server catalog value, or 3g for dynamic maps}"
+  echo "Default memory: ${default_memory:-built-in per-map defaults, or server catalog for other dynamic maps}"
   echo
 
   if [ -s "$CATALOG" ]; then
@@ -341,7 +341,12 @@ for row in catalog:
     elif global_default:
         display = global_default
     else:
-        display = "3g default"
+        fallback_defaults = {
+            "Survival_1": "16g default",
+            "Overmap": "3g default",
+            "DeepDesert_1": "16g default",
+        }
+        display = fallback_defaults.get(name, "3g default")
 
     rows.append((name, display))
 
@@ -430,7 +435,7 @@ set_memory() {
 
   if ! validate_memory "$memory"; then
     echo "Invalid memory value: $memory"
-    echo "Use values like 512m, 4096m, 4g, 8g, or 12g."
+    echo "Use values like 512m, 4096m, 4g, 8g, 12g, or 16g."
     exit 1
   fi
 

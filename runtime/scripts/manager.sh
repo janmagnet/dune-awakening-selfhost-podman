@@ -2931,36 +2931,6 @@ edit_dedicated_scaling_menu() {
       supports_active=1
     fi
 
-    if map_is_dedicated_scaling "$map"; then
-      menu_or_back "Edit Map: $map" \
-        "Memory Limit  Current: ${memory:-unknown}" \
-        "Remove Memory Override" \
-        "Edit UserGame Partition" \
-        "Show Dimension Details" \
-        "Back To Map List" || return
-      choice="$MENU_CHOICE"
-
-      case "$choice" in
-        1) change_memory_for_map "$map"; pause ;;
-        2)
-          if [ "$memory_override" -eq 1 ]; then
-            remove_memory_for_map "$map"
-          else
-            info "No memory override is currently set for $map."
-          fi
-          pause
-          ;;
-        3)
-          CHOSEN_PARTITION_ID=""
-          choose_dimension_for_map "$map" "Pick Partition To Edit On $map" || { pause; continue; }
-          edit_usergame_menu "$map" "$CHOSEN_PARTITION_ID"
-          ;;
-        4) show_map_dimension_details "$map"; pause ;;
-        5) return ;;
-      esac
-      continue
-    fi
-
     if [ "$supports_active" -eq 1 ]; then
       menu_or_back "Edit Map: $map" \
         "Memory Limit  Current: ${memory:-unknown}" \
@@ -2991,6 +2961,36 @@ edit_dedicated_scaling_menu() {
           ;;
         6) show_map_dimension_details "$map"; pause ;;
         7) return ;;
+      esac
+      continue
+    fi
+
+    if map_is_dedicated_scaling "$map"; then
+      menu_or_back "Edit Map: $map" \
+        "Memory Limit  Current: ${memory:-unknown}" \
+        "Remove Memory Override" \
+        "Edit UserGame Partition" \
+        "Show Dimension Details" \
+        "Back To Map List" || return
+      choice="$MENU_CHOICE"
+
+      case "$choice" in
+        1) change_memory_for_map "$map"; pause ;;
+        2)
+          if [ "$memory_override" -eq 1 ]; then
+            remove_memory_for_map "$map"
+          else
+            info "No memory override is currently set for $map."
+          fi
+          pause
+          ;;
+        3)
+          CHOSEN_PARTITION_ID=""
+          choose_dimension_for_map "$map" "Pick Partition To Edit On $map" || { pause; continue; }
+          edit_usergame_menu "$map" "$CHOSEN_PARTITION_ID"
+          ;;
+        4) show_map_dimension_details "$map"; pause ;;
+        5) return ;;
       esac
       continue
     fi

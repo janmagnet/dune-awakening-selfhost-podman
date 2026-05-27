@@ -32,7 +32,7 @@ CLIENT_PORT_BASE="$(resolve_client_port_base)"
 IGW_PORT_BASE="$(resolve_igw_port_base)"
 GAME_PORT="$CLIENT_PORT_BASE"
 IGW_PORT="$((IGW_PORT_BASE + 1))"
-MEMORY="${DUNE_MEMORY_OVERMAP:-2g}"
+MEMORY="${DUNE_MEMORY_OVERMAP:-$(default_memory_for_map Overmap)}"
 PARTITION_ID="${DUNE_OVERMAP_PARTITION_ID:-2}"
 if [ -n "${DUNE_FAKE_K8S_SERVICEACCOUNT_DIR:-}" ]; then
   FAKE_K8S_SERVICEACCOUNT_DIR="$DUNE_FAKE_K8S_SERVICEACCOUNT_DIR"
@@ -59,6 +59,7 @@ EOF
 chmod -R 755 "$FAKE_K8S_SERVICEACCOUNT_DIR"
 
 mapfile -t SIETCH_RUNTIME_ARGS < <(runtime/scripts/sietches.sh runtime-args Overmap "$PARTITION_ID" 2>/dev/null || true)
+mapfile -t LOG_RUNTIME_ARGS < <(full_stdout_log_args)
 
 docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 begin;
@@ -155,8 +156,7 @@ docker run -d \
   --RMQAdminHostname=127.0.0.1 \
   --RMQAdminPort=32573 \
   "${SIETCH_RUNTIME_ARGS[@]}" \
-  -stdout \
-  -FullStdOutLogOutput
+  "${LOG_RUNTIME_ARGS[@]}"
 
 sleep 20
 

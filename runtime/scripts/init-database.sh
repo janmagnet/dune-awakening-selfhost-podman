@@ -24,7 +24,7 @@ ln -sf /usr/bin/pg_dump /tmp/pg17/bin/pg_dump
 ln -sf /usr/bin/pg_restore /tmp/pg17/bin/pg_restore
 ln -sf /usr/bin/pg_isready /tmp/pg17/bin/pg_isready
 
-python /root/PSQL/initdb.py \
+python -u /root/PSQL/initdb.py \
   --host dune-postgres:5432 \
   --project-database dune \
   --project-user dune \

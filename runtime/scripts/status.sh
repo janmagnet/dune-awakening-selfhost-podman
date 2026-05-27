@@ -80,11 +80,37 @@ map_state() {
   local container="$1"
   local pattern="$2"
   local logs
+  local partition_id=""
+  local farm_ready=""
 
   if ! is_running "$container"; then
     issue=1
     echo "NOT RUNNING"
     return
+  fi
+
+  if [[ "$container" =~ -([0-9]+)$ ]]; then
+    partition_id="${BASH_REMATCH[1]}"
+  elif [ "$container" = "dune-server-survival-1" ]; then
+    partition_id="1"
+  elif [ "$container" = "dune-server-overmap" ]; then
+    partition_id="2"
+  fi
+
+  if [ -n "$partition_id" ] && is_running dune-postgres; then
+    farm_ready="$(
+      docker exec dune-postgres psql -U dune -d dune -Atc "
+        select coalesce(fs.ready::text, 'f')
+        from dune.world_partition wp
+        left join dune.farm_state fs on fs.server_id = wp.server_id
+        where wp.partition_id = ${partition_id}
+        limit 1;
+      " 2>/dev/null | tr -d '[:space:]'
+    )"
+    if [ "$farm_ready" = "t" ]; then
+      echo "READY"
+      return
+    fi
   fi
 
   logs="$(docker logs "$container" 2>&1 || true)"

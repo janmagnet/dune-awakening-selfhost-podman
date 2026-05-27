@@ -74,7 +74,9 @@ case "$cmd" in
         runtime/scripts/start-server-survival-1.sh
         runtime/scripts/publish-sietch-overrides.sh restart || true
         runtime/scripts/publish-sietch-overrides.sh once || true
-        runtime/scripts/sietches.sh reconcile Survival_1 || true
+        (
+          exec runtime/scripts/deferred-reconcile.sh
+        ) >/tmp/dune-deferred-reconcile.log 2>&1 &
         ;;
       overmap)
         set -a; [ -f .env ] && . ./.env; set +a

@@ -12,12 +12,17 @@ STATE_FILE="${DUNE_AUTOSCALER_STATE_FILE:-runtime/generated/autoscaler-idle.tsv}
 SERVER_ID_MAP_FILE="${DUNE_AUTOSCALER_SERVER_ID_MAP_FILE:-runtime/generated/autoscaler-server-ids.tsv}"
 DEMAND_FILE="${DUNE_AUTOSCALER_DEMAND_FILE:-runtime/generated/autoscaler-demand.tsv}"
 HUB_TRAVEL_FILE="${DUNE_AUTOSCALER_HUB_TRAVEL_FILE:-runtime/generated/autoscaler-hub-travel.tsv}"
+DIRECTOR_HEAL_FILE="${DUNE_AUTOSCALER_DIRECTOR_HEAL_FILE:-runtime/generated/autoscaler-director-heal.tsv}"
+DIRECTOR_HEAL_STALE_SECONDS="${DUNE_AUTOSCALER_DIRECTOR_HEAL_STALE_SECONDS:-15}"
+DIRECTOR_HEAL_COOLDOWN_SECONDS="${DUNE_AUTOSCALER_DIRECTOR_HEAL_COOLDOWN_SECONDS:-300}"
+DYNAMIC_READY_HEAL_STALE_SECONDS="${DUNE_AUTOSCALER_DYNAMIC_READY_HEAL_STALE_SECONDS:-20}"
 
 mkdir -p "$(dirname "$STATE_FILE")"
 touch "$STATE_FILE"
 touch "$SERVER_ID_MAP_FILE"
 touch "$DEMAND_FILE"
 touch "$HUB_TRAVEL_FILE"
+touch "$DIRECTOR_HEAL_FILE"
 
 echo "=== Dune Docker autoscaler ==="
 echo "Watching Director travel queues and idle dynamic servers."
@@ -305,6 +310,108 @@ clear_idle_since() {
 
   awk -F '\t' -v key="$key" '$1 != key { print }' "$STATE_FILE" > "$tmp"
   mv "$tmp" "$STATE_FILE"
+}
+
+director_heal_get() {
+  local key="$1"
+  awk -F '\t' -v key="$key" '$1 == key { print $2; found=1; exit } END { if (!found) exit 1 }' "$DIRECTOR_HEAL_FILE"
+}
+
+director_heal_set() {
+  local key="$1"
+  local value="$2"
+  local tmp
+  tmp="$(mktemp)"
+
+  awk -F '\t' -v key="$key" '$1 != key { print }' "$DIRECTOR_HEAL_FILE" > "$tmp"
+  printf '%s\t%s\n' "$key" "$value" >> "$tmp"
+  mv "$tmp" "$DIRECTOR_HEAL_FILE"
+}
+
+director_heal_clear() {
+  local key="$1"
+  local tmp
+  tmp="$(mktemp)"
+
+  awk -F '\t' -v key="$key" '$1 != key { print }' "$DIRECTOR_HEAL_FILE" > "$tmp"
+  mv "$tmp" "$DIRECTOR_HEAL_FILE"
+}
+
+dynamic_container_name_for_partition() {
+  local partition_id="$1"
+  local map_name safe
+
+  map_name="$(psql_value "
+    select coalesce(map, '')
+    from dune.world_partition
+    where partition_id = ${partition_id}
+    limit 1;
+  ")"
+  [ -n "$map_name" ] || return 1
+  case "$map_name" in
+    Survival_1|Overmap) return 1 ;;
+  esac
+  safe="$(echo "$map_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')"
+  docker ps --format '{{.Names}}' | grep -E "^dune-server-${safe}-${partition_id}$" | head -n1
+}
+
+dynamic_ready_desync_heal() {
+  local now cooldown_until stale_since
+  local rows partition_id map_name server_id ready alive container log_tail
+
+  cooldown_until="$(director_heal_get dynamic_ready_desync 2>/dev/null || true)"
+  now="$(date +%s)"
+  if [ -n "$cooldown_until" ] && [ "$now" -lt "$cooldown_until" ]; then
+    return 0
+  fi
+
+  rows="$(psql_value "
+    select wp.partition_id, wp.map, coalesce(fs.server_id, ''), coalesce(fs.ready::text, 'f'), coalesce(fs.alive::text, 'f')
+    from dune.world_partition wp
+    join dune.farm_state fs on fs.server_id = wp.server_id
+    where wp.partition_id not in (1, 2)
+      and coalesce(fs.alive, false) = true;
+  ")"
+
+  while IFS='|' read -r partition_id map_name server_id ready alive; do
+    [ -n "${partition_id:-}" ] || continue
+    [ "$ready" = "f" ] || continue
+    [ "$alive" = "t" ] || continue
+
+    container="$(dynamic_container_name_for_partition "$partition_id" 2>/dev/null || true)"
+    [ -n "$container" ] || continue
+
+    log_tail="$(docker logs --since 10m "$container" 2>&1 | tail -220 || true)"
+    if [[ "$log_tail" != *"Server farm is READY"* ]]; then
+      continue
+    fi
+
+    stale_since="$(director_heal_get "dynamic_ready:${partition_id}" 2>/dev/null || true)"
+    if [ -z "$stale_since" ]; then
+      director_heal_set "dynamic_ready:${partition_id}" "$now"
+      continue
+    fi
+
+    if [ $((now - stale_since)) -lt "$DYNAMIC_READY_HEAL_STALE_SECONDS" ]; then
+      continue
+    fi
+
+    echo "HEAL dynamic ready desync partition=${partition_id} map=${map_name} server=${server_id}"
+    if runtime/scripts/start-director.sh >/dev/null 2>&1; then
+      director_heal_set dynamic_ready_desync $((now + DIRECTOR_HEAL_COOLDOWN_SECONDS))
+      director_heal_clear "dynamic_ready:${partition_id}"
+    else
+      echo "ERROR failed to restart director during dynamic ready desync heal"
+    fi
+    return 0
+  done <<< "$rows"
+
+  while IFS='|' read -r partition_id map_name server_id ready alive; do
+    [ -n "${partition_id:-}" ] || continue
+    if [ "$ready" = "t" ] || [ "$alive" != "t" ]; then
+      director_heal_clear "dynamic_ready:${partition_id}"
+    fi
+  done <<< "$rows"
 }
 
 remember_map_demand() {
@@ -1335,6 +1442,105 @@ for line in sys.stdin:
   done <<< "$demand_rows"
 }
 
+director_live_server_rows() {
+  docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+    select map, server_id
+    from dune.farm_state
+    where map in ('Survival_1', 'Overmap', 'DeepDesert_1')
+      and ready = true
+      and alive = true
+      and coalesce(server_id, '') <> ''
+    order by map;
+  " 2>/dev/null || true
+}
+
+director_latest_capacity() {
+  docker logs --since 10m dune-director 2>&1 \
+    | python3 -c '
+import json
+import re
+import sys
+
+pattern = re.compile(r"Population declaration: (\{.*\})")
+capacity = ""
+
+for line in sys.stdin:
+    match = pattern.search(line)
+    if not match:
+        continue
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        continue
+    capacity = str(payload.get("BattlegroupMaxPlayerCapacity", ""))
+
+if capacity:
+    print(capacity)
+'
+}
+
+director_logs_contain_live_ids() {
+  local rows="$1"
+  local logs
+  local missing=0
+
+  logs="$(docker logs --since 10m dune-director 2>&1 || true)"
+  while IFS='|' read -r map server_id; do
+    [ -n "${server_id:-}" ] || continue
+    if [[ "$logs" != *"$server_id"* ]]; then
+      missing=1
+      break
+    fi
+  done <<< "$rows"
+
+  [ "$missing" -eq 0 ]
+}
+
+scan_director_browser_state() {
+  local rows ready_count capacity now first_seen last_restart age since_restart
+
+  rows="$(director_live_server_rows)"
+  ready_count="$(printf '%s\n' "$rows" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+  [ "${ready_count:-0}" -ge 2 ] || {
+    director_heal_clear stale_since
+    return 0
+  }
+
+  capacity="$(director_latest_capacity 2>/dev/null || true)"
+  now="$(date +%s)"
+
+  if [ "${capacity:-}" != "0" ] && director_logs_contain_live_ids "$rows"; then
+    director_heal_clear stale_since
+    return 0
+  fi
+
+  if first_seen="$(director_heal_get stale_since 2>/dev/null)"; then
+    age=$((now - first_seen))
+  else
+    director_heal_set stale_since "$now"
+    age=0
+  fi
+
+  if [ "$age" -lt "$DIRECTOR_HEAL_STALE_SECONDS" ]; then
+    return 0
+  fi
+
+  if last_restart="$(director_heal_get last_restart 2>/dev/null)"; then
+    since_restart=$((now - last_restart))
+    if [ "$since_restart" -lt "$DIRECTOR_HEAL_COOLDOWN_SECONDS" ]; then
+      return 0
+    fi
+  fi
+
+  echo "HEAL director stale browser state capacity=${capacity:-unknown} ready_maps=$ready_count"
+  runtime/scripts/start-director.sh >/dev/null 2>&1 || {
+    echo "ERROR failed to restart director during stale browser state heal"
+    return 0
+  }
+  director_heal_set last_restart "$now"
+  director_heal_clear stale_since
+}
+
 follow_director_hagga_handoffs &
 
 while true; do
@@ -1346,5 +1552,7 @@ while true; do
   scan_idle_servers
   scan_reconnect_demand
   scan_live_player_partition_alignment
+  dynamic_ready_desync_heal
+  scan_director_browser_state
   sleep "$INTERVAL"
 done

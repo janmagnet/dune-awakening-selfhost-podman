@@ -827,6 +827,19 @@ PY
   [ -n "$assigned_count" ] || assigned_count=0
 
   if map_supports_configurable_active_dimensions "$map"; then
+    base_server_id="$(psql_value "
+      select coalesce(server_id, '')
+      from dune.world_partition
+      where partition_id = $base_partition
+      limit 1;
+    " | tr -d '[:space:]')"
+
+    if [ "$assigned_count" -lt "$target" ] && [ "$map" != "Survival_1" ] && [ -z "$base_server_id" ]; then
+      runtime/scripts/spawn-server.sh "$base_partition"
+      assigned_count=$((assigned_count + 1))
+      topology_changed=1
+    fi
+
     mapfile -t survival_partitions < <(psql_value "
       select partition_id || '|' || coalesce(server_id, '')
       from dune.world_partition

@@ -226,6 +226,32 @@ check_game_server_ready() {
   local container="$1"
   local label="$2"
   local pattern="${3:-Server farm is READY}"
+  local partition_id=""
+  local farm_ready=""
+
+  if [[ "$container" =~ -([0-9]+)$ ]]; then
+    partition_id="${BASH_REMATCH[1]}"
+  elif [ "$container" = "dune-server-survival-1" ]; then
+    partition_id="1"
+  elif [ "$container" = "dune-server-overmap" ]; then
+    partition_id="2"
+  fi
+
+  if [ -n "$partition_id" ] && is_running dune-postgres; then
+    farm_ready="$(
+      docker exec dune-postgres psql -U dune -d dune -Atc "
+        select coalesce(fs.ready::text, 'f')
+        from dune.world_partition wp
+        left join dune.farm_state fs on fs.server_id = wp.server_id
+        where wp.partition_id = ${partition_id}
+        limit 1;
+      " 2>/dev/null | tr -d '[:space:]'
+    )"
+    if [ "$farm_ready" = "t" ]; then
+      mark_ok "$label ready"
+      return
+    fi
+  fi
 
   check_log_ready \
     "$container" \
@@ -416,8 +442,7 @@ while IFS= read -r c; do
   effective_players="${effective_players:-0}"
 
   if [ "$connected_players" = "0" ] && [ "$effective_players" = "0" ] && ! map_has_recent_travel_demand "$map_name"; then
-    mark_ok "$c idle dynamic warmup ignored"
-    echo "     Optional dynamic map with no active or reconnecting players; it will not block overall readiness."
+    mark_ok "$c idle"
     continue
   fi
 
