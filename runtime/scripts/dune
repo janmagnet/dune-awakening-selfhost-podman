@@ -152,6 +152,16 @@ case "$cmd" in
     runtime/scripts/sietches.sh "$@"
     ;;
 
+  maps)
+    shift || true
+    runtime/scripts/map-modes.sh "$@"
+    ;;
+
+  deepdesert)
+    shift || true
+    runtime/scripts/deepdesert.sh "$@"
+    ;;
+
   admin)
     shift || true
     runtime/scripts/admin-tools.sh "$@"
@@ -192,6 +202,14 @@ Usage:
   runtime/scripts/dune db auto status
   runtime/scripts/dune db auto retention <days>
   runtime/scripts/dune db auto retention off
+  runtime/scripts/dune db transfer [--dry-run] [--yes] [--no-backup] <old-fls-id> <new-fls-id>
+  runtime/scripts/dune db transfer --file <plan.tsv> [--dry-run] [--yes]
+  runtime/scripts/dune db transfer pending|apply-pending|clear-pending
+  runtime/scripts/dune maps list
+  runtime/scripts/dune maps mode [map]
+  runtime/scripts/dune maps set <map> <dynamic|always-on>
+  runtime/scripts/dune maps reconcile
+  runtime/scripts/dune deepdesert dual [status|enable|disable|bootstrap|repair]
   runtime/scripts/dune config title ["New Server Name"]
   runtime/scripts/dune memory status
   runtime/scripts/dune memory list-maps
@@ -205,6 +223,9 @@ Usage:
   runtime/scripts/dune sietches set-display <partition-id> <display-name>
   runtime/scripts/dune sietches set-password <partition-id> [password]
   runtime/scripts/dune admin item-search <query>
+  runtime/scripts/dune admin players [--online] [--show-full-ids]
+  runtime/scripts/dune admin kick <player-fls-id> [--dry-run] [--yes] [--force]
+  runtime/scripts/dune admin kick --all-online [--yes] [--dry-run]
   runtime/scripts/dune admin item-list [category]
   runtime/scripts/dune admin grant-item <player-id|*> <item-name> [quantity] [durability]
   runtime/scripts/dune admin grant-item-id <player-id|*> <item-id> [quantity] [durability]

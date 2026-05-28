@@ -8,6 +8,7 @@ BACKUP_DIR_DEFAULT="runtime/backups/db"
 AUTO_STATE_FILE="runtime/generated/db-backup.env"
 AUTO_SERVICE_FILE="/etc/systemd/system/dune-awakening-db-backup.service"
 AUTO_TIMER_FILE="/etc/systemd/system/dune-awakening-db-backup.timer"
+PENDING_TRANSFER_FILE="runtime/generated/pending-character-transfers.tsv"
 
 usage() {
   cat <<'EOF'
@@ -19,6 +20,15 @@ Usage:
   dune db health
   dune db import <backup-file>
   dune db restore <backup-file>
+  dune db restore <backup-file> --transfer OLD=NEW
+  dune db restore <backup-file> --transfer-file <plan.tsv>
+  dune db transfer OLD_FLS_ID NEW_FLS_ID
+  dune db transfer --dry-run OLD_FLS_ID NEW_FLS_ID
+  dune db transfer --yes OLD_FLS_ID NEW_FLS_ID
+  dune db transfer --file <plan.tsv> [--dry-run]
+  dune db transfer pending
+  dune db transfer apply-pending
+  dune db transfer clear-pending
   dune db delete <backup-file-or-name>
   dune db delete --all
   dune db auto enable <hours> [retention-days]
@@ -31,6 +41,17 @@ Backups are written as official-style .backup files with a .backup.yaml sidecar.
 Import accepts official .backup files and older dune-db-*.dump or .sql backups.
 Import requires confirmation and creates a pre-import backup first.
 EOF
+}
+
+redact_fls() {
+  local value="$1"
+  local len
+  len="${#value}"
+  if [ "$len" -le 10 ]; then
+    printf '<redacted:%s>' "$len"
+  else
+    printf '%s...%s' "${value:0:4}" "${value: -4}"
+  fi
 }
 
 require_postgres() {
@@ -557,6 +578,31 @@ import_db() {
   local restore_after
   local tmp_file
   local ext
+  shift || true
+  local transfer_args=()
+  local transfer_plan=""
+  local transfer_file=""
+  local arg
+
+  while [ "$#" -gt 0 ]; do
+    arg="$1"
+    case "$arg" in
+      --transfer)
+        [ -n "${2:-}" ] || { echo "Missing value for --transfer OLD=NEW"; exit 2; }
+        transfer_args+=("${2}")
+        shift 2
+        ;;
+      --transfer-file)
+        [ -n "${2:-}" ] || { echo "Missing value for --transfer-file"; exit 2; }
+        transfer_file="$2"
+        shift 2
+        ;;
+      *)
+        echo "Unknown import/restore option: $arg"
+        exit 2
+        ;;
+    esac
+  done
 
   if [ -z "$backup_file" ]; then
     usage
@@ -580,6 +626,8 @@ import_db() {
 
   echo "WARNING: importing a database backup replaces current battlegroup database state."
   echo "A pre-import backup will be created first."
+  echo "Do not create new characters after restore/import until character data is verified."
+  echo "Character transfer is only for players whose FLS/Funcom account changed."
   if [ "${DUNE_DB_ASSUME_YES:-0}" != "1" ]; then
     read -r -p "Continue with import? [y/N]: " answer
     case "$answer" in
@@ -613,11 +661,289 @@ import_db() {
   docker exec dune-postgres rm -f "$tmp_file" >/dev/null 2>&1 || true
 
   echo "Database import finished."
+
+  if [ "${#transfer_args[@]}" -gt 0 ] || [ -n "$transfer_file" ]; then
+    mkdir -p runtime/generated
+    transfer_plan="runtime/generated/import-transfer-plan-$(date +%Y%m%d-%H%M%S).tsv"
+    : > "$transfer_plan"
+    for pair in "${transfer_args[@]}"; do
+      case "$pair" in
+        *=*) printf '%s\t%s\t%s\n' "${pair%%=*}" "${pair#*=}" "restore/import --transfer" >> "$transfer_plan" ;;
+        *) echo "Invalid --transfer value, expected OLD=NEW: $pair"; exit 2 ;;
+      esac
+    done
+    if [ -n "$transfer_file" ]; then
+      if [ ! -f "$transfer_file" ]; then
+        echo "Transfer file not found: $transfer_file"
+        exit 1
+      fi
+      cat "$transfer_file" >> "$transfer_plan"
+    fi
+    echo
+    echo "Applying post-import character transfer plan..."
+    DUNE_DB_ASSUME_YES=1 runtime/scripts/db.sh transfer --file "$transfer_plan" --yes --no-backup || {
+      echo "Post-import transfer plan did not fully apply."
+      echo "Missing new-account rows, if any, were saved to: $PENDING_TRANSFER_FILE"
+    }
+  fi
+
   read -r -p "Restart Dune stack now? [y/N]: " restore_after
   case "$restore_after" in
     y|Y|yes|YES) runtime/scripts/start-all.sh ;;
     *) echo "Services remain stopped. Start them with: dune start" ;;
   esac
+}
+
+transfer_function_check() {
+  local missing
+  missing="$(docker exec dune-postgres psql -U postgres -d dune -At -c "
+    with required(schema_name, function_name, args) as (
+      values
+        ('dune','set_account_as_takeoverable','text,text'),
+        ('dune','can_takeover_account','text'),
+        ('dune','takeover_account','text,text')
+    )
+    select string_agg(function_name || '(' || args || ')', ', ')
+    from required r
+    where to_regprocedure(r.schema_name || '.' || r.function_name || '(' || r.args || ')') is null;
+  " | tr -d '\r')"
+  if [ -n "$missing" ]; then
+    echo "Missing required DB transfer function(s): $missing"
+    exit 1
+  fi
+}
+
+fls_exists() {
+  local fls="$1"
+  [ "$(docker exec dune-postgres psql -U postgres -d dune -At -c "
+    select count(*)
+    from dune.encrypted_accounts
+    where convert_from(encrypted_funcom_id, 'UTF8') = '${fls//\'/\'\'}';
+  " | tr -d '[:space:]')" != "0" ]
+}
+
+fls_character_count() {
+  local fls="$1"
+  docker exec dune-postgres psql -U postgres -d dune -At -c "
+    select count(*)
+    from dune.encrypted_accounts e
+    left join dune.player_state ps on ps.account_id = e.id
+    left join dune.encrypted_player_state eps on eps.account_id = e.id
+    left join dune.actors a on a.owner_account_id = e.id and a.class ilike '%PlayerCharacter%'
+    where convert_from(e.encrypted_funcom_id, 'UTF8') = '${fls//\'/\'\'}'
+      and (ps.account_id is not null or eps.account_id is not null or a.id is not null);
+  " 2>/dev/null | tr -d '[:space:]' || echo "unknown"
+}
+
+append_pending_transfer() {
+  local old="$1"
+  local new="$2"
+  local note="${3:-missing new account row}"
+  mkdir -p "$(dirname "$PENDING_TRANSFER_FILE")"
+  if [ ! -f "$PENDING_TRANSFER_FILE" ] || ! awk -F '\t' -v old="$old" -v new="$new" '$1 == old && $2 == new { found=1 } END { exit(found ? 0 : 1) }' "$PENDING_TRANSFER_FILE"; then
+    printf '%s\t%s\t%s\n' "$old" "$new" "$note" >> "$PENDING_TRANSFER_FILE"
+  fi
+}
+
+transfer_sql_apply() {
+  local old="$1"
+  local new="$2"
+  docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+begin;
+select dune.set_account_as_takeoverable('${old//\'/\'\'}', '${new//\'/\'\'}');
+do \$\$
+begin
+  if not dune.can_takeover_account('${new//\'/\'\'}') then
+    raise exception 'can_takeover_account returned false';
+  end if;
+end
+\$\$;
+select dune.takeover_account('${old//\'/\'\'}', '${new//\'/\'\'}');
+do \$\$
+begin
+  if not exists (
+    select 1
+    from dune.encrypted_accounts e
+    left join dune.player_state ps on ps.account_id = e.id
+    left join dune.actors a on a.owner_account_id = e.id and a.class ilike '%PlayerCharacter%'
+    where convert_from(e.encrypted_funcom_id, 'UTF8') = '${new//\'/\'\'}'
+      and (ps.account_id is not null or a.id is not null)
+  ) then
+    raise exception 'post-transfer character lookup for new FLS failed';
+  end if;
+end
+\$\$;
+commit;
+"
+}
+
+load_transfer_plan() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    parts = raw.split("\t")
+    if len(parts) < 2 or not parts[0].strip() or not parts[1].strip():
+        print(f"ERROR\t{lineno}\tInvalid transfer line: expected old_fls_id<TAB>new_fls_id<TAB>optional_note")
+        continue
+    note = parts[2].strip() if len(parts) > 2 else ""
+    print(f"ROW\t{lineno}\t{parts[0].strip()}\t{parts[1].strip()}\t{note}")
+PY
+}
+
+run_transfer_plan() {
+  local plan_file="$1"
+  local dry_run="$2"
+  local assume_yes="$3"
+  local no_backup="$4"
+  local applied=0 skipped=0 failed=0 pending=0 line kind lineno old new note chars
+  local rows
+
+  require_postgres
+  transfer_function_check
+  rows="$(load_transfer_plan "$plan_file")"
+  if printf '%s\n' "$rows" | grep -q '^ERROR'; then
+    printf '%s\n' "$rows" | sed 's/^ERROR\t/Line /'
+    exit 1
+  fi
+  if [ -z "$(printf '%s\n' "$rows" | sed '/^$/d')" ]; then
+    echo "Transfer plan is empty."
+    return 0
+  fi
+
+  if [ "$dry_run" != "1" ] && [ "$no_backup" != "1" ]; then
+    backup_db "$BACKUP_DIR_DEFAULT"
+  elif [ "$dry_run" != "1" ] && [ "$no_backup" = "1" ]; then
+    echo "WARNING: --no-backup disables the default pre-transfer database backup."
+    if [ "$assume_yes" != "1" ]; then
+      read -r -p "Type NO BACKUP to continue: " chars
+      [ "$chars" = "NO BACKUP" ] || { echo "Transfer cancelled."; exit 1; }
+    fi
+  fi
+
+  while IFS=$'\t' read -r kind lineno old new note; do
+    [ "$kind" = "ROW" ] || continue
+    echo
+    echo "Transfer line $lineno: $(redact_fls "$old") -> $(redact_fls "$new") ${note:+($note)}"
+
+    if ! fls_exists "$old"; then
+      echo "SKIP old FLS does not exist after restore/import."
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if ! fls_exists "$new"; then
+      echo "PENDING new FLS row does not exist. Have the new account log in once, then run: dune db transfer apply-pending"
+      append_pending_transfer "$old" "$new" "new account must log in once"
+      pending=$((pending + 1))
+      continue
+    fi
+
+    char_count="$(fls_character_count "$new")"
+    if [ "$char_count" != "0" ]; then
+      echo "WARNING: new account appears non-empty (character/state rows: $char_count)."
+      if [ "$assume_yes" != "1" ] && [ "$dry_run" != "1" ]; then
+        read -r -p "Continue this identity-changing transfer? [y/N]: " answer
+        case "$answer" in y|Y|yes|YES) ;; *) echo "Transfer cancelled."; failed=$((failed + 1)); break ;; esac
+      fi
+    fi
+
+    if [ "$dry_run" = "1" ]; then
+      echo "DRY RUN would call set_account_as_takeoverable, can_takeover_account, takeover_account."
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    if [ "$assume_yes" != "1" ]; then
+      read -r -p "Apply transfer $(redact_fls "$old") -> $(redact_fls "$new")? [y/N]: " answer
+      case "$answer" in y|Y|yes|YES) ;; *) echo "Transfer cancelled."; failed=$((failed + 1)); break ;; esac
+    fi
+
+    if transfer_sql_apply "$old" "$new"; then
+      echo "APPLIED transfer $(redact_fls "$old") -> $(redact_fls "$new")"
+      applied=$((applied + 1))
+    else
+      echo "FAILED transfer on line $lineno. Stopping."
+      failed=$((failed + 1))
+      break
+    fi
+  done <<< "$rows"
+
+  echo
+  echo "Transfer summary: applied=$applied skipped=$skipped failed=$failed pending=$pending"
+  [ "$failed" -eq 0 ] && [ "$pending" -eq 0 ]
+}
+
+transfer_command() {
+  local dry_run=0 assume_yes="${DUNE_DB_ASSUME_YES:-0}" no_backup=0 file="" sub="${1:-}"
+  local plan
+
+  case "$sub" in
+    pending)
+      if [ -s "$PENDING_TRANSFER_FILE" ]; then
+        while IFS=$'\t' read -r old new note; do
+          [ -n "${old:-}" ] || continue
+          printf '%s\t%s\t%s\n' "$(redact_fls "$old")" "$(redact_fls "$new")" "$note"
+        done < "$PENDING_TRANSFER_FILE"
+      else
+        echo "No pending character transfers."
+      fi
+      return 0
+      ;;
+    apply-pending)
+      [ -s "$PENDING_TRANSFER_FILE" ] || { echo "No pending character transfers."; return 0; }
+      if run_transfer_plan "$PENDING_TRANSFER_FILE" 0 "$assume_yes" 0; then
+        rm -f "$PENDING_TRANSFER_FILE"
+        echo "All pending transfers applied; pending file cleared."
+        return 0
+      fi
+      return 1
+      ;;
+    clear-pending)
+      if [ "$assume_yes" != "1" ]; then
+        read -r -p "Clear pending transfer file? [y/N]: " answer
+        case "$answer" in y|Y|yes|YES) ;; *) echo "Cancelled."; return 1 ;; esac
+      fi
+      rm -f "$PENDING_TRANSFER_FILE"
+      echo "Pending transfer file cleared."
+      return 0
+      ;;
+  esac
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --yes|-y) assume_yes=1; shift ;;
+      --no-backup) no_backup=1; shift ;;
+      --file)
+        [ -n "${2:-}" ] || { echo "Missing --file path."; exit 2; }
+        file="$2"; shift 2
+        ;;
+      --*) echo "Unknown transfer option: $1"; exit 2 ;;
+      *) break ;;
+    esac
+  done
+
+  if [ -n "$file" ]; then
+    [ -f "$file" ] || { echo "Transfer plan file not found: $file"; exit 1; }
+    run_transfer_plan "$file" "$dry_run" "$assume_yes" "$no_backup"
+    return $?
+  fi
+
+  if [ "$#" -ne 2 ]; then
+    echo "Usage: dune db transfer [--dry-run] [--yes] OLD_FLS_ID NEW_FLS_ID"
+    exit 2
+  fi
+  mkdir -p runtime/generated
+  plan="runtime/generated/transfer-plan-single-$$.tsv"
+  printf '%s\t%s\tmanual\n' "$1" "$2" > "$plan"
+  run_transfer_plan "$plan" "$dry_run" "$assume_yes" "$no_backup"
+  rm -f "$plan"
 }
 
 validate_positive_integer() {
@@ -886,7 +1212,12 @@ case "$cmd" in
     health_db
     ;;
   import|restore)
-    import_db "${2:-}"
+    shift || true
+    import_db "$@"
+    ;;
+  transfer)
+    shift || true
+    transfer_command "$@"
     ;;
   delete)
     delete_backup "${2:-}"

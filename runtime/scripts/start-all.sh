@@ -54,6 +54,17 @@ runtime/scripts/publish-sietch-overrides.sh restart || {
   echo "Sietch override publisher did not start. Survival_1 custom browser names/passwords will not republish."
 }
 
+echo "=== Starting Deep Desert Warm-Up Publisher ==="
+runtime/scripts/publish-deepdesert-overrides.sh restart || {
+  echo "Deep Desert warm-up publisher did not start. Deep Desert may show offline instead of loading while warming."
+}
+
+if [ -f runtime/generated/director-deepdesert-dual.ini ]; then
+  echo
+  echo "=== Dual Deep Desert Override Present ==="
+  echo "Deep Desert dual-mode config detected. Selector names/Kanly remain client/backend-controlled."
+fi
+
 echo
 echo "=== Starting ServerGateway ==="
 runtime/scripts/start-server-gateway.sh
@@ -63,6 +74,17 @@ echo "=== Publishing Survival Sietch State ==="
 runtime/scripts/publish-sietch-overrides.sh once || {
   echo "Could not publish the latest Survival_1 browser state snapshot."
 }
+
+echo "=== Publishing Deep Desert Warm-Up State ==="
+runtime/scripts/publish-deepdesert-overrides.sh once || {
+  echo "Could not publish the latest Deep Desert warm-up snapshot."
+}
+
+if [ -f runtime/generated/director-deepdesert-dual.ini ]; then
+  echo
+  echo "=== Dual Deep Desert Note ==="
+  echo "Deep Desert dual-mode gameplay config is active. Selector names/Kanly remain cosmetic."
+fi
 
 echo
 echo "=== Starting Autoscaler ==="

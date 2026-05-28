@@ -7,11 +7,13 @@ INTERVAL="${DUNE_AUTOSCALER_INTERVAL:-5}"
 SINCE="${DUNE_AUTOSCALER_LOG_SINCE:-30s}"
 NAMED_DESTINATION_SINCE="${DUNE_AUTOSCALER_NAMED_DESTINATION_LOG_SINCE:-10m}"
 IDLE_SECONDS="${DUNE_AUTOSCALER_IDLE_SECONDS:-300}"
+DESPAWN_GRACE_SECONDS="${DUNE_AUTOSCALER_DESPAWN_GRACE_SECONDS:-$IDLE_SECONDS}"
 TRAVEL_GRACE_SECONDS="${DUNE_AUTOSCALER_TRAVEL_GRACE_SECONDS:-120}"
 STATE_FILE="${DUNE_AUTOSCALER_STATE_FILE:-runtime/generated/autoscaler-idle.tsv}"
 SERVER_ID_MAP_FILE="${DUNE_AUTOSCALER_SERVER_ID_MAP_FILE:-runtime/generated/autoscaler-server-ids.tsv}"
 DEMAND_FILE="${DUNE_AUTOSCALER_DEMAND_FILE:-runtime/generated/autoscaler-demand.tsv}"
 HUB_TRAVEL_FILE="${DUNE_AUTOSCALER_HUB_TRAVEL_FILE:-runtime/generated/autoscaler-hub-travel.tsv}"
+DEEPDESERT_TRAVEL_FILE="${DUNE_AUTOSCALER_DEEPDESERT_TRAVEL_FILE:-runtime/generated/autoscaler-deepdesert-travel.tsv}"
 DIRECTOR_HEAL_FILE="${DUNE_AUTOSCALER_DIRECTOR_HEAL_FILE:-runtime/generated/autoscaler-director-heal.tsv}"
 DIRECTOR_HEAL_STALE_SECONDS="${DUNE_AUTOSCALER_DIRECTOR_HEAL_STALE_SECONDS:-15}"
 DIRECTOR_HEAL_COOLDOWN_SECONDS="${DUNE_AUTOSCALER_DIRECTOR_HEAL_COOLDOWN_SECONDS:-300}"
@@ -22,6 +24,7 @@ touch "$STATE_FILE"
 touch "$SERVER_ID_MAP_FILE"
 touch "$DEMAND_FILE"
 touch "$HUB_TRAVEL_FILE"
+touch "$DEEPDESERT_TRAVEL_FILE"
 touch "$DIRECTOR_HEAL_FILE"
 
 echo "=== Dune Docker autoscaler ==="
@@ -30,6 +33,7 @@ echo "Interval: ${INTERVAL}s"
 echo "Log window: ${SINCE}"
 echo "Named destination log window: ${NAMED_DESTINATION_SINCE}"
 echo "Idle despawn grace: ${IDLE_SECONDS}s"
+echo "Dynamic mode-change grace: ${DESPAWN_GRACE_SECONDS}s"
 echo "Travel grace: ${TRAVEL_GRACE_SECONDS}s"
 echo "State file: ${STATE_FILE}"
 echo
@@ -68,6 +72,22 @@ hub_server_id_for_origin_id() {
       "
       ;;
     *) return 1 ;;
+  esac
+}
+
+origin_server_id_for_origin_id() {
+  case "$1" in
+    Overmap2)
+      psql_value "
+        select coalesce(server_id, '')
+        from dune.farm_state
+        where map = 'Overmap'
+        limit 1;
+      "
+      ;;
+    *)
+      hub_server_id_for_origin_id "$1"
+      ;;
   esac
 }
 
@@ -471,6 +491,77 @@ remember_hub_travel() {
   mv "$tmp" "$HUB_TRAVEL_FILE"
 }
 
+deepdesert_travel_seen() {
+  local flow_id="$1"
+  awk -F '\t' -v flow="$flow_id" '$1 == flow { found=1; exit } END { exit(found ? 0 : 1) }' "$DEEPDESERT_TRAVEL_FILE"
+}
+
+remember_deepdesert_travel() {
+  local flow_id="$1"
+  local player_id="$2"
+  local origin_id="$3"
+  local request_token="$4"
+  local ts="$5"
+  local last_refresh="$6"
+  local tmp
+
+  tmp="$(mktemp)"
+  awk -F '\t' -v flow="$flow_id" '$1 != flow { print }' "$DEEPDESERT_TRAVEL_FILE" > "$tmp"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$flow_id" "$player_id" "$origin_id" "$request_token" "$ts" "$last_refresh" >> "$tmp"
+  mv "$tmp" "$DEEPDESERT_TRAVEL_FILE"
+}
+
+forget_deepdesert_travel() {
+  local flow_id="$1"
+  local tmp
+
+  tmp="$(mktemp)"
+  awk -F '\t' -v flow="$flow_id" '$1 != flow { print }' "$DEEPDESERT_TRAVEL_FILE" > "$tmp"
+  mv "$tmp" "$DEEPDESERT_TRAVEL_FILE"
+}
+
+deepdesert_target_json() {
+  python3 - <<'PY'
+import json
+import subprocess
+
+sql = """
+select
+  wp.partition_id,
+  coalesce(wp.dimension_index, 0),
+  coalesce(fs.game_port, 0),
+  trim(leading '(' from split_part(fs.game_addr::text, ',', 1)) as game_addr,
+  coalesce(fs.ready, false),
+  coalesce(fs.alive, false),
+  coalesce(fs.server_id, '')
+from dune.world_partition wp
+join dune.farm_state fs on fs.server_id = wp.server_id
+where wp.map = 'DeepDesert_1'
+order by wp.dimension_index, wp.partition_id
+limit 1;
+"""
+proc = subprocess.run(
+    ["docker", "exec", "dune-postgres", "psql", "-U", "postgres", "-d", "dune", "-AtF", "|", "-c", sql],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+row = proc.stdout.strip()
+if not row:
+    raise SystemExit(1)
+partition_id, dimension, port, ip, ready, alive, server_id = row.split("|", 6)
+print(json.dumps({
+    "partition_id": int(partition_id),
+    "dimension": int(dimension),
+    "port": int(port),
+    "ip": ip.split("/")[0],
+    "ready": ready.lower() in ("t", "true", "1"),
+    "alive": alive.lower() in ("t", "true", "1"),
+    "server_id": server_id,
+}))
+PY
+}
+
 survival_partition_target_json() {
   python3 - <<'PY'
 import json
@@ -696,6 +787,183 @@ PY
   done
 }
 
+scan_deepdesert_loading_responses() {
+  local director_log_file pending_rows now target_json
+
+  target_json="$(deepdesert_target_json 2>/dev/null || true)"
+  [ -n "$target_json" ] || return 0
+
+  director_log_file="$(mktemp)"
+  docker logs --since "$SINCE" dune-director > "$director_log_file" 2>&1 || true
+  pending_rows="$(TARGET_JSON="$target_json" LOG_FILE="$director_log_file" python3 - <<'PY'
+import json
+import os
+import re
+
+target = json.loads(os.environ["TARGET_JSON"])
+log_file = os.environ["LOG_FILE"]
+response_re = re.compile(r'Notified player\(s\) "([^"]+)" of travel response (Overmap2): (\{.*\})')
+
+with open(log_file, encoding="utf-8", errors="replace") as f:
+    for line in f:
+        match = response_re.search(line)
+        if not match:
+            continue
+        player_id = match.group(1)
+        origin_id = match.group(2)
+        try:
+            payload = json.loads(match.group(3))
+        except json.JSONDecodeError:
+            continue
+        if payload.get("Code") != 1:
+            continue
+        if payload.get("MapName") != "DeepDesert_1":
+            continue
+        if payload.get("ServerState") not in (0, None):
+            continue
+        flow_id = payload.get("RequestID") or ""
+        if not flow_id:
+            continue
+        payload["ServerState"] = 2
+        payload["DestinationPartitionId"] = target["partition_id"]
+        payload["BroadcastExchange"] = f"status.DeepDesert_1.dim_{target['dimension']}"
+        print("{}|{}|{}|{}|{}".format(
+            flow_id,
+            player_id,
+            origin_id,
+            payload.get("QueueToken") or 0,
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+        ))
+PY
+  )"
+  rm -f "$director_log_file"
+
+  now="$(date +%s)"
+  while IFS='|' read -r flow_id player_id origin_id request_token response_json; do
+    [ -n "${flow_id:-}" ] || continue
+
+    local origin_server_id
+    origin_server_id="$(origin_server_id_for_origin_id "$origin_id" 2>/dev/null || true)"
+    [ -n "$origin_server_id" ] || continue
+
+    publish_rmq_json "heartbeats" "$origin_server_id" "$response_json" "travel-response-dd-${flow_id}" || true
+
+    if ! deepdesert_travel_seen "$flow_id"; then
+      remember_deepdesert_travel "$flow_id" "$player_id" "$origin_id" "$request_token" "$now" "$now"
+    else
+      remember_deepdesert_travel "$flow_id" "$player_id" "$origin_id" "$request_token" "$now" "$now"
+    fi
+    echo "DEEPDESERT-QUEUE flow=$flow_id origin=$origin_id server=$origin_server_id state=loading"
+  done <<< "$pending_rows"
+}
+
+progress_deepdesert_travel_handoffs() {
+  local now line flow_id player_id origin_id request_token seen_at last_refresh
+  local target_json
+
+  [ -s "$DEEPDESERT_TRAVEL_FILE" ] || return 0
+  target_json="$(deepdesert_target_json 2>/dev/null || true)"
+  [ -n "$target_json" ] || return 0
+  now="$(date +%s)"
+
+  while IFS=$'\t' read -r flow_id player_id origin_id request_token seen_at last_refresh; do
+    [ -n "${flow_id:-}" ] || continue
+
+    local origin_server_id
+    origin_server_id="$(origin_server_id_for_origin_id "$origin_id" 2>/dev/null || true)"
+    if [ -z "$origin_server_id" ]; then
+      forget_deepdesert_travel "$flow_id"
+      continue
+    fi
+
+    if [ $((now - seen_at)) -gt 300 ]; then
+      forget_deepdesert_travel "$flow_id"
+      continue
+    fi
+
+    TARGET_JSON="$target_json" FLOW_ID="$flow_id" PLAYER_ID="$player_id" ORIGIN_ID="$origin_id" REQUEST_TOKEN="$request_token" python3 - <<'PY' > /tmp/deepdesert-progress.json
+import json
+import os
+from datetime import datetime, timedelta, timezone
+
+target = json.loads(os.environ["TARGET_JSON"])
+flow_id = os.environ["FLOW_ID"]
+player_id = os.environ["PLAYER_ID"]
+origin_id = os.environ["ORIGIN_ID"]
+request_token = int(os.environ.get("REQUEST_TOKEN") or "0")
+
+if target["ready"]:
+    payload = {
+        "grant": {
+            "Map": "DeepDesert_1",
+            "Dimension": target["dimension"],
+            "PartitionId": target["partition_id"],
+            "Port": target["port"],
+            "Expiration": (datetime.now(timezone.utc) + timedelta(minutes=3)).isoformat().replace("+00:00", "Z"),
+            "RequestToken": request_token,
+            "OriginId": origin_id,
+            "RequestID": flow_id,
+            "Players": [{"Id": player_id, "TargetDimension": target["dimension"]}],
+            "Flow": 1,
+            "ServerLoginToken": "",
+            "ReturnDimension": None,
+            "Ip": target["ip"],
+        }
+    }
+else:
+    payload = {
+        "response": {
+            "Code": 1,
+            "OriginId": origin_id,
+            "RequestID": flow_id,
+            "MapName": "DeepDesert_1",
+            "DestinationPartitionId": target["partition_id"],
+            "QueueToken": request_token,
+            "QueueState": {},
+            "ServerState": 2,
+            "BroadcastExchange": f"status.DeepDesert_1.dim_{target['dimension']}",
+            "ServerFull": False,
+            "ServerLoginToken": "",
+            "RetryTime": None,
+        }
+    }
+
+print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+PY
+
+    if TARGET_JSON="$target_json" python3 - <<'PY'
+import json, os, sys
+target = json.loads(os.environ["TARGET_JSON"])
+sys.exit(0 if target["ready"] else 1)
+PY
+    then
+      local grant_json
+      grant_json="$(python3 - <<'PY'
+import json
+from pathlib import Path
+print(json.dumps(json.loads(Path("/tmp/deepdesert-progress.json").read_text())["grant"], separators=(",", ":"), ensure_ascii=False))
+PY
+)"
+      publish_rmq_json "heartbeats" "$origin_server_id" "$grant_json" "travel-grant-dd-${flow_id}" || true
+      echo "DEEPDESERT-GRANT flow=$flow_id origin=$origin_id server=$origin_server_id"
+      forget_deepdesert_travel "$flow_id"
+    else
+      if [ $((now - last_refresh)) -ge 15 ]; then
+        local response_json
+        response_json="$(python3 - <<'PY'
+import json
+from pathlib import Path
+print(json.dumps(json.loads(Path("/tmp/deepdesert-progress.json").read_text())["response"], separators=(",", ":"), ensure_ascii=False))
+PY
+)"
+        publish_rmq_json "heartbeats" "$origin_server_id" "$response_json" "travel-response-dd-${flow_id}" || true
+        remember_deepdesert_travel "$flow_id" "$player_id" "$origin_id" "$request_token" "$seen_at" "$now"
+        echo "DEEPDESERT-QUEUE flow=$flow_id origin=$origin_id server=$origin_server_id state=loading-refresh"
+      fi
+    fi
+  done < "$DEEPDESERT_TRAVEL_FILE"
+}
+
 companion_map_for() {
   case "$1" in
     SH_Arrakeen) echo "SH_HarkoVillage" ;;
@@ -753,6 +1021,20 @@ map_effective_player_count() {
 map_has_active_presence() {
   local map="$1"
   [ "$(map_effective_player_count "$map" | tr -d '[:space:]')" != "0" ]
+}
+
+map_is_always_on() {
+  local map="$1"
+  runtime/scripts/map-modes.sh is-always-on "$map" >/dev/null 2>&1
+}
+
+map_dynamic_grace_remaining() {
+  local map="$1"
+  DUNE_AUTOSCALER_DESPAWN_GRACE_SECONDS="$DESPAWN_GRACE_SECONDS" runtime/scripts/map-modes.sh grace-remaining "$map" 2>/dev/null || echo 0
+}
+
+reconcile_always_on_maps() {
+  runtime/scripts/map-modes.sh reconcile || true
 }
 
 remember_server_id_map() {
@@ -854,6 +1136,11 @@ handle_demand() {
       ;;
   esac
 
+  if map_is_always_on "$map"; then
+    clear_idle_since "$(state_key "$map" "$server_id")"
+    return 0
+  fi
+
   if ! map_exists "$map"; then
     echo "WARN unknown map from Director travel queue: $map"
     return 0
@@ -864,6 +1151,40 @@ handle_demand() {
 
   local running
   running="$(container_count_for_map "$map")"
+
+  if [ "$map" = "DeepDesert_1" ]; then
+    local desired_active current_active needed
+    desired_active="$(active_dimensions_for_map "$map" | tr -d '[:space:]')"
+    [ -n "$desired_active" ] || desired_active=1
+
+    if [ "$assigned" -ge "$desired_active" ] 2>/dev/null || [ "$running" -ge "$desired_active" ] 2>/dev/null; then
+      echo "OK   demand map=$map num=$num target=$desired_active assigned=$assigned containers=$running"
+      return 0
+    fi
+
+    current_active="$assigned"
+    if [ "${running:-0}" -gt "${current_active:-0}" ] 2>/dev/null; then
+      current_active="$running"
+    fi
+    needed=$((desired_active - current_active))
+    [ "$needed" -gt 0 ] || needed=1
+
+    while [ "$needed" -gt 0 ]; do
+      echo "SPAWN demand map=$map num=$num target=$desired_active assigned=$assigned containers=$running"
+      runtime/scripts/spawn-server.sh "$map" || {
+        echo "ERROR failed to spawn $map"
+        return 0
+      }
+      assigned="$(map_assigned_count "$map")"
+      running="$(container_count_for_map "$map")"
+      current_active="$assigned"
+      if [ "${running:-0}" -gt "${current_active:-0}" ] 2>/dev/null; then
+        current_active="$running"
+      fi
+      needed=$((desired_active - current_active))
+    done
+    return 0
+  fi
 
   dedicated_scaling="$(map_uses_dedicated_scaling "$map")"
 
@@ -935,6 +1256,13 @@ handle_idle_row() {
   fi
 
   if map_has_recent_demand "$map"; then
+    clear_idle_since "$key"
+    return 0
+  fi
+
+  local remaining
+  remaining="$(map_dynamic_grace_remaining "$map" | tr -d '[:space:]')"
+  if [ "${remaining:-0}" -gt 0 ] 2>/dev/null; then
     clear_idle_since "$key"
     return 0
   fi
@@ -1542,9 +1870,13 @@ scan_director_browser_state() {
 }
 
 follow_director_hagga_handoffs &
+reconcile_always_on_maps
 
 while true; do
+  reconcile_always_on_maps
+  scan_deepdesert_loading_responses
   scan_travel_demand
+  progress_deepdesert_travel_handoffs
   ensure_social_hub_companions
   scan_proactive_hagga_handoffs
   scan_social_hub_travel_handoffs

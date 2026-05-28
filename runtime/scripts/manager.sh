@@ -25,10 +25,18 @@ restore_menu_tty() {
     printf '\033[H\033[J' >&2
   fi
   if [ -n "${MENU_ACTIVE_TTY:-}" ]; then
-    stty "$MENU_ACTIVE_TTY" < /dev/tty 2>/dev/null || stty "$MENU_ACTIVE_TTY" 2>/dev/null || stty sane < /dev/tty 2>/dev/null || stty sane 2>/dev/null || true
+    if [ -t 0 ] && [ -r /dev/tty ]; then
+      stty "$MENU_ACTIVE_TTY" < /dev/tty 2>/dev/null || stty "$MENU_ACTIVE_TTY" 2>/dev/null || stty sane < /dev/tty 2>/dev/null || stty sane 2>/dev/null || true
+    else
+      stty "$MENU_ACTIVE_TTY" 2>/dev/null || stty sane 2>/dev/null || true
+    fi
     MENU_ACTIVE_TTY=""
   else
-    stty sane < /dev/tty 2>/dev/null || stty sane 2>/dev/null || true
+    if [ -t 0 ] && [ -r /dev/tty ]; then
+      stty sane < /dev/tty 2>/dev/null || stty sane 2>/dev/null || true
+    else
+      stty sane 2>/dev/null || true
+    fi
   fi
 }
 
@@ -386,6 +394,9 @@ select_menu() {
     done
     echo >&2
     echo "${C_CYAN}Use Up And Down, Enter To Select. Use Back To Return.${C_RESET}" >&2
+    echo "${C_GREEN}This project is free and community-supported.${C_RESET}" >&2
+    echo "${C_GREEN}If it's useful to you, please consider supporting its development.${C_RESET}" >&2
+    echo "${C_GREEN}Keep it alive: https://ko-fi.com/redblink${C_RESET}" >&2
     printf '\033[J' >&2
 
     MENU_INTERRUPTED=0
@@ -1924,14 +1935,59 @@ choose_backup() {
 restore_specific_backup_path() {
   local backup_path="$1"
   local backup_name="${2:-$(basename "$backup_path")}"
+  local transfer_args=()
 
   echo
   echo "Restoring a database backup will replace the current battlegroup database."
+  echo "Do not let players create new characters until the restore is verified."
+  echo "Normal case: players keep the same account and no transfer is needed."
+  echo "Use character transfer only for players whose FLS/Funcom account changed."
   if confirm "Restore backup '$backup_name'?"; then
-    run_cmd env DUNE_DB_ASSUME_YES=1 "$DUNE" db restore "$backup_path"
+    collect_transfer_args transfer_args
+    run_cmd env DUNE_DB_ASSUME_YES=1 "$DUNE" db restore "$backup_path" "${transfer_args[@]}"
   else
     echo "Cancelled."
   fi
+}
+
+collect_transfer_args() {
+  local __var="$1"
+  local -n __out="$__var"
+  local choice pair plan_file
+  __out=()
+  echo
+  echo "Character transfers are only for players whose account identity changed."
+  echo "If players are logging in with the same account as before, choose No."
+  echo
+  if ! confirm "Add character transfer mapping after import/restore?"; then
+    return 0
+  fi
+  while true; do
+    menu_or_back "Character Transfers After Import/Restore" \
+      "Add old_fls=new_fls Pair (Changed Account Only)" \
+      "Use Local Transfer Plan TSV" \
+      "Continue" || return 0
+    choice="$MENU_CHOICE"
+    case "$choice" in
+      1)
+        prompt_text "Transfer Pair old_fls=new_fls:" pair || continue
+        if [[ "$pair" != *=* ]]; then
+          error_msg "Expected old_fls=new_fls."
+          continue
+        fi
+        __out+=("--transfer" "$pair")
+        ;;
+      2)
+        prompt_text "Local Transfer Plan TSV Path:" plan_file || continue
+        if [ ! -f "$plan_file" ]; then
+          error_msg "File not found: $plan_file"
+          continue
+        fi
+        __out+=("--transfer-file" "$plan_file")
+        ;;
+      3) return 0 ;;
+    esac
+  done
 }
 
 import_local_backup_file_flow() {
@@ -2281,8 +2337,8 @@ admin_choose_player() {
   mapfile -t rows < <(admin_online_player_rows)
 
   echo
-  echo "Select Player To Grant Items"
-  echo "============================"
+  echo "Select Online Player"
+  echo "===================="
   echo
   if [ "${#rows[@]}" -eq 0 ]; then
     echo "No online players found."
@@ -2491,6 +2547,40 @@ admin_tools_menu() {
   done
 }
 
+admin_kick_player_flow() {
+  local player_id player_label
+
+  ADMIN_SELECTED_PLAYER_ID=""
+  ADMIN_SELECTED_PLAYER_LABEL=""
+  admin_choose_player || return
+  player_id="$ADMIN_SELECTED_PLAYER_ID"
+  player_label="$ADMIN_SELECTED_PLAYER_LABEL"
+
+  echo
+  if [ "$player_id" = "*" ]; then
+    echo "Kick all online players now?"
+    echo "  Target: $player_label"
+    echo "  Scope: whatever the running server farm currently considers online"
+    echo
+    if confirm "Publish KickPlayer for all online players"; then
+      run_cmd "$DUNE" admin kick --all-online --yes
+    else
+      echo "Cancelled."
+    fi
+    return 0
+  fi
+
+  echo "Kick player now?"
+  echo "  Player: $player_label"
+  echo "  PlayerId: $player_id"
+  echo
+  if confirm "Publish KickPlayer now"; then
+    run_cmd "$DUNE" admin kick "$player_id" --yes
+  else
+    echo "Cancelled."
+  fi
+}
+
 main_menu() {
   local choice
   while true; do
@@ -2669,6 +2759,8 @@ dynamic_maps_menu() {
       "Stop Autoscaler" \
       "Restart Autoscaler" \
       "Show Running Maps" \
+      "Configure Maps" \
+      "Dual Deep Desert PvP/PvE" \
       "Show Autoscaler Logs" \
       "Back" || return
     choice="$MENU_CHOICE"
@@ -2685,8 +2777,78 @@ dynamic_maps_menu() {
         run_cmd "$DUNE" servers
         pause
         ;;
-      6) run_cmd "$DUNE" autoscaler logs; pause ;;
-      7) return ;;
+      6) configure_maps_menu ;;
+      7) dual_deepdesert_menu ;;
+      8) run_cmd "$DUNE" autoscaler logs; pause ;;
+      9) return ;;
+    esac
+  done
+}
+
+configure_maps_menu() {
+  local rows=() labels=() maps=() row map choice mode sub
+  while true; do
+    mapfile -t rows < <("$DUNE" maps list 2>/dev/null || true)
+    labels=()
+    maps=()
+    for row in "${rows[@]}"; do
+      [ -n "$row" ] || continue
+      map="$(awk '{print $1}' <<< "$row")"
+      maps+=("$map")
+      labels+=("$row")
+    done
+    labels+=("Back")
+    menu_or_back "Configure Maps" "${labels[@]}" || return
+    choice="$MENU_CHOICE"
+    if [ "$choice" -eq "${#labels[@]}" ]; then
+      return
+    fi
+    map="${maps[$((choice - 1))]}"
+    mode="$("$DUNE" maps mode "$map" | awk '{print $2}')"
+    while true; do
+      if [ "$mode" = "always-on" ]; then
+        menu_or_back "$map" \
+          "Change To Dynamic" \
+          "Show Running Partitions" \
+          "Back" || break
+        sub="$MENU_CHOICE"
+        case "$sub" in
+          1) run_cmd "$DUNE" maps set "$map" dynamic; pause; break ;;
+          2) run_cmd "$DUNE" sietches dimensions "$map"; pause ;;
+          3) break ;;
+        esac
+      else
+        menu_or_back "$map" \
+          "Change To Always On" \
+          "Show Running Partitions" \
+          "Back" || break
+        sub="$MENU_CHOICE"
+        case "$sub" in
+          1) run_cmd "$DUNE" maps set "$map" always-on; pause; break ;;
+          2) run_cmd "$DUNE" sietches dimensions "$map"; pause ;;
+          3) break ;;
+        esac
+      fi
+    done
+  done
+}
+
+dual_deepdesert_menu() {
+  local choice
+  while true; do
+    menu_or_back "Dual Deep Desert PvP/PvE" \
+      "Status" \
+      "Enable" \
+      "Disable" \
+      "Bootstrap Routing Fix" \
+      "Back" || return
+    choice="$MENU_CHOICE"
+    case "$choice" in
+      1) run_cmd "$DUNE" deepdesert dual status; pause ;;
+      2) run_cmd "$DUNE" deepdesert dual enable; pause ;;
+      3) run_cmd "$DUNE" deepdesert dual disable; pause ;;
+      4) run_cmd "$DUNE" deepdesert dual bootstrap; pause ;;
+      5) return ;;
     esac
   done
 }
@@ -2702,6 +2864,7 @@ database_maintenance_menu() {
       "Delete A Backup" \
       "Delete All Backups" \
       "Automatic Database Backups" \
+      "Character Transfer / Account Takeover" \
       "Database Health Check" \
       "Database Status" \
       "Back" || return
@@ -2715,9 +2878,41 @@ database_maintenance_menu() {
       5) delete_backup_flow; pause ;;
       6) delete_all_backups_flow; pause ;;
       7) automatic_database_backups_menu ;;
-      8) run_cmd "$DUNE" db health; pause ;;
-      9) run_cmd "$DUNE" db status; pause ;;
-      10) return ;;
+      8) character_transfer_menu ;;
+      9) run_cmd "$DUNE" db health; pause ;;
+      10) run_cmd "$DUNE" db status; pause ;;
+      11) return ;;
+    esac
+  done
+}
+
+character_transfer_menu() {
+  local choice old new plan
+  while true; do
+    menu_or_back "Character Transfer / Account Takeover" \
+      "Run Single Transfer" \
+      "Run Transfer Plan File" \
+      "Show Pending Transfers" \
+      "Apply Pending Transfers" \
+      "Clear Pending Transfers" \
+      "Back" || return
+    choice="$MENU_CHOICE"
+    case "$choice" in
+      1)
+        prompt_text "Old FLS ID:" old || { pause; continue; }
+        prompt_text "New FLS ID:" new || { pause; continue; }
+        run_cmd "$DUNE" db transfer "$old" "$new"
+        pause
+        ;;
+      2)
+        prompt_text "Transfer Plan TSV Path:" plan || { pause; continue; }
+        run_cmd "$DUNE" db transfer --file "$plan"
+        pause
+        ;;
+      3) run_cmd "$DUNE" db transfer pending; pause ;;
+      4) run_cmd "$DUNE" db transfer apply-pending; pause ;;
+      5) run_cmd "$DUNE" db transfer clear-pending; pause ;;
+      6) return ;;
     esac
   done
 }

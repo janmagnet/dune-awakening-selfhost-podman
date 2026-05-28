@@ -170,6 +170,10 @@ AllowGroupTravel=false
 NumExtraServers=0
 EOF
 
+if [ -s runtime/generated/director-deepdesert-dual.ini ]; then
+  cat runtime/generated/director-deepdesert-dual.ini >> runtime/director/config/director_config.ini
+fi
+
 cat >> runtime/director/config/director_config.ini <<EOF
 
 [AuthenticationConfiguration]

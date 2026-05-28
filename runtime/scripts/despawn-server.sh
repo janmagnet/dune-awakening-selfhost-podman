@@ -2,11 +2,13 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+PORT_RESERVATION_FILE="runtime/generated/spawn-port-reservations.tsv"
+PORT_LOCK_FILE="runtime/generated/spawn-port-reservations.lock"
 
 usage() {
   cat <<'EOF'
 Usage:
-  dune despawn <map-name|partition-id|container-name>
+  dune despawn <map-name|partition-id|container-name> [--force]
 
 Examples:
   dune despawn SH_Arrakeen
@@ -21,6 +23,14 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ $# -lt 1 ]; then
 fi
 
 TARGET="$1"
+FORCE=0
+shift || true
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    *) echo "Unknown option: $arg"; usage; exit 2 ;;
+  esac
+done
 
 case "${TARGET,,}" in
   overmap|dune-server-overmap)
@@ -37,6 +47,90 @@ esac
 
 psql_value() {
   docker exec dune-postgres psql -U postgres -d dune -Atc "$1"
+}
+
+container_name_for_map_partition() {
+  local map="$1"
+  local partition_id="$2"
+  local safe_name
+
+  safe_name="$(echo "$map-$partition_id" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')"
+  printf 'dune-server-%s\n' "$safe_name"
+}
+
+rebuild_port_reservation_file() {
+  local output_path="$1"
+  local rows partition_id map game_port igw_port container_name
+
+  : >"$output_path"
+  rows="$(docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+    select
+      wp.partition_id,
+      wp.map,
+      coalesce(fs.game_port::text, ''),
+      coalesce(fs.igw_port::text, '')
+    from dune.world_partition wp
+    left join dune.farm_state fs on fs.server_id = wp.server_id
+    where coalesce(wp.server_id, '') <> ''
+      and coalesce(fs.game_port::text, '') <> ''
+      and coalesce(fs.igw_port::text, '') <> ''
+    order by wp.partition_id;
+  " 2>/dev/null || true)"
+
+  [ -n "$rows" ] || return 0
+
+  while IFS='|' read -r partition_id map game_port igw_port; do
+    [ -n "${partition_id:-}" ] || continue
+    [ -n "${map:-}" ] || continue
+    [ -n "${game_port:-}" ] || continue
+    [ -n "${igw_port:-}" ] || continue
+    container_name="$(container_name_for_map_partition "$map" "$partition_id")"
+    printf '%s\t%s\t%s\n' "$container_name" "$game_port" "$igw_port" >>"$output_path"
+  done <<< "$rows"
+}
+
+ensure_runtime_state_file() {
+  local path="$1"
+  local label="$2"
+  local dir base tmp
+
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
+  mkdir -p "$dir"
+
+  if [ ! -e "$path" ]; then
+    umask 0002
+    : >"$path"
+    chmod 664 "$path" 2>/dev/null || true
+    return 0
+  fi
+
+  if [ -r "$path" ] && [ -w "$path" ]; then
+    chmod 664 "$path" 2>/dev/null || true
+    return 0
+  fi
+
+  tmp="$(mktemp "$dir/.${base}.tmp.XXXXXX")"
+  chmod 664 "$tmp" 2>/dev/null || true
+
+  if [ -r "$path" ]; then
+    cat "$path" >"$tmp"
+  else
+    rebuild_port_reservation_file "$tmp"
+  fi
+
+  mv -f "$tmp" "$path"
+  chmod 664 "$path" 2>/dev/null || true
+}
+
+release_port_reservation() {
+  local container_name="$1"
+  local tmp
+
+  [ -f "$PORT_RESERVATION_FILE" ] || return 0
+  tmp="$(mktemp)"
+  awk -F '\t' -v target="$container_name" '$1 != target { print }' "$PORT_RESERVATION_FILE" >"$tmp"
+  mv "$tmp" "$PORT_RESERVATION_FILE"
 }
 
 container_from_partition() {
@@ -110,6 +204,18 @@ case "$CONTAINER" in
     ;;
 esac
 
+CONTAINER_MAP=""
+if [[ "$CONTAINER" =~ ^dune-server-(.*)-([0-9]+)$ ]]; then
+  PARTITION_FROM_NAME="${BASH_REMATCH[2]}"
+  CONTAINER_MAP="$(psql_value "select coalesce(map, '') from dune.world_partition where partition_id = $PARTITION_FROM_NAME limit 1;")"
+fi
+
+if [ -n "$CONTAINER_MAP" ] && [ "$FORCE" != "1" ] && runtime/scripts/map-modes.sh is-always-on "$CONTAINER_MAP" >/dev/null 2>&1; then
+  echo "Refusing to despawn Always On map: $CONTAINER_MAP"
+  echo "Set it back to Dynamic first, or rerun with --force. The autoscaler will respawn Always On maps."
+  exit 1
+fi
+
 PARTITION_ID=""
 if [[ "$CONTAINER" =~ -([0-9]+)$ ]]; then
   PARTITION_ID="${BASH_REMATCH[1]}"
@@ -122,6 +228,11 @@ fi
 
 echo "Despawning: $CONTAINER"
 docker rm -f "$CONTAINER"
+ensure_runtime_state_file "$PORT_LOCK_FILE" "spawn port reservation lock"
+exec 9>"$PORT_LOCK_FILE"
+flock 9
+ensure_runtime_state_file "$PORT_RESERVATION_FILE" "spawn port reservation state"
+release_port_reservation "$CONTAINER"
 
 if [ -n "$SERVER_ID" ]; then
   echo

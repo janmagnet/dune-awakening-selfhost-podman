@@ -675,6 +675,23 @@ Path("runtime/generated/partition-catalog.json").write_text(
 PY
 }
 
+normalize_deepdesert_labels() {
+  if ! docker_postgres_running; then
+    return 0
+  fi
+
+  docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+update dune.world_partition
+set label = case
+  when dimension_index = 0 then 'PvP'
+  when dimension_index = 1 then 'PvE'
+  else label
+end
+where map = 'DeepDesert_1'
+  and dimension_index in (0, 1);
+" >/dev/null
+}
+
 refresh_survival_browser_state() {
   if [ -x runtime/scripts/publish-sietch-overrides.sh ]; then
     runtime/scripts/publish-sietch-overrides.sh restart >/dev/null 2>&1 || true
@@ -755,6 +772,9 @@ from template;
 
 select dune.update_partition_labels(true);
 " >/dev/null
+    if [ "$map" = "DeepDesert_1" ]; then
+      normalize_deepdesert_labels
+    fi
     current=$((current + 1))
     next_dim=$((next_dim + 1))
     ENSURE_MAP_PARTITIONS_CHANGED=1
@@ -931,6 +951,9 @@ where wp.partition_id = ranked.partition_id
 
 select dune.update_partition_labels(true);
 " >/dev/null
+    if [ "$map" = "DeepDesert_1" ]; then
+      normalize_deepdesert_labels
+    fi
   else
     docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 with ranked as (
@@ -988,6 +1011,40 @@ if not entry:
 config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 PY
   set_config_permissions
+}
+
+partition_map_name() {
+  local partition_id="$1"
+  local row
+
+  if docker_postgres_running; then
+    row="$(psql_value "
+      select coalesce(map, '')
+      from dune.world_partition
+      where partition_id = ${partition_id}
+      limit 1;
+    " | tr -d '\r')"
+    if [ -n "$row" ]; then
+      printf '%s' "$row"
+      return 0
+    fi
+  fi
+
+  python3 - "$PARTITION_CATALOG" "$partition_id" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+catalog_path = Path(sys.argv[1])
+partition_id = str(sys.argv[2])
+if not catalog_path.exists():
+    raise SystemExit
+rows = json.loads(catalog_path.read_text())
+for row in rows:
+    if str(row.get("id")) == partition_id:
+        print(str(row.get("map") or ""))
+        raise SystemExit
+PY
 }
 
 runtime_args() {
@@ -1067,15 +1124,21 @@ case "$cmd" in
     shift 2
     display_name="$*"
     [ -n "$display_name" ] || { echo "Display name cannot be empty."; exit 1; }
-  set_partition_value "$partition_id" display_name "$display_name"
-    refresh_survival_control_plane_state
+    set_partition_value "$partition_id" display_name "$display_name"
+    python3 runtime/scripts/usersettings.py partition-engine-set "$(partition_map_name "$partition_id")" "$partition_id" server_display_name "$display_name" >/dev/null 2>&1 || true
+    if [ "$(partition_map_name "$partition_id")" = "Survival_1" ]; then
+      refresh_survival_control_plane_state
+    fi
     echo "Display name updated."
     ;;
   set-password)
     [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || { usage; exit 2; }
     password_value="${3:-${SIETCH_PASSWORD:-}}"
     set_partition_value "$2" password "$password_value"
-    refresh_survival_control_plane_state
+    python3 runtime/scripts/usersettings.py partition-engine-set "$(partition_map_name "$2")" "$2" server_login_password "$password_value" >/dev/null 2>&1 || true
+    if [ "$(partition_map_name "$2")" = "Survival_1" ]; then
+      refresh_survival_control_plane_state
+    fi
     if [ -n "$password_value" ]; then
       echo "Password updated."
     else

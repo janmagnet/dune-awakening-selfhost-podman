@@ -11,6 +11,10 @@ echo "=== Stopping sietch override publisher ==="
 runtime/scripts/publish-sietch-overrides.sh stop || true
 
 echo
+echo "=== Stopping Deep Desert warm-up publisher ==="
+runtime/scripts/publish-deepdesert-overrides.sh stop || true
+
+echo
 echo "=== Stopping game servers first ==="
 docker rm -f dune-server-overmap dune-server-survival-1 2>/dev/null || true
 

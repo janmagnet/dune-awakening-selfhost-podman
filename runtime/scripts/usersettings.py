@@ -90,6 +90,11 @@ PARTITION_FIELDS = {
     **MAP_FIELDS,
 }
 
+PARTITION_ENGINE_FIELDS = {
+    "server_display_name": ENGINE_FIELDS["server_display_name"],
+    "server_login_password": ENGINE_FIELDS["server_login_password"],
+}
+
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
@@ -190,6 +195,13 @@ def merged_partition_values(config: dict, map_name: str, partition_id: str) -> d
     return values
 
 
+def merged_partition_engine_values(config: dict, partition_id: str) -> dict[str, str]:
+    values = merged_engine_values(config)
+    partition_entry = config.get("partitions", {}).get(str(partition_id), {})
+    values.update(partition_entry.get("userengine", {}))
+    return values
+
+
 def print_rows(rows: dict[str, str], order: dict[str, tuple[str | None, str | None, str]]) -> int:
     for key in order:
         print(f"{key}\t{rows.get(key, '')}")
@@ -220,6 +232,17 @@ def set_partition_field(map_name: str, partition_id: str, field_id: str, value: 
     entry = config.setdefault("partitions", {}).setdefault(str(partition_id), {})
     entry["map"] = canonical_map(map_name)
     entry.setdefault("usergame", {})[field_id] = value
+    save_config(config)
+    return 0
+
+
+def set_partition_engine_field(map_name: str, partition_id: str, field_id: str, value: str) -> int:
+    if field_id not in PARTITION_ENGINE_FIELDS:
+        raise SystemExit(f"Unknown partition engine field: {field_id}")
+    config = load_config()
+    entry = config.setdefault("partitions", {}).setdefault(str(partition_id), {})
+    entry["map"] = canonical_map(map_name)
+    entry.setdefault("userengine", {})[field_id] = value
     save_config(config)
     return 0
 
@@ -486,11 +509,13 @@ def materialize_current_runtime_files() -> int:
     for map_name, saved_dir, partition_id in targets:
         user_settings_dir = saved_dir / "UserSettings"
         user_settings_dir.mkdir(parents=True, exist_ok=True)
-        write_userengine_ini(user_settings_dir / "UserEngine.ini", merged_engine_values(config))
         if partition_id:
+            engine_values = merged_partition_engine_values(config, str(partition_id))
             values = merged_partition_values(config, canonical_map(map_name), str(partition_id))
         else:
+            engine_values = merged_engine_values(config)
             values = merged_map_values(config, canonical_map(map_name))
+        write_userengine_ini(user_settings_dir / "UserEngine.ini", engine_values)
         write_usergame_ini(user_settings_dir / "UserGame.ini", values, partition_id)
     return 0
 
@@ -500,11 +525,13 @@ def materialize(map_name: str, saved_dir: str, partition_id: str | None = None) 
     target_map = canonical_map(map_name)
     user_settings_dir = Path(saved_dir) / "UserSettings"
     user_settings_dir.mkdir(parents=True, exist_ok=True)
-    write_userengine_ini(user_settings_dir / "UserEngine.ini", merged_engine_values(config))
     if partition_id:
+        engine_values = merged_partition_engine_values(config, str(partition_id))
         values = merged_partition_values(config, target_map, str(partition_id))
     else:
+        engine_values = merged_engine_values(config)
         values = merged_map_values(config, target_map)
+    write_userengine_ini(user_settings_dir / "UserEngine.ini", engine_values)
     write_usergame_ini(user_settings_dir / "UserGame.ini", values, str(partition_id) if partition_id else None)
     return 0
 
@@ -522,12 +549,16 @@ def main(argv: list[str]) -> int:
         return print_rows(merged_map_values(config, canonical_map(argv[2])), MAP_FIELDS)
     if command == "partition-values" and len(argv) == 4:
         return print_rows(merged_partition_values(config, canonical_map(argv[2]), argv[3]), PARTITION_FIELDS)
+    if command == "partition-engine-values" and len(argv) == 4:
+        return print_rows(merged_partition_engine_values(config, argv[3]), PARTITION_ENGINE_FIELDS)
     if command == "engine-set" and len(argv) == 4:
         return set_field("engine", None, argv[2], argv[3])
     if command == "map-set" and len(argv) == 5:
         return set_field("map", argv[2], argv[3], argv[4])
     if command == "partition-set" and len(argv) == 6:
         return set_partition_field(argv[2], argv[3], argv[4], argv[5])
+    if command == "partition-engine-set" and len(argv) == 6:
+        return set_partition_engine_field(argv[2], argv[3], argv[4], argv[5])
     if command == "reset-all":
         return reset_all()
     if command == "materialize-current":

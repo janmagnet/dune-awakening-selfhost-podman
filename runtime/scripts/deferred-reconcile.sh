@@ -48,4 +48,3 @@ wait_for_core_ready || {
 runtime/scripts/sietches.sh reconcile Survival_1 || true
 runtime/scripts/sietches.sh reconcile DeepDesert_1 || true
 runtime/scripts/publish-sietch-overrides.sh once || true
-

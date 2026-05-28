@@ -1,5 +1,9 @@
 # Dune Awakening Self-Host Docker
 
+<p align="center">
+  <img src="assets/cover.png" alt="Dune Awakening Self-Host Docker cover" />
+</p>
+
 ![Docker](https://img.shields.io/badge/Docker-ready-brightgreen)
 ![Linux](https://img.shields.io/badge/Linux-supported-brightgreen)
 ![Self--Hosted](https://img.shields.io/badge/Self--Hosted-yes-brightgreen)
@@ -219,6 +223,8 @@ dune db auto status
 
 Import and restore accept official Funcom-style `.backup` files plus older `dune-db-*.dump` and `.sql` backups. Import/restore replaces the current battlegroup database state, requires confirmation, and creates a pre-import backup first.
 
+After restore/import, do not let players create new characters until the restored database is verified. In the normal case, players keep the same FLS/Funcom account and no transfer is needed. Character transfer is only for players whose account identity changed.
+
 In the manager, `Import Database Backup` has two paths:
 
 - `Import Local Backup File` prompts for a local file path, copies the selected `.backup`, `.dump`, or `.sql` file into `runtime/backups/db/`, copies `<file>.yaml` when present, then runs the normal restore confirmation flow.
@@ -227,6 +233,38 @@ In the manager, `Import Database Backup` has two paths:
 Automatic backups use a systemd timer when systemd is available. Optional retention keeps backups from the last X days, for example `dune db auto enable 1 7` backs up hourly and keeps the last 7 days.
 
 In the manager, database maintenance includes `Create Database Backup`, `Import Database Backup`, `Restore A Database Backup`, `Delete A Backup`, `Delete All Backups`, and `Automatic Database Backups`. Restore and delete flows show available backups first. `Import Database Backup` supports local files and remote SSH imports, and carries the `.yaml` sidecar along when present. Deleting backups is permanent.
+
+### Character Transfer / Account Takeover
+
+Character transfer is exposed under `dune db transfer` and in `dune manager` -> `Database Maintenance` -> `Character Transfer / Account Takeover`. It uses Funcom's database functions:
+
+```bash
+dune db transfer OLD_FLS_ID NEW_FLS_ID
+dune db transfer --dry-run OLD_FLS_ID NEW_FLS_ID
+dune db transfer --file runtime/backups/db/transfer-plan.tsv
+dune db transfer pending
+dune db transfer apply-pending
+dune db transfer clear-pending
+```
+
+The new account must log in once before transfer so it exists as a registered empty account in `dune.encrypted_accounts`. The transfer swaps the Funcom/FLS identity; character data stays in place. There is no undo except restoring a database backup, so the command creates a backup by default before applying live transfers. Normal output redacts FLS IDs.
+
+If a player logs in with the same account as before, restore alone should bring the character back. Do not create a new character first. Creating a new character writes new live state into the database and can overwrite the account state you were trying to recover.
+
+Transfer plan files are TSV:
+
+```text
+old_fls_id<TAB>new_fls_id<TAB>optional_note
+```
+
+Blank lines and lines starting with `#` are ignored. Restore and import can apply transfer plans after the database is imported:
+
+```bash
+dune db restore runtime/backups/db/example.backup --transfer OLD=NEW
+dune db import runtime/backups/db/example.backup --transfer-file runtime/backups/db/transfer-plan.tsv
+```
+
+If the old account exists after restore but the new account has not logged in yet, the pair is saved to `runtime/generated/pending-character-transfers.tsv`. Restart the stack, have the new account log in once, then run `dune db transfer apply-pending`.
 
 ## Battlegroup And Sietch Settings
 
@@ -269,6 +307,65 @@ User settings are generated from `runtime/generated/usersettings.json` into each
 For `Survival_1`, display name and password changes are applied by republishing the browser-facing sietch state without respawning the selected dimension. `Overmap` is protected and only supports memory changes. Dedicated scaling maps have active dimensions managed by the autoscaler at runtime.
 
 If a map setting fails validation or cannot be saved, the manager does not ask to restart that map.
+
+## Dynamic Maps
+
+The Docker autoscaler keeps `Survival_1` and `Overmap` protected and always on. Other maps are dynamic by default and can be configured with:
+
+```bash
+dune maps list
+dune maps mode
+dune maps mode DeepDesert_1
+dune maps set SH_Arrakeen always-on
+dune maps set SH_Arrakeen dynamic
+dune maps reconcile
+```
+
+The same controls are in `dune manager` -> `Battlegroup Settings` -> `Dynamic Maps And Autoscaler` -> `Configure Maps`. `Survival_1` and `Overmap` never appear in that picker.
+
+Always On settings are stored in `runtime/generated/map-runtime-modes.json` and survive manager or stack restarts. When a map is changed to Always On, the stack spawns/reconciles non-blocked partitions for that map and the autoscaler will not idle-despawn it. When a map is changed back to Dynamic, the container is not killed immediately; it is eligible for normal idle despawn after the 300 second grace period, configurable with `DUNE_AUTOSCALER_DESPAWN_GRACE_SECONDS`.
+
+Manual `dune despawn` still refuses `Survival_1` and `Overmap`. For other Always On maps, manual despawn is blocked unless `--force` is used because the autoscaler will otherwise respawn them.
+
+### Dual Deep Desert PvP/PvE
+
+Dual Deep Desert is Docker-native and does not use Kubernetes/k3s CRDs:
+
+```bash
+dune deepdesert dual status
+dune deepdesert dual enable
+dune deepdesert dual disable
+dune deepdesert dual bootstrap
+dune deepdesert dual repair
+```
+
+`enable` detects the existing `DeepDesert_1` dimension 0 partition, creates dimension 1 when missing, raises `DeepDesert_1` to two configured dimensions, writes the Director override for one extra Deep Desert server slot, applies `UserGame.ini` PvP routing so only dimension 0's detected partition ID is listed in `m_PvpEnabledPartitions`, restarts `dune-director` automatically when it is running, and recycles idle Deep Desert servers so they re-register cleanly. It does not hard-code partition 8 or 34.
+
+Dimension 0 remains PvP and dimension 1 is PvE. Actual PvP behavior is controlled by the server-side `m_PvpEnabledPartitions` setting. The reference implementation documents that the SELECT INSTANCE Kanly/PvP badge is hardcoded by Funcom's backend for self-hosted servers and cannot be corrected from server config alone. The selector can also continue to show generic instance names instead of custom `ServerDisplayName` values.
+
+The map remains dynamically scaled unless you separately set `DeepDesert_1` to Always On. `bootstrap` removes the dimension 0 Deep Desert container once as a routing workaround for players previously stuck on dimension 0. After bootstrap, players should wait about 3 minutes when switching between Deep Desert instances because Director grace routing can send them back to the previous instance.
+
+## Admin Tools
+
+Admin item grants are available in `dune manager` -> `Admin Tools`. Admin kick commands remain available under `dune admin`.
+
+```bash
+dune admin players
+dune admin players --online
+dune admin kick PLAYER_FLS_ID
+dune admin kick PLAYER_FLS_ID --dry-run
+dune admin kick --all-online
+```
+
+Kick uses the upstream-compatible server admin command shape:
+
+```json
+{"ServerCommand":"KickPlayer","PlayerId":"<target>"}
+```
+
+`PlayerId` is a specific FLS ID, or `*` only for the explicit `--all-online` path. Commands are published through the Docker RabbitMQ game container using the same local admin envelope already used for item grants. The command output redacts FLS IDs by default and does not print Funcom tokens, RabbitMQ secrets, or command auth tokens.
+
+Published means the command was queued to RabbitMQ; it does not prove the player disconnected. If online-player state is unavailable, `dune admin players --online` fails with a helpful message. If publishing is unavailable, check that `dune-rmq-game` is running and that local command-auth/token files exist. Audit history is written to `runtime/generated/admin-command-history.tsv` with redacted targets and no secrets.
 
 ## Runtime Files
 
