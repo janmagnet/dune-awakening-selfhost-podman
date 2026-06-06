@@ -1,5 +1,11 @@
 # Dune Awakening Self-Host Docker
 
+> [!IMPORTANT]
+> A major update for this repository is currently in progress.
+>
+> It has not been released yet. To follow development progress and stay up to date, join the Discord:  
+> [Dune: Awakening Docker](https://discord.gg/9pQqytu6BU)
+
 <p align="center">
   <img src="assets/cover.png" alt="Dune Awakening Self-Host Docker cover" />
 </p>
