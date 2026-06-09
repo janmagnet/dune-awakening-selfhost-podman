@@ -1,6 +1,7 @@
-Dune Awakening Self-Host Docker
+Dune Awakening Self-Host Podman
 
 Original project by RedBlink.
+Podman adaptions by janmagnet.
 
 This is an unofficial community project. It is not affiliated with,
 endorsed by, sponsored by, or supported by Funcom.
@@ -12,7 +13,7 @@ This project does not grant any rights to Funcom, Legendary, or DUNE
 intellectual property. Users are responsible for following Funcom's
 applicable terms, EULA, rules, and self-hosting requirements.
 
-Do not redistribute Funcom game files, Docker image tarballs, tokens,
+Do not redistribute Funcom game files, container image tarballs, tokens,
 secrets, or proprietary assets with this project.
 
 Please keep the LICENSE and NOTICE files intact when redistributing or

@@ -151,7 +151,7 @@ runtime_catalogs_available() {
 }
 
 battlegroup_services_running() {
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^(dune-rmq-admin|dune-rmq-game|dune-text-router|dune-director|dune-server-gateway|dune-server-survival-1|dune-server-overmap)$'
+  engine ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^(dune-rmq-admin|dune-rmq-game|dune-text-router|dune-director|dune-server-gateway|dune-server-survival-1|dune-server-overmap)$'
 }
 
 show_runtime_files_status() {
@@ -822,12 +822,12 @@ show_world_partition_count() {
   echo
   echo "=== World Partition Count ==="
 
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
     echo "dune-postgres is not running."
     return
   fi
 
-  docker exec dune-postgres psql -U dune -d dune -c "select count(*) as world_partition_rows from world_partition;"
+  engine exec dune-postgres psql -U dune -d dune -c "select count(*) as world_partition_rows from world_partition;"
 }
 
 show_current_memory_usage() {
@@ -842,7 +842,7 @@ show_current_memory_usage() {
   local label
   local dim
 
-  mapfile -t containers < <(docker ps --format '{{.Names}}' 2>/dev/null | grep '^dune-server-' || true)
+  mapfile -t containers < <(engine ps --format '{{.Names}}' 2>/dev/null | grep '^dune-server-' || true)
 
   echo
   echo "=== Current Memory Usage ==="
@@ -855,7 +855,7 @@ show_current_memory_usage() {
   printf "%-24s %-12s %-12s %s\n" "MAP" "PARTITION" "MEMORY" "CONTAINER"
 
   for container in "${containers[@]}"; do
-    stats_line="$(docker stats --no-stream --format '{{.Name}}\t{{.MemUsage}}' "$container" 2>/dev/null | head -n1 || true)"
+    stats_line="$(engine stats --no-stream --format '{{.Name}}\t{{.MemUsage}}' "$container" 2>/dev/null | head -n1 || true)"
     [ -n "$stats_line" ] || continue
 
     name="${stats_line%%$'\t'*}"
@@ -875,8 +875,8 @@ show_current_memory_usage() {
       *)
         if [[ "$name" =~ -([0-9]+)$ ]]; then
           partition_id="${BASH_REMATCH[1]}"
-          if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
-            db_row="$(docker exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "select map,coalesce(label,''),coalesce(dimension_index::text,'') from dune.world_partition where partition_id = ${partition_id} limit 1;" 2>/dev/null || true)"
+          if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+            db_row="$(engine exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "select map,coalesce(label,''),coalesce(dimension_index::text,'') from dune.world_partition where partition_id = ${partition_id} limit 1;" 2>/dev/null || true)"
             if [ -n "$db_row" ]; then
               IFS=$'\t' read -r map label dim <<< "$db_row"
               if [ -n "$label" ]; then
@@ -916,7 +916,7 @@ follow_dune_logs() {
 }
 
 show_header() {
-  echo "Dune Awakening Self-Host Docker Manager"
+  echo "Dune Awakening Self-Host Podman Manager"
   echo "======================================="
   echo
   echo "Choose a category. Direct CLI commands like 'dune ready' still work normally."
@@ -1819,7 +1819,7 @@ restart_partition_if_requested() {
       ;;
   esac
 
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$container" || return
+  engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$container" || return
 
   echo
   echo "The relevant map must restart for this change to apply."
@@ -2496,7 +2496,7 @@ PY
 }
 
 admin_online_player_rows() {
-  docker exec dune-postgres psql -U dune -d dune -At -F $'\t' -c "
+  engine exec dune-postgres psql -U dune -d dune -At -F $'\t' -c "
     select
       coalesce(nullif(a.\"user\", ''), nullif(a.funcom_id, '')) as fls_id,
       ps.account_id,
@@ -2522,7 +2522,7 @@ admin_online_player_rows() {
 }
 
 admin_known_player_rows() {
-  docker exec dune-postgres psql -U dune -d dune -At -F $'\t' -c "
+  engine exec dune-postgres psql -U dune -d dune -At -F $'\t' -c "
     select
       coalesce(nullif(a.\"user\", ''), nullif(a.funcom_id, '')) as fls_id,
       ps.account_id,
@@ -2548,7 +2548,7 @@ admin_choose_player() {
 
   ADMIN_SELECTION_CANCELLED=0
 
-  if ! docker inspect -f '{{.State.Running}}' dune-postgres 2>/dev/null | grep -qx 'true'; then
+  if ! engine inspect -f '{{.State.Running}}' dune-postgres 2>/dev/null | grep -qx 'true'; then
     error_msg "Postgres container is not running, so online players cannot be listed."
     prompt_text "Enter Player FLS ID manually, * for all online players, or 0 to go back:" manual_id || return 1
     manual_id="$(sanitize_numeric_prompt_value "$manual_id")"
@@ -3040,7 +3040,7 @@ admin_kick_player_flow() {
   ADMIN_SELECTED_PLAYER_LABEL=""
 
   ADMIN_SELECTION_CANCELLED=0
-  if ! docker inspect -f '{{.State.Running}}' dune-postgres 2>/dev/null | grep -qx 'true'; then
+  if ! engine inspect -f '{{.State.Running}}' dune-postgres 2>/dev/null | grep -qx 'true'; then
     error_msg "Postgres container is not running, so online players cannot be listed."
     echo "Kick normally requires an online player. Start the stack or use the CLI with a known FLS id."
     return 1
@@ -3125,7 +3125,7 @@ main_menu() {
   local choice
   while true; do
     set +e
-    select_menu "Dune Awakening Self-Host Docker Manager" \
+    select_menu "Dune Awakening Self-Host Podman Manager" \
       "Battlegroup Overview" \
       "Battlegroup Settings" \
       "Sietches" \
@@ -3928,7 +3928,7 @@ advanced_menu() {
     choice="$MENU_CHOICE"
 
     case "$choice" in
-      1) run_cmd docker compose exec orchestrator bash; pause ;;
+      1) run_cmd engine exec -it dune-orchestrator bash; pause ;;
       2) run_cmd "$DUNE" doctor; pause ;;
       3) run_cmd runtime/scripts/db-manager.sh; pause ;;
       4) return ;;

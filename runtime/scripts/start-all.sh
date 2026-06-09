@@ -14,6 +14,16 @@ if [ -f .env ]; then
 fi
 set +a
 
+require_quadlet_privileges || exit 1
+
+echo "=== Installing/refreshing Quadlet units ==="
+runtime/scripts/render-quadlet.sh
+
+# Make sure directly-run containers that carry a restart policy (the dynamic game
+# servers the autoscaler spawns) come back after a host reboot.
+dune_systemctl enable podman-restart.service >/dev/null 2>&1 || true
+
+echo
 echo "=== Starting Postgres ==="
 runtime/scripts/start-postgres.sh
 
@@ -115,7 +125,7 @@ echo "=== Scheduling Deferred Dimension Reconcile ==="
 
 echo
 echo "=== Final quick status ==="
-docker ps --filter "name=dune-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+engine ps --filter "name=dune-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
 echo
 echo "=== Required TCP listeners ==="

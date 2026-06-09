@@ -3,13 +3,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-if ! docker ps --format '{{.Names}}' | grep -qx dune-postgres; then
+source runtime/scripts/engine.sh
+
+if ! engine ps --format '{{.Names}}' | grep -qx dune-postgres; then
   echo "dune-postgres is not running."
   exit 1
 fi
 
 echo "=== Dune server partitions ==="
-docker exec dune-postgres psql -U postgres -d dune -P pager=off -c "
+engine exec dune-postgres psql -U postgres -d dune -P pager=off -c "
 select
   wp.partition_id,
   wp.map,
@@ -30,7 +32,7 @@ order by wp.partition_id;
 
 echo
 echo "=== Map summary ==="
-docker exec dune-postgres psql -U postgres -d dune -P pager=off -c "
+engine exec dune-postgres psql -U postgres -d dune -P pager=off -c "
 select
   wp.map,
   count(*) as partitions,

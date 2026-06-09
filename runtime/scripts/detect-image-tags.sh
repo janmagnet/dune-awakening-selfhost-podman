@@ -3,11 +3,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 mkdir -p runtime/generated
 
 get_latest_tag() {
   local repo="$1"
-  docker images --format '{{.Repository}} {{.Tag}}' \
+  engine images --format '{{.Repository}} {{.Tag}}' \
     | awk -v repo="$repo" '$1 == repo && $2 != "<none>" { print $2 }' \
     | sort -rV \
     | head -n1

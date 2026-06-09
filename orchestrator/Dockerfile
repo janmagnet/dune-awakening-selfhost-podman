@@ -2,6 +2,11 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Talk to the host's rootful Podman API socket (bind-mounted at runtime). With
+# CONTAINER_HOST set, the in-container podman binary acts as a remote client, so
+# `podman load` / `podman ps` operate on the host engine that runs the stack.
+ENV CONTAINER_HOST=unix:///run/podman/podman.sock
+
 RUN dpkg --add-architecture i386 \
  && apt-get update -y \
  && apt-get install -y \
@@ -18,7 +23,7 @@ RUN dpkg --add-architecture i386 \
     util-linux \
     lib32gcc-s1 \
     lib32stdc++6 \
-    docker.io \
+    podman \
  && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash dune \

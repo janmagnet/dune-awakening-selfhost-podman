@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -34,7 +36,7 @@ value_is_known() {
 
 is_running() {
   local name="$1"
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+  engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
 }
 
 container_env_value() {
@@ -45,7 +47,7 @@ container_env_value() {
     return 1
   fi
 
-  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+  engine inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
     | awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); exit }'
 }
 

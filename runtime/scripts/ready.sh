@@ -10,7 +10,7 @@ wait=0
 
 is_running() {
   local name="$1"
-  docker ps --format '{{.Names}}' | grep -qx "$name"
+  engine ps --format '{{.Names}}' | grep -qx "$name"
 }
 
 mark_ok() {
@@ -69,7 +69,7 @@ check_udp() {
 
 container_logs() {
   local container="$1"
-  docker logs "$container" 2>&1 || true
+  engine logs "$container" 2>&1 || true
 }
 
 container_partition_id() {
@@ -83,7 +83,7 @@ partition_map_and_server() {
   local partition_id="$1"
 
   [ -n "$partition_id" ] || return 1
-  docker exec dune-postgres psql -U dune -d dune -Atc "
+  engine exec dune-postgres psql -U dune -d dune -Atc "
     select map || '|' || coalesce(server_id, '')
     from dune.world_partition
     where partition_id = $partition_id
@@ -99,7 +99,7 @@ server_effective_players() {
     return 0
   }
 
-  docker exec dune-postgres psql -U dune -d dune -Atc "
+  engine exec dune-postgres psql -U dune -d dune -Atc "
     select count(*)
     from dune.player_state
     where server_id = '${server_id//\'/\'\'}'
@@ -129,7 +129,7 @@ partition_effective_players() {
     return 0
   }
 
-  docker exec dune-postgres psql -U dune -d dune -Atc "
+  engine exec dune-postgres psql -U dune -d dune -Atc "
     select count(*)
     from dune.player_state ps
     left join dune.farm_state fs on fs.server_id = ps.server_id
@@ -164,7 +164,7 @@ map_has_recent_travel_demand() {
   [ -n "$map_name" ] || return 1
   is_running dune-director || return 1
 
-  docker logs --since 5m dune-director 2>&1 \
+  engine logs --since 5m dune-director 2>&1 \
     | grep -Fq "Processing travel queue for ClassicalInstancing group ${map_name} "
 }
 
@@ -239,7 +239,7 @@ check_game_server_ready() {
 
   if [ -n "$partition_id" ] && is_running dune-postgres; then
     farm_ready="$(
-      docker exec dune-postgres psql -U dune -d dune -Atc "
+      engine exec dune-postgres psql -U dune -d dune -Atc "
         select coalesce(fs.ready::text, 'f')
         from dune.world_partition wp
         left join dune.farm_state fs on fs.server_id = wp.server_id
@@ -265,7 +265,7 @@ game_server_rmq_connections_ready() {
   local attempt
 
   for attempt in 1 2 3 4 5; do
-    if docker exec dune-rmq-game rabbitmqctl list_connections user state 2>/dev/null \
+    if engine exec dune-rmq-game rabbitmqctl list_connections user state 2>/dev/null \
       | awk '$1 ~ /^sg[.]/ && $2 == "running" { found=1 } END { exit(found ? 0 : 1) }'; then
       return 0
     fi
@@ -285,7 +285,7 @@ director_fls_ready() {
     return 1
   fi
 
-  logs="$(docker logs --tail 3000 dune-director 2>&1 || true)"
+  logs="$(engine logs --tail 3000 dune-director 2>&1 || true)"
 
   if grep -q 'Battlegroups_SendBattlegroupHeartbeat.*Request successful' <<< "$logs"; then
     return 0
@@ -307,8 +307,8 @@ partition_mismatch_hint_needed() {
 
   logs="$(
     {
-      docker logs --since 10m dune-server-survival-1 2>&1 || true
-      docker logs --since 10m dune-server-overmap 2>&1 || true
+      engine logs --since 10m dune-server-survival-1 2>&1 || true
+      engine logs --since 10m dune-server-overmap 2>&1 || true
     }
   )"
 
@@ -348,7 +348,7 @@ check_udp "$((igw_port_base + 1))" "Overmap S2S" "dune-server-overmap"
 echo
 echo "=== Database world partition checks ==="
 if is_running dune-postgres; then
-  partition_count="$(docker exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" 2>/dev/null | tr -d '[:space:]' || true)"
+  partition_count="$(engine exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" 2>/dev/null | tr -d '[:space:]' || true)"
   partition_count="${partition_count:-0}"
 
   if [ "$partition_count" -gt 0 ]; then
@@ -357,7 +357,7 @@ if is_running dune-postgres; then
     mark_fail "world_partition rows: 0"
     echo "     Fresh init needs canonical world partitions. Run:"
     echo "       runtime/scripts/generate-world-partitions-sql.sh"
-    echo "       docker exec -i dune-postgres psql -U dune -d dune < runtime/generated/reset-world-partitions.sql"
+    echo "       podman exec -i dune-postgres psql -U dune -d dune < runtime/generated/reset-world-partitions.sql"
   fi
 else
   mark_fail "world_partition check"
@@ -413,7 +413,7 @@ while IFS= read -r c; do
 
   farm_ready="f"
   if [ -n "$server_id" ]; then
-    farm_ready="$(docker exec dune-postgres psql -U dune -d dune -Atc "
+    farm_ready="$(engine exec dune-postgres psql -U dune -d dune -Atc "
       select coalesce(ready::text, 'f')
       from dune.farm_state
       where server_id = '${server_id//\'/\'\'}'
@@ -429,7 +429,7 @@ while IFS= read -r c; do
 
   connected_players="0"
   if [ -n "$server_id" ]; then
-    connected_players="$(docker exec dune-postgres psql -U dune -d dune -Atc "
+    connected_players="$(engine exec dune-postgres psql -U dune -d dune -Atc "
       select coalesce(connected_players::text, '0')
       from dune.farm_state
       where server_id = '${server_id//\'/\'\'}'
@@ -447,7 +447,7 @@ while IFS= read -r c; do
   fi
 
   check_game_server_ready "$c" "$c"
-done < <(docker ps --format '{{.Names}}' | grep '^dune-server-' || true)
+done < <(engine ps --format '{{.Names}}' | grep '^dune-server-' || true)
 
 if [ "$dynamic_found" -eq 0 ]; then
   echo "OK   no dynamic game maps currently running"
@@ -466,7 +466,7 @@ fi
 
 echo
 if [ "$fail" -eq 0 ] && [ "$wait" -eq 0 ]; then
-  echo "READY: Dune Awakening Self-Host Docker stack looks healthy."
+  echo "READY: Dune Awakening Self-Host Podman stack looks healthy."
   echo
   echo "Note: after local READY, the in-game server browser may still take a few minutes"
   echo "to show population and sietch availability while Funcom/FLS and the client refresh."

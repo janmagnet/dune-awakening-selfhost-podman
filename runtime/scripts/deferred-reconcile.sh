@@ -3,18 +3,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 timeout_seconds="${DUNE_DEFERRED_RECONCILE_TIMEOUT_SECONDS:-900}"
 poll_seconds="${DUNE_DEFERRED_RECONCILE_POLL_SECONDS:-5}"
 deadline=$(( $(date +%s) + timeout_seconds ))
 
 is_running() {
   local name="$1"
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+  engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
 }
 
 partition_ready() {
   local partition_id="$1"
-  docker exec dune-postgres psql -U dune -d dune -Atc "
+  engine exec dune-postgres psql -U dune -d dune -Atc "
     select coalesce(fs.ready::text, 'f')
     from dune.world_partition wp
     left join dune.farm_state fs on fs.server_id = wp.server_id

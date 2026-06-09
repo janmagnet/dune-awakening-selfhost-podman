@@ -1,0 +1,6 @@
+# PostgreSQL data directory for the Dune database.
+[Unit]
+Description=Dune Awakening Postgres data volume
+
+[Volume]
+VolumeName=dune-postgres-data

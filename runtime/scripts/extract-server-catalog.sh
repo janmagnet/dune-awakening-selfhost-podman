@@ -13,7 +13,7 @@ SERVER_REGION="$(resolve_server_region)"
 SERVER_IP="$(resolve_server_ip)"
 export SERVER_REGION SERVER_IP
 
-docker compose exec -T orchestrator python3 - <<'PY'
+engine exec -i dune-orchestrator python3 - <<'PY'
 from pathlib import Path
 import json
 import re
@@ -63,7 +63,7 @@ for item in catalog:
     print(f"{item['index']:02d} name={item['name']} map={item['map']}")
 PY
 
-docker compose exec -T orchestrator cat /work/server-catalog.json > runtime/generated/server-catalog.json
+engine exec dune-orchestrator cat /work/server-catalog.json > runtime/generated/server-catalog.json
 
 echo
 echo "Wrote runtime/generated/server-catalog.json"

@@ -1,0 +1,9 @@
+# Quadlet network unit for the Dune Awakening self-host stack.
+# Installed into the Podman Quadlet directory by runtime/scripts/render-quadlet.sh.
+# Infrastructure services (postgres, rabbitmq, director, text-router, gateway)
+# attach to this bridge. Game servers and the autoscaler use host networking.
+[Unit]
+Description=Dune Awakening internal bridge network
+
+[Network]
+NetworkName=dune-net

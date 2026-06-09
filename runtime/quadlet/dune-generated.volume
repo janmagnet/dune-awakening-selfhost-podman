@@ -1,0 +1,6 @@
+# Generated runtime data shared between the orchestrator and the host scripts.
+[Unit]
+Description=Dune Awakening generated-data volume
+
+[Volume]
+VolumeName=dune-generated

@@ -26,21 +26,21 @@ fail_msg() {
 
 container_running() {
   local name="$1"
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+  engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
 }
 
 container_arg_has() {
   local container="$1"
   local pattern="$2"
 
-  docker inspect "$container" --format '{{range .Args}}{{println .}}{{end}}' 2>/dev/null | grep -Fxq -- "$pattern"
+  engine inspect "$container" --format '{{range .Args}}{{println .}}{{end}}' 2>/dev/null | grep -Fxq -- "$pattern"
 }
 
 container_arg_value() {
   local container="$1"
   local prefix="$2"
 
-  docker inspect "$container" --format '{{range .Args}}{{println .}}{{end}}' 2>/dev/null \
+  engine inspect "$container" --format '{{range .Args}}{{println .}}{{end}}' 2>/dev/null \
     | awk -v prefix="$prefix" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }'
 }
 
@@ -72,7 +72,7 @@ ini_value() {
 }
 
 docker_available() {
-  docker ps >/dev/null 2>&1
+  engine ps >/dev/null 2>&1
 }
 
 print_row() {
@@ -225,13 +225,13 @@ if docker_available; then
     fail_msg "dune-server-gateway is not running"
   fi
 else
-  warn_msg "Docker is not reachable; skipped container argument checks."
+  warn_msg "Podman is not reachable; skipped container argument checks."
 fi
 
 echo
 echo "=== Database advertised server endpoints ==="
 if container_running dune-postgres; then
-  rows="$(docker exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "
+  rows="$(engine exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "
     select map, coalesce(host(game_addr), ''), game_port, coalesce(host(igw_addr), ''), igw_port, ready, alive
     from dune.farm_state
     where map in ('Overmap', 'Survival_1')

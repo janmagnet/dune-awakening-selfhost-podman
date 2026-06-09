@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Container engine + platform abstraction (engine(), DUNE_* vars, dune_systemctl()).
+source runtime/scripts/engine.sh
+
 value_is_known() {
   local value="${1:-}"
   [ -n "$value" ] && [ "$value" != "unknown" ]
@@ -33,7 +36,7 @@ config_value() {
 
 container_exists_any_state() {
   local name="$1"
-  docker inspect "$name" >/dev/null 2>&1
+  engine inspect "$name" >/dev/null 2>&1
 }
 
 container_env_value_any_state() {
@@ -44,7 +47,7 @@ container_env_value_any_state() {
     return 1
   fi
 
-  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+  engine inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
     | awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); exit }'
 }
 
@@ -59,7 +62,7 @@ any_container_env_value_matching() {
       printf '%s' "$value"
       return 0
     fi
-  done < <(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "$pattern" || true)
+  done < <(engine ps -a --format '{{.Names}}' 2>/dev/null | grep -E "$pattern" || true)
 
   return 1
 }

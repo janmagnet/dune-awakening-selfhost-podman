@@ -66,13 +66,13 @@ PORT_LOCK_FILE="runtime/generated/spawn-port-reservations.lock"
 SPAWN_SUCCESS=0
 PORTS_RESERVED=0
 
-if ! docker ps --format '{{.Names}}' | grep -qx dune-postgres; then
+if ! engine ps --format '{{.Names}}' | grep -qx dune-postgres; then
   echo "dune-postgres is not running."
   exit 1
 fi
 
 psql_value() {
-  docker exec dune-postgres psql -U postgres -d dune -Atc "$1"
+  engine exec dune-postgres psql -U postgres -d dune -Atc "$1"
 }
 
 container_name_for_map_partition() {
@@ -89,7 +89,7 @@ rebuild_port_reservation_file() {
   local rows partition_id map game_port igw_port container_name
 
   : >"$output_path"
-  rows="$(docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+  rows="$(engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
     select
       wp.partition_id,
       wp.map,
@@ -169,7 +169,7 @@ cleanup_port_reservations() {
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     container_name="$(printf '%s' "$line" | cut -f1)"
-    if docker ps -a --format '{{.Names}}' | grep -qx "$container_name"; then
+    if engine ps -a --format '{{.Names}}' | grep -qx "$container_name"; then
       printf '%s\n' "$line" >>"$tmp"
     fi
   done <"$PORT_RESERVATION_FILE"
@@ -212,7 +212,7 @@ purge_stale_farm_rows_for_map() {
   local safe_map
   safe_map="${map//\'/\'\'}"
 
-  docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+  engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 begin;
 delete from dune.farm_state fs
 where fs.map = '$safe_map'
@@ -245,7 +245,7 @@ clear_dead_partition_assignment() {
     return 1
   fi
 
-  docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+  engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 begin;
 update dune.world_partition
 set server_id = null
@@ -286,7 +286,7 @@ bind_partition_to_live_server() {
     " | tr -d '\r[:space:]')"
 
     if [ -n "$live_server_id" ]; then
-      docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+      engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 begin;
 update dune.world_partition
 set server_id = '$live_server_id'
@@ -559,9 +559,9 @@ EOF
 : > "$FAKE_K8S_SERVICEACCOUNT_DIR/ca.crt"
 chmod -R 755 "$FAKE_K8S_SERVICEACCOUNT_DIR"
 
-docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+engine rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-docker run -d \
+engine run -d \
   --name "$CONTAINER_NAME" \
   --network host \
   --restart unless-stopped \
@@ -645,11 +645,11 @@ docker run -d \
 
 sleep 5
 
-docker ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+engine ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
 echo
 echo "Watch logs with:"
-echo "  docker logs -f $CONTAINER_NAME"
+echo "  podman logs -f $CONTAINER_NAME"
 
 if live_server_id="$(bind_partition_to_live_server "$PARTITION_ID" "$MAP_NAME" "$GAME_PORT" "$IGW_PORT" 15 2)"; then
   echo "Bound partition $PARTITION_ID to warming server_id: $live_server_id"

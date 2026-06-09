@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source runtime/scripts/engine.sh
+
 get_latest_local_tag() {
   local repo="$1"
-  docker images --format '{{.Repository}} {{.Tag}}' 2>/dev/null \
+  engine images --format '{{.Repository}} {{.Tag}}' 2>/dev/null \
     | awk -v repo="$repo" '$1 == repo && $2 != "<none>" { print $2 }' \
     | sort -rV \
     | head -n1

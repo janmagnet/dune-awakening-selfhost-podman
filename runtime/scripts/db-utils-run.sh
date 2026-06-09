@@ -6,7 +6,7 @@ cd "$(dirname "$0")/../.."
 source runtime/scripts/image-tags.sh
 DB_UTILS_IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-db-utils:$(resolve_world_image_tag)"
 
-docker run --rm \
+engine run --rm \
   --network dune-net \
   --entrypoint sh \
   "$DB_UTILS_IMAGE" \

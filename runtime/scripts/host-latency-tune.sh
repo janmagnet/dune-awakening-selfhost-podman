@@ -15,7 +15,7 @@ HELPER_IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server:${WORLD_IMA
 
 run_helper() {
   local script="$1"
-  docker run --rm \
+  engine run --rm \
     --privileged \
     --network host \
     --pid host \

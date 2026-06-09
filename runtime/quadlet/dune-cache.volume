@@ -1,0 +1,6 @@
+# Application-level cache for the orchestrator.
+[Unit]
+Description=Dune Awakening cache volume
+
+[Volume]
+VolumeName=dune-cache

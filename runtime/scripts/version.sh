@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 config_value() {
   local file="$1"
   local key="$2"
@@ -27,7 +29,7 @@ value_is_known() {
 
 is_running() {
   local name="$1"
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+  engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
 }
 
 container_env_value() {
@@ -38,7 +40,7 @@ container_env_value() {
     return 1
   fi
 
-  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+  engine inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
     | awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); exit }'
 }
 
@@ -57,8 +59,8 @@ steam_build_id() {
   local app_id="$1"
   local manifest="/tmp/dune-appmanifest-${app_id}.acf"
 
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-orchestrator; then
-    docker compose exec -T orchestrator sh -lc "cat /srv/dune/server/steamapps/appmanifest_${app_id}.acf 2>/dev/null" > "$manifest" 2>/dev/null || true
+  if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-orchestrator; then
+    engine exec dune-orchestrator sh -lc "cat /srv/dune/server/steamapps/appmanifest_${app_id}.acf 2>/dev/null" > "$manifest" 2>/dev/null || true
     if [ -s "$manifest" ]; then
       awk '/"buildid"/ { gsub(/"/, "", $2); print $2; exit }' "$manifest"
       rm -f "$manifest"
@@ -147,16 +149,16 @@ if [ -f runtime/generated/image-tags.env ]; then
   sed -n '1,80p' runtime/generated/image-tags.env
 else
   if is_running dune-director; then
-    printf "%-24s %s\n" "Director image:" "$(docker inspect --format '{{.Config.Image}}' dune-director 2>/dev/null || echo unknown)"
+    printf "%-24s %s\n" "Director image:" "$(engine inspect --format '{{.Config.Image}}' dune-director 2>/dev/null || echo unknown)"
   fi
   if is_running dune-server-gateway; then
-    printf "%-24s %s\n" "Gateway image:" "$(docker inspect --format '{{.Config.Image}}' dune-server-gateway 2>/dev/null || echo unknown)"
+    printf "%-24s %s\n" "Gateway image:" "$(engine inspect --format '{{.Config.Image}}' dune-server-gateway 2>/dev/null || echo unknown)"
   fi
   if is_running dune-server-overmap; then
-    printf "%-24s %s\n" "Overmap image:" "$(docker inspect --format '{{.Config.Image}}' dune-server-overmap 2>/dev/null || echo unknown)"
+    printf "%-24s %s\n" "Overmap image:" "$(engine inspect --format '{{.Config.Image}}' dune-server-overmap 2>/dev/null || echo unknown)"
   fi
   if is_running dune-server-survival-1; then
-    printf "%-24s %s\n" "Survival_1 image:" "$(docker inspect --format '{{.Config.Image}}' dune-server-survival-1 2>/dev/null || echo unknown)"
+    printf "%-24s %s\n" "Survival_1 image:" "$(engine inspect --format '{{.Config.Image}}' dune-server-survival-1 2>/dev/null || echo unknown)"
   fi
   if ! is_running dune-director && ! is_running dune-server-gateway && ! is_running dune-server-overmap && ! is_running dune-server-survival-1; then
     echo "runtime/generated/image-tags.env not found"

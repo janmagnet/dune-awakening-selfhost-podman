@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 ITEMS_FILE="runtime/data/admin-items.json"
 VEHICLES_FILE="runtime/data/admin-vehicles.json"
 SKILL_MODULES_FILE="runtime/data/admin-skill-modules.json"
@@ -149,7 +151,7 @@ command_auth_token() {
 }
 
 require_rmq_game_running() {
-  if ! docker exec "$RMQ_CONTAINER" rabbitmqctl status >/dev/null 2>&1; then
+  if ! engine exec "$RMQ_CONTAINER" rabbitmqctl status >/dev/null 2>&1; then
     echo "RabbitMQ game container is not running: $RMQ_CONTAINER" >&2
     echo "Start the battlegroup first; item grants are published live to the running container." >&2
     exit 1
@@ -157,7 +159,7 @@ require_rmq_game_running() {
 }
 
 require_postgres_running() {
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
+  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
     echo "Postgres container is not running: $POSTGRES_CONTAINER" >&2
     exit 1
   fi
@@ -178,7 +180,7 @@ resolve_player_id() {
   fi
 
   resolved="$(
-    docker exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
+    engine exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
       select coalesce(nullif(\"user\", ''), nullif(funcom_id, ''))
       from dune.accounts
       where id = ${player_id}
@@ -199,7 +201,7 @@ account_id_for_player_id() {
   local player_id="$1"
 
   [ "$player_id" != "*" ] || return 0
-  docker exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
+  engine exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
     select id
     from dune.accounts
     where \"user\" = '${player_id//\'/\'\'}'
@@ -213,7 +215,7 @@ player_item_stack_count() {
   local item_id="$2"
 
   [ -n "$account_id" ] || return 0
-  docker exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
+  engine exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
     select coalesce(sum(it.stack_size), 0)
     from dune.items it
     join dune.inventories inv on inv.id = it.inventory_id
@@ -610,7 +612,7 @@ publish_inner_json() {
   eval_code='Outer = base64:decode(<<"'"$outer_b64"'">>), XName = rabbit_misc:r(<<"/">>, exchange, <<"heartbeats">>), X = rabbit_exchange:lookup_or_die(XName), MsgId = list_to_binary("smgmt-'"$label"'-" ++ integer_to_list(erlang:system_time(millisecond))), P = {list_to_atom("P_basic"), <<"Content">>, undefined, [], undefined, undefined, undefined, undefined, undefined, MsgId, undefined, undefined, <<"fls">>, <<"fls_backend">>, undefined}, Content = rabbit_basic:build_content(P, Outer), {ok, Msg} = rabbit_basic:message(XName, <<"notifications">>, Content), Result = rabbit_queue_type:publish_at_most_once(X, Msg), io:format("publish=~p exchange=heartbeats routing=notifications app_id=fls_backend user_id=fls label='"$label"'~n", [Result]).'
 
   set +e
-  output="$(docker exec "$RMQ_CONTAINER" rabbitmqctl eval "$eval_code" 2>&1)"
+  output="$(engine exec "$RMQ_CONTAINER" rabbitmqctl eval "$eval_code" 2>&1)"
   local rc=$?
   set -e
 
@@ -630,7 +632,7 @@ publish_inner_json() {
 player_rows() {
   local online_only="$1"
   require_postgres_running
-  docker exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
+  engine exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
     select
       convert_from(e.encrypted_funcom_id, 'UTF8') as fls_id,
       coalesce(ps.character_name, '') as character_name,
@@ -674,10 +676,10 @@ players_command() {
 
 player_status_for_fls() {
   local fls="$1"
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
+  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
     return 2
   fi
-  docker exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
+  engine exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
     with matched_accounts as (
       select a.id
       from dune.accounts a
@@ -699,10 +701,10 @@ player_status_for_fls() {
 
 player_location_for_fls() {
   local fls="$1"
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
+  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
     return 2
   fi
-  docker exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
+  engine exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
     with matched_accounts as (
       select a.id
       from dune.accounts a
@@ -728,10 +730,10 @@ player_location_for_fls() {
 
 player_position_for_fls() {
   local fls="$1"
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
+  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
     return 2
   fi
-  docker exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
+  engine exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
     with matched_accounts as (
       select a.id
       from dune.accounts a
@@ -1298,7 +1300,7 @@ spawn_vehicle_command() {
 
 unsupported_command() {
   cat <<'EOF'
-Unsupported upstream admin actions in this Docker port:
+Unsupported upstream admin actions in this Podman port:
 
 - Journey / quest / tag progression commands are not exposed. The inspected upstream
   service removed JourneyCompleteJourneyEntry because it publishes successfully but
@@ -1310,7 +1312,7 @@ Unsupported upstream admin actions in this Docker port:
 - Direct specialization-XP-by-track is not exposed. Live testing in the reference manager
   found AwardXP ignores Category and grants generic player XP only.
 
-Implemented tools use the same Docker-native RabbitMQ admin command path as item
+Implemented tools use the same Podman-native RabbitMQ admin command path as item
 grants and write audit history to runtime/generated/admin-command-history.tsv.
 Detailed JSONL audit records are written to runtime/generated/admin-command-audit.jsonl.
 EOF
