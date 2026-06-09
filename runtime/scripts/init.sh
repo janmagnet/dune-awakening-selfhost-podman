@@ -19,9 +19,9 @@ require_podman_prereqs() {
     echo "Podman is required but was not found in PATH."
     echo
     echo "Install Podman (4.4+ for Quadlet) with your OS package manager:"
-    echo "  Fedora / Fedora CoreOS : already included (rpm-ostree install podman if missing)"
     echo "  RHEL / Rocky / Alma    : sudo dnf install -y podman"
     echo "  Debian / Ubuntu        : sudo apt-get update && sudo apt-get install -y podman"
+    echo "  Fedora / Fedora CoreOS : already included (rpm-ostree install podman if missing)"
     echo
     echo "Then run:"
     echo "  sudo dune init"
@@ -30,6 +30,23 @@ require_podman_prereqs() {
 
   if ! command -v systemctl >/dev/null 2>&1; then
     echo "systemd (systemctl) is required to run Podman Quadlet units, but was not found."
+    exit 1
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required on the host but was not found in PATH."
+    echo
+    echo "This project uses python3 for first-time setup, world/sietch state, and"
+    echo "the admin tools. Only the Python standard library is needed (no pip packages)."
+    echo
+    echo "Instructions for a few distributions:"
+    echo "  RHEL / Rocky / Alma : sudo dnf install -y python3"
+    echo "  Debian / Ubuntu     : sudo apt-get update && sudo apt-get install -y python3"
+    echo "  Fedora CoreOS       : sudo rpm-ostree install python3 && sudo systemctl reboot"
+    echo
+    echo
+    echo "Then run:"
+    echo "  sudo dune init"
     exit 1
   fi
 

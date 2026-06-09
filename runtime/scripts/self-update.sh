@@ -33,7 +33,7 @@ detect_github_repo() {
     esac
   fi
 
-  printf '%s\n' "Red-Blink/dune-awakening-selfhost-docker"
+  printf '%s\n' "janmagnet/dune-awakening-selfhost-podman"
 }
 
 GITHUB_REPO="$(detect_github_repo)"

@@ -38,8 +38,9 @@ This project is unofficial. It is not affiliated with, endorsed by, sponsored by
 
 | Requirement | Plain explanation |
 |---|---|
-| Linux server | Ubuntu 24.04.4 LTS is the known target. |
+| Linux server | Fedora CoreOS or any systemd Linux with rootful Podman. Ubuntu 24.04 also works. |
 | Podman 4.4+ with Quadlet | Podman runs the server pieces as rootful systemd units. |
+| python3 on the host | Used by setup, world/sietch state, and admin tools. Standard library only (no pip). |
 | Funcom self-host token | Required to authenticate your self-host server. |
 | CPU with AVX and AVX2 | Required by the game server. |
 | Disk space | 100 GB or more recommended. |
@@ -58,12 +59,12 @@ If map containers fail with `Illegal instruction (core dumped)`, the machine usu
 ### 2. Download And Install The `dune` Command
 
 ```bash
-git clone https://github.com/Red-Blink/dune-awakening-selfhost-docker.git
-cd dune-awakening-selfhost-docker
+git clone https://github.com/janmagnet/dune-awakening-selfhost-podman.git
+cd dune-awakening-selfhost-podman
 sudo runtime/scripts/install-command.sh
 ```
 
-The installer creates `/usr/local/bin/dune`, so you can run `dune manager` from anywhere. If you move the repo later, either reinstall the command or set `DUNE_DOCKER_DIR=/path/to/dune-awakening-selfhost-docker`.
+The installer creates `/usr/local/bin/dune`, so you can run `dune manager` from anywhere. If you move the repo later, either reinstall the command or set `DUNE_PODMAN_DIR=/path/to/dune-awakening-selfhost-podman`.
 
 ### 3. First-Time Setup
 
@@ -670,6 +671,7 @@ Common problems:
 | Problem | What to try |
 |---|---|
 | `podman: command not found` | Install Podman 4.4+ (includes Quadlet). |
+| `python3: command not found` | Install python3 on the host. RHEL / Rocky / Alma: `sudo dnf install -y python3`, Debian / Ubuntu `sudo apt-get install -y python3`, or Fedora / Fedora CoreOS: `sudo rpm-ostree install python3 && sudo systemctl reboot`. |
 | Podman API socket not active | Run `sudo systemctl enable --now podman.socket`. |
 | Missing Funcom token | Run `dune init` or place it in `runtime/secrets/funcom-token.txt`. |
 | SteamCMD `state is 0x6` during init | Usually disk space, Steam anonymous depot availability, stale SteamCMD metadata, or Steam CDN/network failure. Check `sudo podman exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache`, free space, then retry `runtime/scripts/update.sh install`. |
