@@ -192,7 +192,7 @@ Environment="AuthenticationConfiguration__BackendLoginConfiguration__UsernameSec
 Environment="AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
 Environment="AuthenticationConfiguration__BackendLoginConfiguration__ChecksumSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
 PodmanArgs=--env=fls-apikey=${FLS_APIKEY}
-Exec=/opt/dune-local/run-server.sh Survival_1 "-FarmRegion=${SERVER_REGION}" "-ini:engine:[FuncomLiveServices]:ServiceAuthToken=${FUNCOM_TOKEN}" -RMQGameTlsEnabled=true "ServerName=${BATTLEGROUP_ID}" "-MultiHome=${MULTIHOME_IP}" -DatabaseName=dune -DatabaseHost=127.0.0.1:15432 -DatabaseUser=dune -DatabasePassword=dune "-PartitionIndex=${PARTITION_ID}" "-ini:engine:[URL]:Port=${GAME_PORT}" "-ini:engine:[URL]:IGWPort=${IGW_PORT}" -battlegroup-director-url=127.0.0.1:11717 --RMQGameHostname=127.0.0.1 --RMQGamePort=31982 --RMQAdminHostname=127.0.0.1 --RMQAdminPort=32573 ${SIETCH_RUNTIME_ARGS[*]} ${LOG_RUNTIME_ARGS[*]}
+Exec=/opt/dune-local/run-server.sh Survival_1 "-FarmRegion=${SERVER_REGION}" "-ini:engine:[FuncomLiveServices]:ServiceAuthToken=${FUNCOM_TOKEN}" -RMQGameTlsEnabled=true "ServerName=${BATTLEGROUP_ID}" "-MultiHome=${MULTIHOME_IP}" -DatabaseName=dune -DatabaseHost=127.0.0.1:15432 -DatabaseUser=dune -DatabasePassword=dune "-PartitionIndex=${PARTITION_ID}" "-ini:engine:[URL]:Port=${GAME_PORT}" "-ini:engine:[URL]:IGWPort=${IGW_PORT}" -battlegroup-director-url=127.0.0.1:11717 --RMQGameHostname=127.0.0.1 --RMQGamePort=31982 --RMQAdminHostname=127.0.0.1 --RMQAdminPort=32573 $(printf '"%s" ' "${SIETCH_RUNTIME_ARGS[@]}" "${LOG_RUNTIME_ARGS[@]}")
 
 [Service]
 Restart=always
