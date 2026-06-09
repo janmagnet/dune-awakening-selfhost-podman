@@ -19,6 +19,10 @@ REPO_DIR="$(pwd)"
 
 mkdir -p "$DUNE_QUADLET_DIR"
 
+# The orchestrator bind-mounts <repo>/work for catalog extraction output. Podman
+# requires bind-mount source paths to exist before the container starts.
+mkdir -p "${REPO_DIR}/work"
+
 # Install the static, secret-free units (network + volumes) verbatim.
 ensure_quadlet_foundation
 
