@@ -25,7 +25,7 @@ fail_msg() {
 
 is_running() {
   local name="$1"
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+  engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
 }
 
 check_file() {
@@ -83,24 +83,30 @@ echo "=== Dune doctor ==="
 echo
 
 echo "=== Host tools ==="
-if command -v docker >/dev/null 2>&1; then
-  ok "Docker command found"
-  if docker info >/dev/null 2>&1; then
-    ok "Docker daemon reachable"
+if command -v podman >/dev/null 2>&1; then
+  ok "Podman command found"
+  if podman info >/dev/null 2>&1; then
+    ok "Podman reachable"
   else
-    fail_msg "Docker daemon is not reachable"
-    echo "     Start Docker and make sure your user can access /var/run/docker.sock."
+    fail_msg "Podman is not working for this user"
+    echo "     Run 'podman info' and check the rootful Podman setup."
   fi
 else
-  fail_msg "Docker command not found"
-  echo "     Install Docker Engine."
+  fail_msg "Podman command not found"
+  echo "     Install Podman 4.4+ (includes Quadlet)."
 fi
 
-if docker compose version >/dev/null 2>&1; then
-  ok "Docker Compose available"
+if [ "$(id -u)" -eq 0 ]; then
+  ok "Running as root (rootful Podman)"
 else
-  fail_msg "Docker Compose is not available"
-  echo "     Install Docker Compose v2."
+  warn_msg "Not running as root; rootful dune commands need sudo"
+fi
+
+if systemctl is-active --quiet podman.socket; then
+  ok "Podman API socket (podman.socket) active"
+else
+  warn_msg "podman.socket is not active"
+  echo "     Enable it with: sudo systemctl enable --now podman.socket"
 fi
 
 echo
@@ -149,7 +155,7 @@ echo
 echo "=== Steam server files ==="
 app_id="$(config_value .env STEAM_APP_ID || echo "${STEAM_APP_ID:-4754530}")"
 if is_running dune-orchestrator; then
-  if docker compose exec -T orchestrator test -f "/srv/dune/server/steamapps/appmanifest_${app_id}.acf" 2>/dev/null; then
+  if engine exec dune-orchestrator test -f "/srv/dune/server/steamapps/appmanifest_${app_id}.acf" 2>/dev/null; then
     ok "Steam appmanifest found for app $app_id"
   else
     fail_msg "Steam appmanifest not found for app $app_id"
@@ -162,13 +168,13 @@ fi
 echo
 echo "=== Database ==="
 if is_running dune-postgres; then
-  if docker exec dune-postgres pg_isready -U postgres -d dune >/dev/null 2>&1; then
+  if engine exec dune-postgres pg_isready -U postgres -d dune >/dev/null 2>&1; then
     ok "Postgres reachable"
   else
     fail_msg "Postgres is running but not ready"
   fi
 
-  partition_count="$(docker exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" 2>/dev/null | tr -d '[:space:]' || true)"
+  partition_count="$(engine exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" 2>/dev/null | tr -d '[:space:]' || true)"
   if [ "${partition_count:-0}" -gt 0 ] 2>/dev/null; then
     ok "world_partition rows: $partition_count"
   else
@@ -196,13 +202,13 @@ fi
 
 echo
 echo "=== RabbitMQ and service signals ==="
-if is_running dune-rmq-game && docker exec dune-rmq-game rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
+if is_running dune-rmq-game && engine exec dune-rmq-game rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
   ok "RabbitMQ game reachable"
 else
   fail_msg "RabbitMQ game is not reachable"
 fi
 
-director_logs="$(docker logs --since 15m dune-director 2>&1 || true)"
+director_logs="$(engine logs --since 15m dune-director 2>&1 || true)"
 if grep -q 'Battlegroups_SendBattlegroupHeartbeat.*Request successful' <<< "$director_logs"; then
   ok "Director heartbeat to Funcom/FLS"
 else
@@ -210,7 +216,7 @@ else
   echo "     If the stack just started, wait a few minutes and run: dune ready"
 fi
 
-if docker logs --tail 5000 dune-server-gateway 2>&1 | grep -q 'Monitoring for servers going up or down'; then
+if engine logs --tail 5000 dune-server-gateway 2>&1 | grep -q 'Monitoring for servers going up or down'; then
   ok "Gateway DB monitoring"
 else
   warn_msg "Gateway DB monitoring not seen in recent logs"

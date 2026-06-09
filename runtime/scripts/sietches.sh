@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 PARTITION_CATALOG="runtime/generated/partition-catalog.json"
 SERVER_CATALOG="runtime/generated/server-catalog.json"
 CONFIG_FILE="runtime/generated/sietch-config.json"
@@ -57,7 +59,7 @@ sync_sietch_config_from_db() {
   local db_json=""
 
   if docker_postgres_running; then
-    db_rows="$(docker exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "
+    db_rows="$(engine exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "
       select partition_id,
              map,
              dimension_index,
@@ -387,19 +389,19 @@ sanitize_positive_integer_arg() {
 }
 
 docker_postgres_running() {
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres
+  engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres
 }
 
 psql_value() {
-  docker exec dune-postgres psql -U postgres -d dune -Atc "$1"
+  engine exec dune-postgres psql -U postgres -d dune -Atc "$1"
 }
 
 python_common() {
   local db_rows=""
   local db_json=""
 
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
-    db_rows="$(docker exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "
+  if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+    db_rows="$(engine exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "
       select partition_id, map, dimension_index, coalesce(label, ''), blocked, coalesce(server_id, '')
       from dune.world_partition
       order by partition_id;
@@ -806,7 +808,7 @@ import subprocess
 from pathlib import Path
 
 out = subprocess.check_output([
-    "docker", "exec", "dune-postgres", "psql",
+    "podman", "exec", "dune-postgres", "psql",
     "-U", "postgres", "-d", "dune", "-At", "-F", "\t",
     "-c",
     "select partition_id, map, dimension_index, blocked, partition_definition::text "
@@ -843,7 +845,7 @@ normalize_deepdesert_labels() {
     return 0
   fi
 
-  docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+  engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 update dune.world_partition
 set label = case
   when dimension_index = 0 then 'PvP'
@@ -1021,13 +1023,13 @@ PY
 }
 
 refresh_survival_director_state() {
-  if docker ps --format '{{.Names}}' | grep -qx dune-director; then
+  if engine ps --format '{{.Names}}' | grep -qx dune-director; then
     runtime/scripts/start-director.sh >/dev/null 2>&1 || true
   fi
 }
 
 refresh_survival_gateway_state() {
-  if docker ps --format '{{.Names}}' | grep -qx dune-server-gateway; then
+  if engine ps --format '{{.Names}}' | grep -qx dune-server-gateway; then
     runtime/scripts/start-server-gateway.sh >/dev/null 2>&1 || true
   fi
 }
@@ -1040,7 +1042,7 @@ refresh_survival_control_plane_state() {
 }
 
 restart_survival_server_if_running() {
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-survival-1; then
+  if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-survival-1; then
     echo "Restarting Survival_1 so sietch display/password changes are published by the running server..."
     runtime/scripts/start-server-survival-1.sh >/dev/null
   fi
@@ -1070,7 +1072,7 @@ ensure_map_partitions() {
   [ -n "$next_dim" ] || next_dim=0
 
   while [ "$current" -lt "$wanted" ]; do
-    docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+    engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 set search_path = dune, public;
 
 with template as (
@@ -1229,7 +1231,7 @@ PY
         limit 1;
       " | tr -d '[:space:]')"
       if [ -n "$base_server_id" ]; then
-        docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+        engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 update dune.encrypted_player_state
 set
   server_id = '$base_server_id',
@@ -1244,7 +1246,7 @@ where previous_server_partition_id = $remove_partition
       topology_changed=1
     done
 
-    if docker exec dune-postgres psql -U postgres -d dune -Atc "
+    if engine exec dune-postgres psql -U postgres -d dune -Atc "
 with ranked as (
   select
     partition_id,
@@ -1261,7 +1263,7 @@ where ord > $target
       topology_changed=1
     fi
 
-    docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+    engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 set search_path = dune, public;
 
 with ranked as (
@@ -1284,7 +1286,7 @@ select dune.update_partition_labels(true);
       normalize_deepdesert_labels
     fi
   else
-    docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+    engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 with ranked as (
   select
     partition_id,
@@ -1371,7 +1373,7 @@ set_partition_label_if_possible() {
   local label="$2"
 
   docker_postgres_running || return 0
-  docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+  engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 update dune.world_partition
 set label = '${label//\'/\'\'}'
 where partition_id = ${partition_id};

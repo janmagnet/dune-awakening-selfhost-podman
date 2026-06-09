@@ -13,7 +13,7 @@ SERVER_REGION="$(resolve_server_region)"
 SERVER_IP="$(resolve_server_ip)"
 export SERVER_REGION SERVER_IP
 
-docker compose exec -T orchestrator python3 - <<'PY'
+engine exec -i dune-orchestrator python3 - <<'PY'
 from pathlib import Path
 import json
 import re
@@ -65,7 +65,7 @@ for r in rows:
     )
 PY
 
-docker compose exec -T orchestrator cat /work/partition-catalog.json > runtime/generated/partition-catalog.json
+engine exec dune-orchestrator cat /work/partition-catalog.json > runtime/generated/partition-catalog.json
 
 echo
 echo "Wrote runtime/generated/partition-catalog.json"

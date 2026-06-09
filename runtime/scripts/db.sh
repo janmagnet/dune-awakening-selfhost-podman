@@ -2,6 +2,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+
+source runtime/scripts/engine.sh
+
 ROOT_DIR="$(pwd)"
 
 BACKUP_DIR_DEFAULT="runtime/backups/db"
@@ -55,7 +58,7 @@ redact_fls() {
 }
 
 require_postgres() {
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
     echo "dune-postgres is not running."
     exit 1
   fi
@@ -108,7 +111,7 @@ backup_scope_from_name() {
 backup_scope_slug() {
   local rows primary count secondary
 
-  rows="$(docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+  rows="$(engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
     select distinct map
     from dune.world_partition
     where coalesce(server_id, '') <> ''
@@ -140,7 +143,7 @@ backup_scope_slug() {
 }
 
 backup_scope_maps() {
-  docker exec dune-postgres psql -U postgres -d dune -At -F ',' -c "
+  engine exec dune-postgres psql -U postgres -d dune -At -F ',' -c "
     select string_agg(map, ',' order by map)
     from (
       select distinct map
@@ -287,9 +290,9 @@ backup_db() {
   tmp_file="/tmp/$artifact_id-$ts.backup"
 
   echo "Creating database backup..."
-  docker exec dune-postgres pg_dump -U postgres -d dune -Fc -f "$tmp_file"
-  docker cp "dune-postgres:$tmp_file" "$backup_file"
-  docker exec dune-postgres rm -f "$tmp_file" >/dev/null 2>&1 || true
+  engine exec dune-postgres pg_dump -U postgres -d dune -Fc -f "$tmp_file"
+  engine cp "dune-postgres:$tmp_file" "$backup_file"
+  engine exec dune-postgres rm -f "$tmp_file" >/dev/null 2>&1 || true
 
   {
     echo "artifact_id: $artifact_id"
@@ -434,10 +437,10 @@ status_db() {
   require_postgres
 
   echo "=== Database status ==="
-  docker exec dune-postgres psql -U dune -d dune -c "
+  engine exec dune-postgres psql -U dune -d dune -c "
 select current_database() as database, current_user as user;
 "
-  docker exec dune-postgres psql -U dune -d dune -c "
+  engine exec dune-postgres psql -U dune -d dune -c "
 select count(*) as world_partition_rows from world_partition;
 "
 }
@@ -446,7 +449,7 @@ health_db() {
   require_postgres
 
   echo "=== Database health ==="
-  docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -P pager=off -c "
+  engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -P pager=off -c "
 with required_columns as (
   select 'dune'::text as table_schema, 'world_partition'::text as table_name, 'partition_id'::text as column_name
   union all select 'dune', 'world_partition', 'map'
@@ -557,20 +560,20 @@ order by check_name;
 
 stop_db_dependents() {
   echo "Stopping services that depend on the database..."
-  docker ps --format '{{.Names}}' | grep '^dune-server-' | xargs -r docker rm -f || true
-  docker rm -f dune-server-gateway dune-director dune-text-router 2>/dev/null || true
+  engine ps --format '{{.Names}}' | grep '^dune-server-' | xargs -r "$DUNE_ENGINE" rm -f || true
+  engine rm -f dune-server-gateway dune-director dune-text-router 2>/dev/null || true
 }
 
 recreate_dune_database() {
   echo "Recreating dune database..."
-  docker exec dune-postgres psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "
+  engine exec dune-postgres psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "
 select pg_terminate_backend(pid)
 from pg_stat_activity
 where datname = 'dune'
   and pid <> pg_backend_pid();
 "
-  docker exec dune-postgres psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "drop database if exists dune;"
-  docker exec dune-postgres psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "create database dune owner dune;"
+  engine exec dune-postgres psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "drop database if exists dune;"
+  engine exec dune-postgres psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "create database dune owner dune;"
 }
 
 import_db() {
@@ -642,23 +645,23 @@ import_db() {
 
   ext="${backup_file##*.}"
   tmp_file="/tmp/dune-db-import-$(date +%Y%m%d-%H%M%S).$ext"
-  docker cp "$backup_file" "dune-postgres:$tmp_file"
+  engine cp "$backup_file" "dune-postgres:$tmp_file"
 
   echo "Restoring database..."
   case "$backup_file" in
     *.backup|*.dump)
-      docker exec dune-postgres pg_restore -U postgres -d dune "$tmp_file"
+      engine exec dune-postgres pg_restore -U postgres -d dune "$tmp_file"
       ;;
     *.sql)
-      docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -f "$tmp_file"
+      engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -f "$tmp_file"
       ;;
     *)
-      docker exec dune-postgres rm -f "$tmp_file" >/dev/null 2>&1 || true
+      engine exec dune-postgres rm -f "$tmp_file" >/dev/null 2>&1 || true
       echo "Unsupported backup format: $backup_file"
       exit 1
       ;;
   esac
-  docker exec dune-postgres rm -f "$tmp_file" >/dev/null 2>&1 || true
+  engine exec dune-postgres rm -f "$tmp_file" >/dev/null 2>&1 || true
 
   echo "Database import finished."
 
@@ -696,7 +699,7 @@ import_db() {
 
 transfer_function_check() {
   local missing
-  missing="$(docker exec dune-postgres psql -U postgres -d dune -At -c "
+  missing="$(engine exec dune-postgres psql -U postgres -d dune -At -c "
     with required(schema_name, function_name, args) as (
       values
         ('dune','set_account_as_takeoverable','text,text'),
@@ -715,7 +718,7 @@ transfer_function_check() {
 
 fls_exists() {
   local fls="$1"
-  [ "$(docker exec dune-postgres psql -U postgres -d dune -At -c "
+  [ "$(engine exec dune-postgres psql -U postgres -d dune -At -c "
     select count(*)
     from dune.encrypted_accounts
     where convert_from(encrypted_funcom_id, 'UTF8') = '${fls//\'/\'\'}';
@@ -724,7 +727,7 @@ fls_exists() {
 
 fls_character_count() {
   local fls="$1"
-  docker exec dune-postgres psql -U postgres -d dune -At -c "
+  engine exec dune-postgres psql -U postgres -d dune -At -c "
     select count(*)
     from dune.encrypted_accounts e
     left join dune.player_state ps on ps.account_id = e.id
@@ -748,7 +751,7 @@ append_pending_transfer() {
 transfer_sql_apply() {
   local old="$1"
   local new="$2"
-  docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+  engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 begin;
 select dune.set_account_as_takeoverable('${old//\'/\'\'}', '${new//\'/\'\'}');
 do \$\$
@@ -1044,8 +1047,8 @@ auto_backup_enable() {
   cat > "$AUTO_SERVICE_FILE" <<EOF
 [Unit]
 Description=Dune Awakening battlegroup database backup
-Wants=docker.service
-After=network-online.target docker.service
+Wants=podman.socket
+After=network-online.target podman.socket
 
 [Service]
 Type=oneshot

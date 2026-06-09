@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 cmd="${1:-help}"
 target="${2:-}"
 
@@ -28,7 +30,7 @@ case "$cmd" in
     ;;
 
   ps)
-    docker ps --filter "name=dune-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    engine ps --filter "name=dune-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
     ;;
 
   servers)

@@ -3,15 +3,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 TEXT_ROUTER_LOG="runtime/text-router/director-current.log"
 CONFIG_FILE="runtime/generated/sietch-config.json"
 
 ensure_text_router_log() {
   local container_log
   mkdir -p runtime/text-router
-  container_log="$(docker exec dune-text-router sh -lc 'find /Tools/Battlegroups/TextRouter/TextRouter/logs -maxdepth 1 -type f -name "director*.log" | sort | tail -n 1' 2>/dev/null | tr -d '\r')"
+  container_log="$(engine exec dune-text-router sh -lc 'find /Tools/Battlegroups/TextRouter/TextRouter/logs -maxdepth 1 -type f -name "director*.log" | sort | tail -n 1' 2>/dev/null | tr -d '\r')"
   [ -n "$container_log" ] || return 1
-  docker cp "dune-text-router:${container_log}" "$TEXT_ROUTER_LOG" >/dev/null
+  engine cp "dune-text-router:${container_log}" "$TEXT_ROUTER_LOG" >/dev/null
 }
 
 load_rmq_admin_creds() {
@@ -31,7 +33,7 @@ matches = pattern.findall(text)
 if not matches:
     try:
         text = subprocess.check_output(
-            ["docker", "logs", "dune-text-router"],
+            ["podman", "logs", "dune-text-router"],
             text=True,
             stderr=subprocess.STDOUT,
         )
@@ -53,7 +55,7 @@ rmq_admin() {
   [ "${#rmq_creds[@]}" -ge 2 ] || return 1
   rmq_user="${rmq_creds[0]}"
   rmq_password="${rmq_creds[1]}"
-  docker exec dune-rmq-admin rabbitmqadmin -q -u "$rmq_user" -p "$rmq_password" "$@"
+  engine exec dune-rmq-admin rabbitmqadmin -q -u "$rmq_user" -p "$rmq_password" "$@"
 }
 
 publish_payload() {
@@ -91,7 +93,7 @@ order by wp.dimension_index, wp.partition_id;
 
 result = subprocess.run(
     [
-        "docker", "exec", "dune-postgres",
+        "podman", "exec", "dune-postgres",
         "psql", "-U", "postgres", "-d", "dune",
         "-At", "-F", "\t", "-c", query,
     ],

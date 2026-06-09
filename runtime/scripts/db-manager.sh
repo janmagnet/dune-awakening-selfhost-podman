@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 PG_CONTAINER="${DUNE_PG_CONTAINER:-dune-postgres}"
 PG_USER="${DUNE_DB_USER:-dune}"
 PG_PASSWORD="${DUNE_DB_PASSWORD:-dune}"
@@ -25,7 +27,7 @@ EOF
 }
 
 has_container() {
-  docker exec "$PG_CONTAINER" true >/dev/null 2>&1
+  engine exec "$PG_CONTAINER" true >/dev/null 2>&1
 }
 
 detect_db() {
@@ -36,7 +38,7 @@ detect_db() {
   fi
   if has_container; then
     for db in dune postgres; do
-      if docker exec -e PGPASSWORD="$PG_PASSWORD" "$PG_CONTAINER" psql -U "$PG_USER" -d "$db" -Atc "select 1;" >/dev/null 2>&1; then
+      if engine exec -e PGPASSWORD="$PG_PASSWORD" "$PG_CONTAINER" psql -U "$PG_USER" -d "$db" -Atc "select 1;" >/dev/null 2>&1; then
         printf '%s' "$db"
         return 0
       fi
@@ -56,7 +58,7 @@ psql_run() {
   local db="$1"
   shift
   if has_container; then
-    docker exec -e PGPASSWORD="$PG_PASSWORD" "$PG_CONTAINER" psql -U "$PG_USER" -d "$db" "$@"
+    engine exec -e PGPASSWORD="$PG_PASSWORD" "$PG_CONTAINER" psql -U "$PG_USER" -d "$db" "$@"
   else
     PGPASSWORD="$PG_PASSWORD" psql -h 127.0.0.1 -p 15432 -U "$PG_USER" -d "$db" "$@"
   fi
@@ -68,7 +70,7 @@ pg_dump_backup() {
   mkdir -p runtime/backups/db
   out="runtime/backups/db/manual-db-manager-$(date +%Y%m%d-%H%M%S).dump"
   if has_container; then
-    docker exec -e PGPASSWORD="$PG_PASSWORD" "$PG_CONTAINER" pg_dump -U "$PG_USER" -d "$db" -Fc > "$out"
+    engine exec -e PGPASSWORD="$PG_PASSWORD" "$PG_CONTAINER" pg_dump -U "$PG_USER" -d "$db" -Fc > "$out"
   else
     PGPASSWORD="$PG_PASSWORD" pg_dump -h 127.0.0.1 -p 15432 -U "$PG_USER" -d "$db" -Fc > "$out"
   fi

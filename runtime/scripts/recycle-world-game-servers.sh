@@ -15,7 +15,7 @@ TARGET_IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server:${WORLD_IMA
 SERVER_ID_MAP_FILE="runtime/generated/autoscaler-server-ids.tsv"
 
 psql_value() {
-  docker exec dune-postgres psql -U postgres -d dune -Atc "$1"
+  engine exec dune-postgres psql -U postgres -d dune -Atc "$1"
 }
 
 is_world_game_container() {
@@ -55,7 +55,7 @@ cleanup_partition_assignment() {
   [ -n "$partition_id" ] || return 0
   server_id="$(psql_value "select coalesce(server_id, '') from dune.world_partition where partition_id = $partition_id limit 1;")"
 
-  docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+  engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 begin;
 update dune.world_partition
 set server_id = null
@@ -85,9 +85,9 @@ remove_container() {
   fi
 
   echo "Removing world server container: $name"
-  docker rm -f "$name" >/dev/null
+  engine rm -f "$name" >/dev/null
 
-  if [ -n "$partition_id" ] && docker ps --format '{{.Names}}' | grep -qx dune-postgres; then
+  if [ -n "$partition_id" ] && engine ps --format '{{.Names}}' | grep -qx dune-postgres; then
     cleanup_partition_assignment "$partition_id"
   fi
 }
@@ -102,7 +102,7 @@ remove_stale() {
       echo "Stale world server image detected: $name ($image != $TARGET_IMAGE)"
       remove_container "$name"
     fi
-  done < <(docker ps -a --format '{{.Names}}\t{{.Image}}')
+  done < <(engine ps -a --format '{{.Names}}\t{{.Image}}')
 
   if [ "$found" -eq 0 ]; then
     echo "No stale world server containers found for tag $WORLD_IMAGE_TAG."
@@ -116,7 +116,7 @@ stop_all() {
     is_world_game_container "$name" || continue
     found=1
     remove_container "$name"
-  done < <(docker ps -a --format '{{.Names}}')
+  done < <(engine ps -a --format '{{.Names}}')
 
   if [ "$found" -eq 0 ]; then
     echo "No world server containers found."
@@ -135,7 +135,7 @@ stop_noncore() {
     esac
     found=1
     remove_container "$name"
-  done < <(docker ps -a --format '{{.Names}}')
+  done < <(engine ps -a --format '{{.Names}}')
 
   if [ "$found" -eq 0 ]; then
     echo "No non-core world server containers found."

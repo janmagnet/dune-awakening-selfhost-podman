@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -55,7 +57,7 @@ if [ "$mode" = "--raw" ]; then
     y|Y|yes|YES) ;;
     *) echo "Cancelled."; exit 1 ;;
   esac
-  exec docker logs -f "$container"
+  exec "$DUNE_ENGINE" logs -f "$container"
 fi
 
 if [ -n "$mode" ]; then
@@ -64,7 +66,7 @@ if [ -n "$mode" ]; then
   exit 2
 fi
 
-docker logs -f "$container" 2>&1 | sed -u -E \
+engine logs -f "$container" 2>&1 | sed -u -E \
   -e 's/(ServiceAuthToken=)[^[:space:]"'"'"']+/\1<redacted>/g' \
   -e 's/(ServiceAuthToken[":= ]+)[^,"[:space:]]+/\1<redacted>/g' \
   -e 's/(GameRmqSecret[":= ]+)[^,"[:space:]]+/\1<redacted>/g' \

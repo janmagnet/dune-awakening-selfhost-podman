@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 PID_FILE="runtime/generated/sietch-overrides.pid"
 LOG_FILE="runtime/generated/sietch-overrides.log"
 LOG_POINTER_FILE="runtime/generated/sietch-overrides-current.log"
@@ -55,9 +57,9 @@ prepare_runtime_generated_files() {
 ensure_text_router_log() {
   local container_log
   mkdir -p runtime/text-router
-  container_log="$(docker exec dune-text-router sh -lc 'find /Tools/Battlegroups/TextRouter/TextRouter/logs -maxdepth 1 -type f -name "director*.log" | sort | tail -n 1' 2>/dev/null | tr -d '\r')"
+  container_log="$(engine exec dune-text-router sh -lc 'find /Tools/Battlegroups/TextRouter/TextRouter/logs -maxdepth 1 -type f -name "director*.log" | sort | tail -n 1' 2>/dev/null | tr -d '\r')"
   [ -n "$container_log" ] || return 1
-  docker cp "dune-text-router:${container_log}" "$TEXT_ROUTER_LOG" >/dev/null
+  engine cp "dune-text-router:${container_log}" "$TEXT_ROUTER_LOG" >/dev/null
 }
 
 load_rmq_admin_creds() {
@@ -77,7 +79,7 @@ matches = pattern.findall(text)
 if not matches:
     try:
         text = subprocess.check_output(
-            ["docker", "logs", "dune-text-router"],
+            ["podman", "logs", "dune-text-router"],
             text=True,
             stderr=subprocess.STDOUT,
         )
@@ -99,12 +101,12 @@ rmq_admin() {
   [ "${#rmq_creds[@]}" -ge 2 ] || return 1
   rmq_user="${rmq_creds[0]}"
   rmq_password="${rmq_creds[1]}"
-  docker exec dune-rmq-admin rabbitmqadmin -q -u "$rmq_user" -p "$rmq_password" "$@"
+  engine exec dune-rmq-admin rabbitmqadmin -q -u "$rmq_user" -p "$rmq_password" "$@"
 }
 
 rmq_delete_binding_exact() {
   local source="$1" destination="$2" routing_key="$3"
-  docker exec dune-rmq-admin rabbitmqctl eval "
+  engine exec dune-rmq-admin rabbitmqctl eval "
 Binding = {binding,
   {resource, <<\"/\">>, exchange, <<\"${source}\">>},
   <<\"${routing_key}\">>,
@@ -155,7 +157,7 @@ heal_survival_alive_state() {
   local live_server_ids sql
 
   live_server_ids="$(
-    docker exec dune-rmq-game rabbitmqctl list_connections user state 2>/dev/null \
+    engine exec dune-rmq-game rabbitmqctl list_connections user state 2>/dev/null \
       | awk '$1 ~ /^sg[.]/ && $2 == "running" { split($1, parts, "."); if (length(parts) >= 2) print parts[length(parts) - 1] }' \
       | sort -u
   )" || true
@@ -195,7 +197,7 @@ PY
 )"
 
   [ -n "$sql" ] || return 0
-  docker exec dune-postgres psql -U postgres -d dune -qAt -c "$sql" >/dev/null 2>&1 || true
+  engine exec dune-postgres psql -U postgres -d dune -qAt -c "$sql" >/dev/null 2>&1 || true
 }
 
 publish_snapshot_once() {
@@ -206,8 +208,8 @@ publish_snapshot_once() {
     return 1
   }
   heal_survival_alive_state
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-survival-1; then
-    if docker logs dune-server-survival-1 2>&1 | grep -Eq 'Server farm is READY .*partition 1'; then
+  if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-survival-1; then
+    if engine logs dune-server-survival-1 2>&1 | grep -Eq 'Server farm is READY .*partition 1'; then
       survival_log_ready="true"
     fi
   fi
@@ -239,7 +241,7 @@ order by wp.partition_id;
 
 result = subprocess.run(
     [
-        "docker", "exec", "dune-postgres",
+        "podman", "exec", "dune-postgres",
         "psql", "-U", "postgres", "-d", "dune",
         "-At", "-F", "\t", "-c", query,
     ],
@@ -329,8 +331,8 @@ forward_batch_once() {
   [ "$messages" != "[]" ] || return 1
 
   local survival_log_ready="false"
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-survival-1; then
-    if docker logs dune-server-survival-1 2>&1 | grep -Eq 'Server farm is READY .*partition 1'; then
+  if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-survival-1; then
+    if engine logs dune-server-survival-1 2>&1 | grep -Eq 'Server farm is READY .*partition 1'; then
       survival_log_ready="true"
     fi
   fi
@@ -348,7 +350,7 @@ config = json.loads(config_path.read_text()) if config_path.exists() else {"part
 partition_cfg = config.get("partitions", {})
 survival_log_ready = os.environ.get("SURVIVAL_LOG_READY", "").lower() in ("1", "true", "t", "yes")
 label_rows_raw = subprocess.check_output([
-    "docker", "exec", "dune-postgres", "psql",
+    "podman", "exec", "dune-postgres", "psql",
     "-U", "postgres", "-d", "dune", "-At", "-F", "\t",
     "-c", "select partition_id, coalesce(label, '') from dune.world_partition where lower(map)=lower('Survival_1');"
 ], text=True)

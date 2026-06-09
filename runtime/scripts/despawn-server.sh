@@ -2,6 +2,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+
+source runtime/scripts/engine.sh
+
 PORT_RESERVATION_FILE="runtime/generated/spawn-port-reservations.tsv"
 PORT_LOCK_FILE="runtime/generated/spawn-port-reservations.lock"
 
@@ -46,7 +49,7 @@ case "${TARGET,,}" in
 esac
 
 psql_value() {
-  docker exec dune-postgres psql -U postgres -d dune -Atc "$1"
+  engine exec dune-postgres psql -U postgres -d dune -Atc "$1"
 }
 
 container_name_for_map_partition() {
@@ -63,7 +66,7 @@ rebuild_port_reservation_file() {
   local rows partition_id map game_port igw_port container_name
 
   : >"$output_path"
-  rows="$(docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+  rows="$(engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
     select
       wp.partition_id,
       wp.map,
@@ -156,7 +159,7 @@ container_from_map() {
   local map="$1"
   local safe_map rows row partition safe_name container
 
-  rows="$(docker exec dune-postgres psql -U postgres -d dune -Atc "
+  rows="$(engine exec dune-postgres psql -U postgres -d dune -Atc "
     select partition_id
     from dune.world_partition
     where lower(map) = lower('${map//\'/\'\'}')
@@ -171,7 +174,7 @@ container_from_map() {
     [ -z "$partition" ] && continue
     safe_name="$(echo "$map-$partition" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')"
     container="dune-server-$safe_name"
-    if docker ps -a --format '{{.Names}}' | grep -qx "$container"; then
+    if engine ps -a --format '{{.Names}}' | grep -qx "$container"; then
       echo "$container"
       return 0
     fi
@@ -180,7 +183,7 @@ container_from_map() {
   return 1
 }
 
-if docker ps -a --format '{{.Names}}' | grep -qx "$TARGET"; then
+if engine ps -a --format '{{.Names}}' | grep -qx "$TARGET"; then
   CONTAINER="$TARGET"
 elif [[ "$TARGET" =~ ^[0-9]+$ ]]; then
   CONTAINER="$(container_from_partition "$TARGET" || true)"
@@ -192,7 +195,7 @@ if [ -z "${CONTAINER:-}" ]; then
   echo "Could not find a matching spawned container for: $TARGET"
   echo
   echo "Currently known Dune server containers:"
-  docker ps -a --filter "name=dune-server-" --format "  {{.Names}} - {{.Status}}"
+  engine ps -a --filter "name=dune-server-" --format "  {{.Names}} - {{.Status}}"
   exit 1
 fi
 
@@ -227,7 +230,7 @@ if [ -n "$PARTITION_ID" ]; then
 fi
 
 echo "Despawning: $CONTAINER"
-docker rm -f "$CONTAINER"
+engine rm -f "$CONTAINER"
 ensure_runtime_state_file "$PORT_LOCK_FILE" "spawn port reservation lock"
 exec 9>"$PORT_LOCK_FILE"
 flock 9
@@ -237,7 +240,7 @@ release_port_reservation "$CONTAINER"
 if [ -n "$SERVER_ID" ]; then
   echo
   echo "Cleaning DB assignment for server_id: $SERVER_ID"
-  docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+  engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 begin;
 
 update dune.world_partition
@@ -258,4 +261,4 @@ fi
 
 echo
 echo "Remaining Dune server containers:"
-docker ps -a --filter "name=dune-server-" --format "table {{.Names}}\t{{.Status}}"
+engine ps -a --filter "name=dune-server-" --format "table {{.Names}}\t{{.Status}}"

@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 failures=0
 
 ok() { printf 'OK   %s\n' "$*"; }
@@ -111,7 +113,7 @@ else
   fail "runtime/generated is not writable"
 fi
 
-if docker ps --format '{{.Names}}' >/tmp/dune-admin-docker.out 2>/tmp/dune-admin-docker.err; then
+if engine ps --format '{{.Names}}' >/tmp/dune-admin-docker.out 2>/tmp/dune-admin-docker.err; then
   for container in dune-rmq-game dune-postgres; do
     if grep -qx "$container" /tmp/dune-admin-docker.out; then
       ok "$container container detected"
@@ -120,7 +122,7 @@ if docker ps --format '{{.Names}}' >/tmp/dune-admin-docker.out 2>/tmp/dune-admin
     fi
   done
 else
-  warn "docker is unavailable; live container checks skipped"
+  warn "podman is unavailable; live container checks skipped"
 fi
 
 rm -f /tmp/dune-admin-validate.out /tmp/dune-admin-validate.err /tmp/dune-admin-docker.out /tmp/dune-admin-docker.err

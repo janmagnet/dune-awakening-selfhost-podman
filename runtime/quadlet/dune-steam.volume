@@ -1,0 +1,6 @@
+# SteamCMD tools and cache.
+[Unit]
+Description=Dune Awakening SteamCMD volume
+
+[Volume]
+VolumeName=dune-steam

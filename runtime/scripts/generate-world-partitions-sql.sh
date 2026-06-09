@@ -13,7 +13,7 @@ SERVER_REGION="$(resolve_server_region)"
 SERVER_IP="$(resolve_server_ip)"
 export SERVER_REGION SERVER_IP
 
-docker compose exec -T orchestrator python3 - <<'PY' > runtime/generated/reset-world-partitions.sql
+engine exec -i dune-orchestrator python3 - <<'PY' > runtime/generated/reset-world-partitions.sql
 from pathlib import Path
 import json
 import re

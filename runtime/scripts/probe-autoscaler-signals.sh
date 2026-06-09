@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 echo "=== Director HTTP quick probe ==="
 for path in \
   / \
@@ -28,13 +30,13 @@ done
 
 echo
 echo "=== Director recent log lines with route/API/travel/server/queue words ==="
-docker logs dune-director 2>&1 \
+engine logs dune-director 2>&1 \
   | grep -Ei "api|http|route|travel|queue|server|partition|spawn|scale|dedicated|director" \
   | tail -200 || true
 
 echo
 echo "=== DB tables likely related to travel/queues/sessions/server demand ==="
-docker exec dune-postgres psql -U postgres -d dune -Atc "
+engine exec dune-postgres psql -U postgres -d dune -Atc "
 select table_schema || '.' || table_name || ' | ' || string_agg(column_name, ', ' order by ordinal_position)
 from information_schema.columns
 where table_schema not in ('pg_catalog','information_schema')
@@ -73,5 +75,5 @@ for tbl in \
 do
   echo
   echo "--- $tbl ---"
-  docker exec dune-postgres psql -U postgres -d dune -P pager=off -c "select * from $tbl limit 20;" || true
+  engine exec dune-postgres psql -U postgres -d dune -P pager=off -c "select * from $tbl limit 20;" || true
 done

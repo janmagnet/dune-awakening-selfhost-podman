@@ -3,11 +3,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 target="${1:-all}"
 
 is_running() {
   local name="$1"
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+  engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
 }
 
 heal_partition_ready() {
@@ -21,7 +23,7 @@ heal_partition_ready() {
   is_running "$container_name" || return 0
 
   row="$(
-    docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+    engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
       select coalesce(wp.server_id, ''),
              coalesce(fs.ready::text, 'f'),
              coalesce(fs.alive::text, 'f'),
@@ -43,7 +45,7 @@ heal_partition_ready() {
     return 0
   fi
 
-  if ! docker logs "$container_name" 2>&1 | grep -Eq "$ready_pattern"; then
+  if ! engine logs "$container_name" 2>&1 | grep -Eq "$ready_pattern"; then
     # Recent dedicated-server builds do not always emit or persist the old
     # READY marker for Survival_1, even after the farm row is fully connected.
     # Treat assigned, alive core partitions with both S2S directions as ready.
@@ -57,7 +59,7 @@ heal_partition_ready() {
     fi
   fi
 
-  docker exec dune-postgres psql -U postgres -d dune -qAt -c "
+  engine exec dune-postgres psql -U postgres -d dune -qAt -c "
     update dune.farm_state
     set ready = true,
         alive = true

@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 OVERRIDE_FILE="runtime/generated/director-deepdesert-dual.ini"
 
 usage() {
@@ -17,7 +19,7 @@ EOF
 }
 
 require_postgres() {
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
     echo "dune-postgres is not running."
     exit 1
   fi
@@ -31,17 +33,17 @@ confirm() {
 }
 
 psql() {
-  docker exec dune-postgres psql -U postgres -d dune "$@"
+  engine exec dune-postgres psql -U postgres -d dune "$@"
 }
 
 psql_value() {
-  docker exec dune-postgres psql -U postgres -d dune -At -c "$1"
+  engine exec dune-postgres psql -U postgres -d dune -At -c "$1"
 }
 
 recycle_idle_deepdesert_servers() {
   local rows partition_id server_id connected_players
   RECYCLED_DEEPDESERT_SERVERS=0
-  rows="$(docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+  rows="$(engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
     select
       wp.partition_id,
       coalesce(wp.server_id, ''),
@@ -69,7 +71,7 @@ recycle_idle_deepdesert_servers() {
 }
 
 restart_director_if_running() {
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-director; then
+  if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-director; then
     echo "Restarting dune-director so DeepDesert_1 config changes take effect..."
     runtime/scripts/start-director.sh >/dev/null
     echo "dune-director restarted."
@@ -318,7 +320,7 @@ enable_dual() {
   echo "Dual Deep Desert PvP/PvE is enabled."
   echo "Gameplay routing now matches the reference flow: only the detected dimension 0 partition is listed in m_PvpEnabledPartitions."
   echo "Players should see two Deep Desert instances when the client enters the SELECT INSTANCE flow."
-  echo "Funcom's selector UI may still show generic instance names and a wrong Kanly/PvE badge. That cosmetic state is not controlled by the Docker stack."
+  echo "Funcom's selector UI may still show generic instance names and a wrong Kanly/PvE badge. That cosmetic state is not controlled by the Podman stack."
   echo "Run bootstrap once if players are still routed back to only dimension 0."
 }
 
@@ -421,13 +423,13 @@ bootstrap_dual() {
   pvp="$(pvp_partition_id)"
   [ -n "$pvp" ] || { echo "DeepDesert_1 dimension 0 not found."; exit 1; }
   container="dune-server-deepdesert-1-$pvp"
-  if ! docker ps -a --format '{{.Names}}' | grep -qx "$container"; then
-    container="$(docker ps -a --format '{{.Names}}' | grep -E "^dune-server-deepdesert-1-${pvp}$" | head -n1 || true)"
+  if ! engine ps -a --format '{{.Names}}' | grep -qx "$container"; then
+    container="$(engine ps -a --format '{{.Names}}' | grep -E "^dune-server-deepdesert-1-${pvp}$" | head -n1 || true)"
   fi
   [ -n "$container" ] || { echo "No running dimension 0 DeepDesert_1 container found for partition $pvp."; return 0; }
   echo "This removes only $container once. Survival_1 and Overmap are untouched."
   confirm "Bootstrap routing fix now" || { echo "Cancelled."; exit 1; }
-  runtime/scripts/despawn-server.sh "$container" --force || docker rm -f "$container"
+  runtime/scripts/despawn-server.sh "$container" --force || engine rm -f "$container"
   echo "Bootstrap complete. Players may need about 3 minutes between Deep Desert instance switches due to Director grace routing."
 }
 

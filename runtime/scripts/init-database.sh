@@ -11,7 +11,7 @@ PARTITION_PRESET="${PARTITION_PRESET:-full_battlegroup}"
 
 echo "Initializing Dune database with partition preset: ${PARTITION_PRESET}"
 
-docker run --rm \
+engine run --rm \
   --network dune-net \
   --entrypoint sh \
   "$DB_UTILS_IMAGE" \
@@ -42,4 +42,4 @@ echo "Database initialization finished."
 
 echo
 echo "Checking schema/version tables..."
-docker exec dune-postgres psql -U dune -d dune -c "\\dt" | head -80
+engine exec dune-postgres psql -U dune -d dune -c "\\dt" | head -80

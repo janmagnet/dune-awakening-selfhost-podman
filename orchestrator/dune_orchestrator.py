@@ -95,15 +95,15 @@ def check_free_space():
     if too_low:
         print("", flush=True)
         print("[dune] Not enough free disk space for a safe Dune server install/update.", flush=True)
-        print("[dune] SteamDB currently lists the self-hosted server package as about 4.94 GiB download and 5.79 GiB installed before Docker image loading.", flush=True)
-        print("[dune] This project also needs room for Docker images, volumes, database files, backups, and generated runtime data.", flush=True)
+        print("[dune] SteamDB currently lists the self-hosted server package as about 4.94 GiB download and 5.79 GiB installed before container image loading.", flush=True)
+        print("[dune] This project also needs room for container images, volumes, database files, backups, and generated runtime data.", flush=True)
         print("[dune] Free disk space is below the configured safety minimum:", flush=True)
         for path, free_gb in too_low:
             print(f"[dune]   {path}: {free_gb:.1f} GiB free, needs at least {MIN_FREE_GB} GiB", flush=True)
         print("", flush=True)
-        print("[dune] Free disk space or move Docker's data-root to a larger disk, then retry:", flush=True)
+        print("[dune] Free disk space or move Podman's storage to a larger disk, then retry:", flush=True)
         print("[dune]   runtime/scripts/update.sh install", flush=True)
-        print("[dune] Advanced override if you know there is enough external Docker storage:", flush=True)
+        print("[dune] Advanced override if you know there is enough external Podman storage:", flush=True)
         print("[dune]   DUNE_MIN_FREE_GB=10 runtime/scripts/update.sh install", flush=True)
         print("[dune]   DUNE_SKIP_DISK_CHECK=1 runtime/scripts/update.sh install", flush=True)
         sys.exit(3)
@@ -167,8 +167,8 @@ def download():
         print("[dune]   - network/CDN failure while contacting Steam", flush=True)
         print("", flush=True)
         print("[dune] Useful checks:", flush=True)
-        print("[dune]   docker exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache", flush=True)
-        print(f"[dune]   docker exec dune-orchestrator tail -n 80 {DUNE_HOME}/Steam/logs/stderr.txt", flush=True)
+        print("[dune]   podman exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache", flush=True)
+        print(f"[dune]   podman exec dune-orchestrator tail -n 80 {DUNE_HOME}/Steam/logs/stderr.txt", flush=True)
         print("", flush=True)
         print("[dune] Retry safely after fixing the cause:", flush=True)
         print("[dune]   runtime/scripts/update.sh install", flush=True)
@@ -177,7 +177,7 @@ def download():
     print("[dune] Download finished.", flush=True)
 
 def status():
-    print("Dune Docker Orchestrator MVP")
+    print("Dune Podman Orchestrator MVP")
     print(f"SERVER_IP={resolve_server_ip()}")
     print(f"SERVER_TITLE={SERVER_TITLE}")
     print(f"SERVER_REGION={SERVER_REGION}")
@@ -187,13 +187,13 @@ def status():
     print(f"STEAM_DIR={STEAM_DIR}")
     print("")
 
-    run(["docker", "version"], check=False)
+    run(["podman", "version"], check=False)
     print("")
-    run(["docker", "ps"], check=False)
+    run(["podman", "ps"], check=False)
 
 def daemon():
-    print("Dune Docker Orchestrator MVP daemon is running.", flush=True)
-    print("Use: docker compose exec orchestrator dune status", flush=True)
+    print("Dune Podman Orchestrator MVP daemon is running.", flush=True)
+    print("Use: podman exec dune-orchestrator dune status", flush=True)
     while True:
         time.sleep(3600)
 
@@ -203,7 +203,7 @@ Usage:
   dune help       Show this help
   dune daemon     Keep the orchestrator container running
   dune preflight  Check disk space before downloading server files
-  dune status     Verify Docker access and runtime config
+  dune status     Verify Podman access and runtime config
   dune download   Download/update Dune server files with SteamCMD
 """.strip())
 

@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 STATE_FILE="${DUNE_MAP_MODES_FILE:-runtime/generated/map-runtime-modes.json}"
 GRACE_SECONDS="${DUNE_AUTOSCALER_DESPAWN_GRACE_SECONDS:-${DUNE_AUTOSCALER_IDLE_SECONDS:-300}}"
 
@@ -21,7 +23,7 @@ EOF
 }
 
 require_postgres() {
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
     echo "dune-postgres is not running."
     exit 1
   fi
@@ -36,11 +38,11 @@ protected_map() {
 
 canonical_map() {
   local input="$1"
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
     printf '%s' "$input"
     return 0
   fi
-  docker exec dune-postgres psql -U postgres -d dune -At -v ON_ERROR_STOP=1 -c "
+  engine exec dune-postgres psql -U postgres -d dune -At -v ON_ERROR_STOP=1 -c "
     select map
     from dune.world_partition
     where lower(map) = lower('${input//\'/\'\'}')
@@ -163,7 +165,7 @@ PY
 list_maps() {
   require_postgres
   ensure_state_file
-  docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+  engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
     select
       wp.map,
       count(*) as partitions,
@@ -193,7 +195,7 @@ reconcile_map() {
   local rows assigned running
 
   require_postgres
-  rows="$(docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+  rows="$(engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
     select partition_id, coalesce(server_id, '')
     from dune.world_partition
     where map = '${map//\'/\'\'}'
@@ -208,7 +210,7 @@ reconcile_map() {
 
   while IFS='|' read -r partition_id assigned; do
     [ -n "${partition_id:-}" ] || continue
-    running="$(docker ps --format '{{.Names}}' | grep -Ec "^dune-server-$(printf '%s' "$map" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g')-${partition_id}$" || true)"
+    running="$(engine ps --format '{{.Names}}' | grep -Ec "^dune-server-$(printf '%s' "$map" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g')-${partition_id}$" || true)"
     if [ -n "$assigned" ] || [ "$running" != "0" ]; then
       echo "OK   always-on map=$map partition=$partition_id"
       continue

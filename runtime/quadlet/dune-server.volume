@@ -1,0 +1,6 @@
+# Dune server files (Steam-downloaded Seabass server build).
+[Unit]
+Description=Dune Awakening server files volume
+
+[Volume]
+VolumeName=dune-server

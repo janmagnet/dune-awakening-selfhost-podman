@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 CATALOG="runtime/generated/partition-catalog.json"
 SERVER_CATALOG="runtime/generated/server-catalog.json"
 
@@ -50,7 +52,7 @@ Usage:
   dune memory set default <memory>
   dune memory unset default
 
-Memory values use Docker formats such as 512m, 4096m, 4g, 8g, 12g, or 16g.
+Memory values use Podman formats such as 512m, 4096m, 4g, 8g, 12g, or 16g.
 Map names come from the generated world partition catalog.
 EOF
 }
@@ -228,13 +230,13 @@ running_info_for_map() {
 
   case "$map" in
     Survival_1)
-      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-survival-1; then
+      if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-survival-1; then
         echo "always|dune-server-survival-1|1"
       fi
       return
       ;;
     Overmap)
-      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-overmap; then
+      if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-overmap; then
         echo "always|dune-server-overmap|2"
       fi
       return
@@ -242,7 +244,7 @@ running_info_for_map() {
   esac
 
   safe="$(safe_container_fragment "$map")"
-  container="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E "^dune-server-${safe}-[0-9]+$" | head -n1 || true)"
+  container="$(engine ps --format '{{.Names}}' 2>/dev/null | grep -E "^dune-server-${safe}-[0-9]+$" | head -n1 || true)"
   if [ -n "$container" ] && [[ "$container" =~ -([0-9]+)$ ]]; then
     echo "dynamic|$container|${BASH_REMATCH[1]}"
   fi

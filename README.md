@@ -7,7 +7,7 @@
 > [Dune: Awakening Docker](https://discord.gg/9pQqytu6BU)
 
 <p align="center">
-  <img src="assets/cover.png" alt="Dune Awakening Self-Host Docker cover" />
+  <img src="assets/cover.png" alt="Dune Awakening Self-Host Podman cover" />
 </p>
 
 ![Docker](https://img.shields.io/badge/Docker-ready-brightgreen)
@@ -28,8 +28,8 @@ This project is unofficial. It is not affiliated with, endorsed by, sponsored by
 
 ## Who This Is For
 
-- Server owners who want a guided menu instead of memorizing Docker commands.
-- Technical users who want direct CLI and Docker control.
+- Server owners who want a guided menu instead of memorizing Podman commands.
+- Technical users who want direct CLI and Podman control.
 - Admins who need backups, updates, logs, settings, database tools, and live admin tools.
 
 ## Beginner Quick Start
@@ -39,7 +39,7 @@ This project is unofficial. It is not affiliated with, endorsed by, sponsored by
 | Requirement | Plain explanation |
 |---|---|
 | Linux server | Ubuntu 24.04.4 LTS is the known target. |
-| Docker Engine and Docker Compose | Docker runs the server pieces for you. |
+| Podman 4.4+ with Quadlet | Podman runs the server pieces as rootful systemd units. |
 | Funcom self-host token | Required to authenticate your self-host server. |
 | CPU with AVX and AVX2 | Required by the game server. |
 | Disk space | 100 GB or more recommended. |
@@ -133,7 +133,7 @@ Common beginner tasks:
 | Feature | Beginner access | Advanced command / location |
 |---|---|---|
 | Guided interactive manager | `dune manager` | `runtime/scripts/manager.sh` |
-| Docker-based server stack | Manager start/stop menus | `docker-compose.yml`, `dune start`, `dune stop` |
+| Podman + Quadlet server stack | Manager start/stop menus | `runtime/quadlet/`, `dune start`, `dune stop` |
 | First-time setup | `dune init` | `runtime/scripts/init.sh` |
 | Status and readiness | Battlegroup Overview | `dune status`, `dune ready`, `dune ps`, `dune ports` |
 | Redacted logs | Logs menu | `dune logs <service>` |
@@ -170,9 +170,9 @@ Experimental or limited areas are labeled where they matter:
 
 ## Beginner Concepts
 
-### What Docker Does Here
+### What Podman Does Here
 
-Docker runs the many server pieces as containers. You do not need to manage each container by hand if you use `dune manager`.
+Podman runs the many server pieces as containers, managed as rootful systemd Quadlet services. You do not need to manage each container by hand if you use `dune manager`.
 
 The main always-on pieces are Postgres, RabbitMQ, TextRouter, Director, ServerGateway, Survival_1, and Overmap. Dynamic map containers can be spawned by the autoscaler when needed.
 
@@ -202,7 +202,7 @@ Do not share this file, paste it into chat, or include it in screenshots.
 |---|---|
 | `.env` | Your local server settings. |
 | `.env.example` | Example settings you can compare against. |
-| `docker-compose.yml` | Defines the orchestrator container used by this project. |
+| `runtime/quadlet/` | Quadlet network and volume units installed for the stack. |
 | `runtime/scripts/` | The scripts behind `dune` and `dune manager`. |
 | `runtime/secrets/` | Local secrets such as the Funcom token. |
 | `runtime/generated/` | Generated config, catalogs, state, logs, and exports. |
@@ -437,15 +437,15 @@ sudo dune restart-schedule enable 12
 sudo dune restart-schedule disable
 ```
 
-## Docker Architecture
+## Podman + Quadlet Architecture
 
-This repo uses Docker Compose for the `orchestrator` container and repo scripts to start the rest of the Dune service containers.
+This repo runs the stack with rootful Podman. The long-lived services are installed as systemd Quadlet units (see `runtime/quadlet/` plus the units generated into `/etc/containers/systemd/` by `runtime/scripts/render-quadlet.sh` and the `start-*.sh` scripts). The orchestrator container builds/loads images and the autoscaler spawns dynamic map containers through the rootful Podman API socket.
 
-`docker-compose.yml` defines:
+The `dune-orchestrator` Quadlet unit defines:
 
-- `dune-orchestrator`, running with `network_mode: host`.
-- Docker socket access so scripts can start and stop service containers.
-- Docker volumes for server files, Steam files, cache, and generated data.
+- `dune-orchestrator`, running with host networking.
+- A mount of the rootful Podman API socket (`/run/podman/podman.sock`) so it can load server images onto the host engine.
+- Named volumes for server files, Steam files, cache, and generated data.
 - A bind mount of `./work:/work`.
 
 The runtime scripts then manage service containers named like:
@@ -669,33 +669,34 @@ Common problems:
 
 | Problem | What to try |
 |---|---|
-| `docker: command not found` | Install Docker Engine and Docker Compose. |
-| Docker daemon not reachable | Run `sudo systemctl enable --now docker`, add your user to the docker group, then re-login or run `newgrp docker`. |
+| `podman: command not found` | Install Podman 4.4+ (includes Quadlet). |
+| Podman API socket not active | Run `sudo systemctl enable --now podman.socket`. |
 | Missing Funcom token | Run `dune init` or place it in `runtime/secrets/funcom-token.txt`. |
-| SteamCMD `state is 0x6` during init | Usually disk space, Steam anonymous depot availability, stale SteamCMD metadata, or Steam CDN/network failure. Check `docker exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache`, free space, then retry `runtime/scripts/update.sh install`. |
+| SteamCMD `state is 0x6` during init | Usually disk space, Steam anonymous depot availability, stale SteamCMD metadata, or Steam CDN/network failure. Check `sudo podman exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache`, free space, then retry `runtime/scripts/update.sh install`. |
 | Server not showing publicly | Check `SERVER_IP`, router/firewall forwarding, and `dune ports`. |
 | Server only needed for LAN | Use a local/private server IP during init. |
 | Port conflict | Run `dune ports` and check other services using the same ports. |
 | Database not starting | Run `dune doctor`, then inspect `dune logs postgres`. |
 | Services stuck warming | Wait several minutes, then run `dune ready` and check Director/Gateway/map logs. |
 | Runtime map picker missing | Manager -> Updates -> Runtime Files Status, then Repair Runtime Files. |
-| Permission issues with `dune` | Reinstall with `sudo runtime/scripts/install-command.sh`; check Docker group membership. |
+| Permission issues with `dune` | Run `dune` as root (rootful Podman); reinstall with `sudo runtime/scripts/install-command.sh`. |
 | Raw logs requested | Be careful; raw logs can contain tokens or player identifiers. |
 
-Docker install helper shown by `dune init` if Docker is missing:
+Podman install helper shown by `dune init` if Podman is missing:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl
+# Fedora / Fedora CoreOS: Podman is already included by default
+sudo dnf install -y podman                              # RHEL / Rocky / Alma
+sudo apt-get update && sudo apt-get install -y podman   # Debian / Ubuntu
 ```
 
-Follow Docker's official Linux install steps for your distribution if Docker is not already installed.
+Follow Podman's official install steps for your distribution if Podman 4.4+ (which includes Quadlet) is not already installed.
 
 ## FAQ
 
-### Do I need to know Docker?
+### Do I need to know Podman?
 
-No for normal use. Run `dune manager` and use the menus. Docker still needs to be installed because it runs the server in the background.
+No for normal use. Run `dune manager` and use the menus. Podman still needs to be installed because it runs the server in the background.
 
 ### Where do I change server settings?
 
@@ -737,7 +738,7 @@ Use the manager's `Logs` menu or run `dune logs <service>`. Use `dune doctor` fo
 - Admin Tools affect live players and live server state.
 - If a token is exposed, rotate it from your Funcom self-host account page.
 
-This repository does not include Funcom game files, Docker image tarballs, tokens, secrets, or proprietary assets. Server files and images are downloaded or loaded at runtime by the user's own environment.
+This repository does not include Funcom game files, container image tarballs, tokens, secrets, or proprietary assets. Server files and images are downloaded or loaded at runtime by the user's own environment.
 
 ## Contributing And Project Notes
 

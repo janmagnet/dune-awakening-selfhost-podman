@@ -9,6 +9,7 @@ cd "$(dirname "$0")/../.."
 [ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
 source runtime/scripts/runtime-env.sh
 source runtime/scripts/image-tags.sh
+require_quadlet_privileges || exit 1
 WORLD_IMAGE_TAG="$(resolve_world_image_tag)"
 IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-bg-director:${WORLD_IMAGE_TAG}"
 
@@ -46,7 +47,7 @@ BATTLEGROUP_ID="$(resolve_battlegroup_id)"
 if [ -n "${DUNE_FAKE_K8S_SERVICEACCOUNT_DIR:-}" ]; then
   FAKE_K8S_SERVICEACCOUNT_DIR="$DUNE_FAKE_K8S_SERVICEACCOUNT_DIR"
 else
-  FAKE_K8S_SERVICEACCOUNT_DIR="$PWD/runtime/generated/dune-fake-k8s-serviceaccount-director-$$"
+  FAKE_K8S_SERVICEACCOUNT_DIR="$PWD/runtime/generated/dune-fake-k8s-serviceaccount-director"
 fi
 
 
@@ -239,84 +240,101 @@ EOF
 chmod -R 755 "$FAKE_K8S_SERVICEACCOUNT_DIR"
 chmod -R 755 runtime/director/config
 
-docker network create dune-net 2>/dev/null || true
-docker rm -f dune-director 2>/dev/null || true
+REPO_DIR="$(pwd)"
 
-docker run -d \
-  --name dune-director \
-  --network dune-net \
-  --restart unless-stopped \
-  -p 127.0.0.1:11717:11717/tcp \
-  -v "$PWD/runtime/director/config/director_config.ini:/Tools/Battlegroups/Director/BattlegroupDirector/director_config.ini:ro" \
-  -v "$PWD/runtime/generated/director-bundle:/opt/dune-director-bundle" \
-  -v "$FAKE_K8S_SERVICEACCOUNT_DIR:/run/secrets/kubernetes.io/serviceaccount:ro" \
-  -e "DOTNET_BUNDLE_EXTRACT_BASE_DIR=/opt/dune-director-bundle" \
-  -e "KUBERNETES_SERVICE_HOST=igwo.local" \
-  -e "KUBERNETES_SERVICE_PORT=6443" \
-  -e "KUBERNETES_SERVICE_PORT_HTTPS=6443" \
-  -e "KUBERNETES_SERVICE_PATH=/run/secrets/kubernetes.io/serviceaccount" \
-  -e "BATTLEGROUP=$BATTLEGROUP_ID" \
-  -e "BATTLEGROUP_DISPLAY_NAME=$BATTLEGROUP_ID" \
-  -e "BATTLEGROUP_TITLE=$SERVER_TITLE" \
-  -e "BATTLEGROUP_REGION_NAME=$SERVER_REGION" \
-  -e "FuncomLiveServices__ServiceAuthToken=$FUNCOM_TOKEN" \
-  -e "FuncomLiveServices__RmqTlsEnabled=true" \
-  -e "RMQ_HTTP_TOKEN_AUTH_SECRET=$RMQ_HTTP_TOKEN_AUTH_SECRET" \
-  -e "AuthenticationConfiguration__DefaultScheme=BackendLogin" \
-  -e "AuthenticationConfiguration__DefaultAuthenticateScheme=BackendLogin" \
-  -e "AuthenticationConfiguration__DefaultChallengeScheme=BackendLogin" \
-  -e "AuthenticationConfiguration__AuthenticationScheme=BackendLogin" \
-  -e "AuthenticationConfiguration__RequireAuthenticatedSignIn=false" \
-  -e "DUNE_SERVER_LOGIN_PASSWORD_SECRET=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "DUNE_USERNAME_SERVER_LOGIN_SECRET=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "DUNE_LOGIN_PASSWORD_SKEW_SECONDS=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "BackendLoginConfiguration__Secret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "BackendLoginConfiguration__UsernameServerLoginSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "BackendLoginConfiguration__ServerLoginPasswordSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET" \
-  -e "BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "BackendLoginConfiguration__LoginPasswordSkew=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__Secret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__UsernameServerLoginSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginPasswordSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__LoginPasswordSkew=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__Secret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__UsernameServerLoginSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__ServerLoginPasswordSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__LoginPasswordSkew=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__Secret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__UsernameServerLoginSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__ServerLoginPasswordSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__LoginPasswordSkew=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "fls-apikey=$FLS_APIKEY" \
-  -e "HOST_DATACENTER_ID=${SERVER_PROVIDER:-dune-docker}" \
-  -e "HOST_DATACENTER_IP_ADDRESS=$SERVER_IP" \
-  -e "ASPNETCORE_URLS=http://0.0.0.0:11717" \
-  -e "DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE=false" \
-  -e "Database_address=dune-postgres:5432" \
-  -e "Database_name=dune" \
-  -e "Database_user=dune" \
-  -e "Database_password=dune" \
-  "$IMAGE" \
-  --RMQGameHostname=dune-rmq-game \
-  --RMQGamePort=5672 \
-  --RMQAdminHostname=dune-rmq-admin \
-  --RMQAdminPort=5672
+dune_systemctl stop dune-director.service 2>/dev/null || true
+engine rm -f dune-director 2>/dev/null || true
+
+ensure_quadlet_foundation
+
+quadlet_write dune-director.container <<EOF
+# Generated by runtime/scripts/start-director.sh. Do not edit by hand.
+[Unit]
+Description=Dune Awakening battlegroup director
+
+[Container]
+ContainerName=dune-director
+Image=${IMAGE}
+Pull=never
+Network=dune-net.network
+PublishPort=127.0.0.1:11717:11717/tcp
+Volume=${REPO_DIR}/runtime/director/config/director_config.ini:/Tools/Battlegroups/Director/BattlegroupDirector/director_config.ini:ro,z
+Volume=${REPO_DIR}/runtime/generated/director-bundle:/opt/dune-director-bundle:z
+Volume=${FAKE_K8S_SERVICEACCOUNT_DIR}:/run/secrets/kubernetes.io/serviceaccount:ro,z
+Environment="DOTNET_BUNDLE_EXTRACT_BASE_DIR=/opt/dune-director-bundle"
+Environment="KUBERNETES_SERVICE_HOST=igwo.local"
+Environment="KUBERNETES_SERVICE_PORT=6443"
+Environment="KUBERNETES_SERVICE_PORT_HTTPS=6443"
+Environment="KUBERNETES_SERVICE_PATH=/run/secrets/kubernetes.io/serviceaccount"
+Environment="BATTLEGROUP=${BATTLEGROUP_ID}"
+Environment="BATTLEGROUP_DISPLAY_NAME=${BATTLEGROUP_ID}"
+Environment="BATTLEGROUP_TITLE=${SERVER_TITLE}"
+Environment="BATTLEGROUP_REGION_NAME=${SERVER_REGION}"
+Environment="FuncomLiveServices__ServiceAuthToken=${FUNCOM_TOKEN}"
+Environment="FuncomLiveServices__RmqTlsEnabled=true"
+Environment="RMQ_HTTP_TOKEN_AUTH_SECRET=${RMQ_HTTP_TOKEN_AUTH_SECRET}"
+Environment="AuthenticationConfiguration__DefaultScheme=BackendLogin"
+Environment="AuthenticationConfiguration__DefaultAuthenticateScheme=BackendLogin"
+Environment="AuthenticationConfiguration__DefaultChallengeScheme=BackendLogin"
+Environment="AuthenticationConfiguration__AuthenticationScheme=BackendLogin"
+Environment="AuthenticationConfiguration__RequireAuthenticatedSignIn=false"
+Environment="DUNE_SERVER_LOGIN_PASSWORD_SECRET=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="DUNE_USERNAME_SERVER_LOGIN_SECRET=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="DUNE_LOGIN_PASSWORD_SKEW_SECONDS=${LOGIN_PASSWORD_SKEW_SECONDS}"
+Environment="BackendLoginConfiguration__Secret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="BackendLoginConfiguration__UsernameServerLoginSecret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="BackendLoginConfiguration__ServerLoginPasswordSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET"
+Environment="BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET"
+Environment="BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS"
+Environment="BackendLoginConfiguration__LoginPasswordSkew=${LOGIN_PASSWORD_SKEW_SECONDS}"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__Secret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__UsernameServerLoginSecret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginPasswordSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__LoginPasswordSkew=${LOGIN_PASSWORD_SKEW_SECONDS}"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__Secret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__UsernameServerLoginSecret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__ServerLoginPasswordSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__LoginPasswordSkew=${LOGIN_PASSWORD_SKEW_SECONDS}"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__Secret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__UsernameServerLoginSecret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__ServerLoginPasswordSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS"
+Environment="AuthenticationConfiguration__SchemeMap__BackendLogin__BackendLoginConfiguration__LoginPasswordSkew=${LOGIN_PASSWORD_SKEW_SECONDS}"
+Environment="HOST_DATACENTER_ID=${SERVER_PROVIDER:-dune-docker}"
+Environment="HOST_DATACENTER_IP_ADDRESS=${SERVER_IP}"
+Environment="ASPNETCORE_URLS=http://0.0.0.0:11717"
+Environment="DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE=false"
+Environment="Database_address=dune-postgres:5432"
+Environment="Database_name=dune"
+Environment="Database_user=dune"
+Environment="Database_password=dune"
+PodmanArgs=--env=fls-apikey=${FLS_APIKEY}
+Exec=--RMQGameHostname=dune-rmq-game --RMQGamePort=5672 --RMQAdminHostname=dune-rmq-admin --RMQAdminPort=5672
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+quadlet_reload
+dune_systemctl start dune-director.service
 
 sleep 12
 
-docker ps --filter "name=dune-director" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+engine ps --filter "name=dune-director" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
 echo
 echo "=== director logs ==="
-docker logs --tail 160 dune-director
+engine logs --tail 160 dune-director

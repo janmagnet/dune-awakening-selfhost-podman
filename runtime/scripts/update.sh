@@ -53,8 +53,8 @@ EOF
       cat > "$AUTO_SERVICE_FILE" <<EOF
 [Unit]
 Description=Dune Awakening self-host auto update
-Wants=docker.service
-After=network-online.target docker.service
+Wants=podman.socket
+After=network-online.target podman.socket
 
 [Service]
 Type=oneshot
@@ -144,7 +144,7 @@ if [ "$cmd" = "check" ] || [ "$cmd" = "status" ]; then
   echo
   echo "=== Check Steam for available update ==="
 
-  docker compose exec -T -e APP_ID="$APP_ID" orchestrator bash -lc '
+  engine exec -e APP_ID="$APP_ID" dune-orchestrator bash -lc '
 set -euo pipefail
 
 STEAMCMD_SH=/srv/dune/steam/steamcmd.sh
@@ -303,11 +303,11 @@ if [ "$assume_yes" != "1" ]; then
 fi
 
 echo
-echo "=== Check Docker volume free space ==="
-docker compose exec -T \
+echo "=== Check Podman volume free space ==="
+engine exec \
   -e DUNE_MIN_FREE_GB="${DUNE_MIN_FREE_GB:-25}" \
   -e DUNE_SKIP_DISK_CHECK="${DUNE_SKIP_DISK_CHECK:-}" \
-  orchestrator dune preflight
+  dune-orchestrator dune preflight
 
 echo
 echo "=== Stop game servers before update ==="
@@ -326,7 +326,7 @@ while [ "$steam_attempt" -le "$steam_max_attempts" ]; do
   echo "SteamCMD install attempt $steam_attempt/$steam_max_attempts..."
 
   set +e
-  docker compose exec -T -e APP_ID="$APP_ID" orchestrator dune download
+  engine exec -e APP_ID="$APP_ID" dune-orchestrator dune download
   steam_rc=$?
   set -e
 
@@ -360,13 +360,13 @@ if [ "$steam_ok" != "1" ]; then
   echo "SteamCMD failed after $steam_max_attempts attempts."
   echo
   echo "Most common fresh-install causes:"
-  echo "  - Docker volume storage has too little free disk space."
+  echo "  - Podman storage has too little free disk space."
   echo "  - Steam temporarily rejected the anonymous depot request."
   echo "  - SteamCMD cache/metadata is stale after a Steam-side app change."
   echo
   echo "Useful checks:"
-  echo "  docker exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache"
-  echo "  docker exec dune-orchestrator tail -n 80 /home/dune/Steam/logs/stderr.txt"
+  echo "  podman exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache"
+  echo "  podman exec dune-orchestrator tail -n 80 /home/dune/Steam/logs/stderr.txt"
   echo
   echo "You can retry safely with:"
   echo "  runtime/scripts/update.sh install"
@@ -375,11 +375,11 @@ fi
 
 echo
 echo "=== Load updated Funcom image tarballs ==="
-docker compose exec -T orchestrator bash -lc '
+engine exec dune-orchestrator bash -lc '
 set -euo pipefail
 find /srv/dune/server/images -type f \( -name "*.tar" -o -name "*.tar.gz" -o -name "*.tgz" \) | sort | while read -r tar; do
-  echo ">>> docker load -i $tar"
-  docker load -i "$tar"
+  echo ">>> podman load -i $tar"
+  podman load -i "$tar"
 done
 '
 
@@ -421,15 +421,15 @@ if [ "$cmd" = "install" ]; then
   fi
 
   echo "Applying $partition_count world partitions..."
-  docker exec -i dune-postgres psql -U dune -d dune < "$partition_sql"
+  engine exec -i dune-postgres psql -U dune -d dune < "$partition_sql"
 
   echo
   echo "=== Verify world partitions ==="
-  docker exec dune-postgres psql -U dune -d dune -c "
+  engine exec dune-postgres psql -U dune -d dune -c "
 select count(*) as world_partition_rows from world_partition;
 "
 
-  actual_count="$(docker exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" | tr -d '[:space:]')"
+  actual_count="$(engine exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" | tr -d '[:space:]')"
 
   if [ "${actual_count:-0}" -le 0 ]; then
     echo "world_partition is still empty after applying generated SQL."

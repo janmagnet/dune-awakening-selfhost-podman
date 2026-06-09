@@ -5,26 +5,41 @@ cd "$(dirname "$0")/../.."
 
 mkdir -p runtime/secrets runtime/generated
 
-require_docker_prereqs() {
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "Docker is required but was not found in PATH."
-    echo
-    echo "Use this command to install Docker Engine and Docker Compose:"
-    echo '  sudo apt-get update && sudo apt-get install -y ca-certificates curl && sudo install -m 0755 -d /etc/apt/keyrings && sudo curl -fsSL https://download.docker.com/linux/$(. /etc/os-release && echo "$ID")/gpg -o /etc/apt/keyrings/docker.asc && sudo chmod a+r /etc/apt/keyrings/docker.asc && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null && sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && sudo systemctl enable --now docker && docker --version && docker compose version'
-    echo
-    echo "Then run:"
-    echo "  dune init"
+source runtime/scripts/engine.sh
+
+require_podman_prereqs() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "This project runs rootful Podman and installs systemd Quadlet units."
+    echo "Re-run init as root, for example:"
+    echo "  sudo dune init"
     exit 1
   fi
 
-  if ! docker info >/dev/null 2>&1; then
-    echo "Docker is installed, but the Docker daemon is not reachable."
+  if ! command -v podman >/dev/null 2>&1; then
+    echo "Podman is required but was not found in PATH."
     echo
-    echo "Make sure Docker is running and that your user can access it."
-    echo "Common fixes:"
-    echo "  sudo systemctl enable --now docker"
-    echo "  sudo usermod -aG docker \$USER"
-    echo "  newgrp docker"
+    echo "Install Podman (4.4+ for Quadlet) with your OS package manager:"
+    echo "  Fedora / Fedora CoreOS : already included (rpm-ostree install podman if missing)"
+    echo "  RHEL / Rocky / Alma    : sudo dnf install -y podman"
+    echo "  Debian / Ubuntu        : sudo apt-get update && sudo apt-get install -y podman"
+    echo
+    echo "Then run:"
+    echo "  sudo dune init"
+    exit 1
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemd (systemctl) is required to run Podman Quadlet units, but was not found."
+    exit 1
+  fi
+
+  # Rootful Podman API socket: used by the orchestrator and autoscaler containers.
+  systemctl enable --now podman.socket >/dev/null 2>&1 || true
+
+  if ! podman info >/dev/null 2>&1; then
+    echo "Podman is installed, but 'podman info' failed for root."
+    echo "Make sure Podman works for the root user, then re-run:"
+    echo "  sudo dune init"
     exit 1
   fi
 }
@@ -113,10 +128,10 @@ detect_lan_ip() {
 
 check_running_stack() {
   local running
-  running="$(docker ps --filter "name=dune-" --format "{{.Names}}" | grep -v '^dune-orchestrator$' || true)"
+  running="$(engine ps --filter "name=dune-" --format "{{.Names}}" | grep -v '^dune-orchestrator$' || true)"
 
   if [ -n "$running" ]; then
-    echo "A Dune Docker stack appears to be running:"
+    echo "A Dune Podman stack appears to be running:"
     echo "$running" | sed 's/^/  /'
     echo
     echo "Running init can overwrite local config and restart services."
@@ -169,9 +184,9 @@ fresh_reset_runtime() {
   echo
   echo "Resetting Postgres volume for fresh init..."
 
-  if docker volume inspect dune-postgres-data >/dev/null 2>&1; then
+  if engine volume inspect dune-postgres-data >/dev/null 2>&1; then
     local volume_mount
-    volume_mount="$(docker volume inspect -f '{{ .Mountpoint }}' dune-postgres-data 2>/dev/null || true)"
+    volume_mount="$(engine volume inspect -f '{{ .Mountpoint }}' dune-postgres-data 2>/dev/null || true)"
 
     if [ -n "$volume_mount" ] && [ -d "$volume_mount" ]; then
       echo "Backing up existing Postgres volume..."
@@ -182,7 +197,7 @@ fresh_reset_runtime() {
       echo "Could not find Postgres volume mountpoint; skipping volume tar backup."
     fi
 
-    docker volume rm dune-postgres-data >/dev/null
+    engine volume rm dune-postgres-data >/dev/null
     echo "Removed old Postgres volume: dune-postgres-data"
   else
     echo "No existing Postgres volume found."
@@ -225,16 +240,16 @@ print(f"sh-{host_id}-{suffix}")
 PY
 }
 
-echo "=== Dune Awakening Docker first-time init ==="
+echo "=== Dune Awakening Podman first-time init ==="
 echo
 echo "This will create local config, save your Funcom token locally, generate a battlegroup ID,"
-echo "download/load server assets, run DB setup/update, and start the Docker stack."
+echo "download/load server assets, run DB setup/update, and start the Podman stack."
 echo
 echo "Important: dune init creates a fresh local world and resets the local Postgres database."
 echo "Existing local config/state is backed up first, but players should treat this as a reset."
 echo
 
-require_docker_prereqs
+require_podman_prereqs
 check_running_stack
 confirm_overwrite
 
@@ -383,8 +398,13 @@ echo "Generated battlegroup ID:"
 echo "  $BATTLEGROUP_ID"
 
 echo
-echo "Starting orchestrator container..."
-docker compose up -d --build orchestrator
+echo "Building orchestrator image..."
+engine build -t dune-orchestrator:dev ./orchestrator
+
+echo
+echo "Installing Quadlet units and starting orchestrator container..."
+runtime/scripts/render-quadlet.sh
+dune_systemctl start dune-orchestrator.service
 
 echo
 echo "Downloading/loading assets and running database setup/update..."

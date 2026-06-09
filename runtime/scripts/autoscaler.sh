@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 INTERVAL="${DUNE_AUTOSCALER_INTERVAL:-5}"
 SINCE="${DUNE_AUTOSCALER_LOG_SINCE:-30s}"
 NAMED_DESTINATION_SINCE="${DUNE_AUTOSCALER_NAMED_DESTINATION_LOG_SINCE:-10m}"
@@ -27,7 +29,7 @@ touch "$HUB_TRAVEL_FILE"
 touch "$DEEPDESERT_TRAVEL_FILE"
 touch "$DIRECTOR_HEAL_FILE"
 
-echo "=== Dune Docker autoscaler ==="
+echo "=== Dune Podman autoscaler ==="
 echo "Watching Director travel queues and idle dynamic servers."
 echo "Interval: ${INTERVAL}s"
 echo "Log window: ${SINCE}"
@@ -38,18 +40,18 @@ echo "Travel grace: ${TRAVEL_GRACE_SECONDS}s"
 echo "State file: ${STATE_FILE}"
 echo
 
-if ! docker ps --format '{{.Names}}' | grep -qx dune-director; then
+if ! engine ps --format '{{.Names}}' | grep -qx dune-director; then
   echo "dune-director is not running."
   exit 1
 fi
 
-if ! docker ps --format '{{.Names}}' | grep -qx dune-postgres; then
+if ! engine ps --format '{{.Names}}' | grep -qx dune-postgres; then
   echo "dune-postgres is not running."
   exit 1
 fi
 
 psql_value() {
-  docker exec dune-postgres psql -U postgres -d dune -Atc "$1"
+  engine exec dune-postgres psql -U postgres -d dune -Atc "$1"
 }
 
 hub_origin_id_for_map() {
@@ -100,7 +102,7 @@ publish_rmq_json() {
 
   payload_b64="$(printf '%s' "$payload_json" | base64 -w0)"
   eval_code='Payload = base64:decode(<<"'"$payload_b64"'">>), XName = rabbit_misc:r(<<"/">>, exchange, <<"'"$exchange"'">>), X = rabbit_exchange:lookup_or_die(XName), MsgId = list_to_binary("'"$label"'-" ++ integer_to_list(erlang:system_time(millisecond))), P = {list_to_atom("P_basic"), <<"application/json">>, undefined, [], undefined, undefined, undefined, undefined, undefined, MsgId, undefined, undefined, <<"fls">>, <<"dune_autoscaler">>, undefined}, Content = rabbit_basic:build_content(P, Payload), {ok, Msg} = rabbit_basic:message(XName, <<"'"$routing_key"'">>, Content), Result = rabbit_queue_type:publish_at_most_once(X, Msg), io:format("publish=~p exchange='"$exchange"' routing='"$routing_key"' label='"$label"'~n", [Result]).'
-  output="$(docker exec dune-rmq-game rabbitmqctl eval "$eval_code" 2>&1)"
+  output="$(engine exec dune-rmq-game rabbitmqctl eval "$eval_code" 2>&1)"
   if [[ "$output" != *"publish=ok"* ]]; then
     echo "ERROR failed to publish $label via exchange=$exchange routing=$routing_key"
     echo "$output"
@@ -125,7 +127,7 @@ replay_hagga_travel_handoff() {
   [ -n "$origin_server_id" ] || return 0
 
   director_log_file="$(mktemp)"
-  docker logs --since "$NAMED_DESTINATION_SINCE" dune-director > "$director_log_file" 2>&1 || true
+  engine logs --since "$NAMED_DESTINATION_SINCE" dune-director > "$director_log_file" 2>&1 || true
   replay_rows="$(FLOW_ID="$flow_id" ORIGIN_ID="$origin_id" LOG_FILE="$director_log_file" python3 - <<'PY'
 import base64
 import json
@@ -238,7 +240,7 @@ container_count_for_map() {
   local safe
   safe="$(echo "$map" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')"
 
-  docker ps --format '{{.Names}}' | grep -Ec "^dune-server-${safe}-[0-9]+$" || true
+  engine ps --format '{{.Names}}' | grep -Ec "^dune-server-${safe}-[0-9]+$" || true
 }
 
 max_dimensions_for_map() {
@@ -372,7 +374,7 @@ dynamic_container_name_for_partition() {
     Survival_1|Overmap) return 1 ;;
   esac
   safe="$(echo "$map_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')"
-  docker ps --format '{{.Names}}' | grep -E "^dune-server-${safe}-${partition_id}$" | head -n1
+  engine ps --format '{{.Names}}' | grep -E "^dune-server-${safe}-${partition_id}$" | head -n1
 }
 
 dynamic_ready_desync_heal() {
@@ -401,7 +403,7 @@ dynamic_ready_desync_heal() {
     container="$(dynamic_container_name_for_partition "$partition_id" 2>/dev/null || true)"
     [ -n "$container" ] || continue
 
-    log_tail="$(docker logs --since 10m "$container" 2>&1 | tail -220 || true)"
+    log_tail="$(engine logs --since 10m "$container" 2>&1 | tail -220 || true)"
     if [[ "$log_tail" != *"Server farm is READY"* ]]; then
       continue
     fi
@@ -541,7 +543,7 @@ order by wp.dimension_index, wp.partition_id
 limit 1;
 """
 proc = subprocess.run(
-    ["docker", "exec", "dune-postgres", "psql", "-U", "postgres", "-d", "dune", "-AtF", "|", "-c", sql],
+    ["podman", "exec", "dune-postgres", "psql", "-U", "postgres", "-d", "dune", "-AtF", "|", "-c", sql],
     capture_output=True,
     text=True,
     check=False,
@@ -582,7 +584,7 @@ order by wp.partition_id
 limit 1;
 """
 proc = subprocess.run(
-    ["docker", "exec", "dune-postgres", "psql", "-U", "postgres", "-d", "dune", "-AtF", "|", "-c", sql],
+    ["podman", "exec", "dune-postgres", "psql", "-U", "postgres", "-d", "dune", "-AtF", "|", "-c", sql],
     capture_output=True,
     text=True,
     check=False,
@@ -607,7 +609,7 @@ scan_proactive_hagga_handoffs() {
   [ -n "$target_json" ] || return 0
 
   director_log_file="$(mktemp)"
-  docker logs --since "$SINCE" dune-director > "$director_log_file" 2>&1 || true
+  engine logs --since "$SINCE" dune-director > "$director_log_file" 2>&1 || true
   proactive_rows="$(TARGET_JSON="$target_json" LOG_FILE="$director_log_file" python3 - <<'PY'
 import json
 import os
@@ -699,7 +701,7 @@ PY
 
 follow_director_hagga_handoffs() {
   while true; do
-    docker logs -f --since 0s dune-director 2>&1 | TARGET_JSON="$(survival_partition_target_json 2>/dev/null || true)" python3 -u - <<'PY' | while IFS='|' read -r flow_id origin_id payload_json; do
+    engine logs -f --since 0s dune-director 2>&1 | TARGET_JSON="$(survival_partition_target_json 2>/dev/null || true)" python3 -u - <<'PY' | while IFS='|' read -r flow_id origin_id payload_json; do
 import json
 import os
 import re
@@ -794,7 +796,7 @@ scan_deepdesert_loading_responses() {
   [ -n "$target_json" ] || return 0
 
   director_log_file="$(mktemp)"
-  docker logs --since "$SINCE" dune-director > "$director_log_file" 2>&1 || true
+  engine logs --since "$SINCE" dune-director > "$director_log_file" 2>&1 || true
   pending_rows="$(TARGET_JSON="$target_json" LOG_FILE="$director_log_file" python3 - <<'PY'
 import json
 import os
@@ -1385,10 +1387,10 @@ scan_social_hub_travel_handoffs() {
     [ -n "$destination_map" ] || continue
     container="$(hub_container_for_map "$source_map" 2>/dev/null || true)"
     [ -n "$container" ] || continue
-    docker ps --format '{{.Names}}' | grep -qx "$container" || continue
+    engine ps --format '{{.Names}}' | grep -qx "$container" || continue
 
     log_file="$(mktemp)"
-    docker logs --since "$SINCE" "$container" > "$log_file" 2>&1 || true
+    engine logs --since "$SINCE" "$container" > "$log_file" 2>&1 || true
     handoff_rows="$(SOURCE_MAP="$source_map" DESTINATION_MAP="$destination_map" LOG_FILE="$log_file" python3 - <<'PY'
 import os
 import re
@@ -1489,10 +1491,10 @@ scan_named_destination_failures() {
   for source_map in SH_Arrakeen SH_HarkoVillage; do
     container="$(hub_container_for_map "$source_map" 2>/dev/null || true)"
     [ -n "$container" ] || continue
-    docker ps --format '{{.Names}}' | grep -qx "$container" || continue
+    engine ps --format '{{.Names}}' | grep -qx "$container" || continue
 
     log_file="$(mktemp)"
-    docker logs --since "$NAMED_DESTINATION_SINCE" "$container" > "$log_file" 2>&1 || true
+    engine logs --since "$NAMED_DESTINATION_SINCE" "$container" > "$log_file" 2>&1 || true
     handoff_rows="$(SOURCE_MAP="$source_map" LOG_FILE="$log_file" python3 - <<'PY'
 import os
 import re
@@ -1613,7 +1615,7 @@ PY
 }
 
 scan_idle_servers() {
-  docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+  engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
     select
       fs.map,
       fs.server_id,
@@ -1662,7 +1664,7 @@ scan_idle_servers() {
 }
 
 scan_reconnect_demand() {
-  docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+  engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
     select
       ps.account_id,
       coalesce(ps.server_id, ''),
@@ -1742,7 +1744,7 @@ scan_reconnect_demand() {
 }
 
 scan_live_player_partition_alignment() {
-  docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+  engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
     select
       ps.account_id,
       ps.server_id,
@@ -1784,7 +1786,7 @@ scan_travel_demand() {
   local demand_rows
 
   demand_rows="$(
-    docker logs --since "$SINCE" dune-director 2>&1 | python3 -c '
+    engine logs --since "$SINCE" dune-director 2>&1 | python3 -c '
 import re
 import sys
 
@@ -1830,7 +1832,7 @@ for line in sys.stdin:
 }
 
 director_live_server_rows() {
-  docker exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+  engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
     select map, server_id
     from dune.farm_state
     where map in ('Survival_1', 'Overmap', 'DeepDesert_1')
@@ -1842,7 +1844,7 @@ director_live_server_rows() {
 }
 
 director_latest_capacity() {
-  docker logs --since 10m dune-director 2>&1 \
+  engine logs --since 10m dune-director 2>&1 \
     | python3 -c '
 import json
 import re
@@ -1871,7 +1873,7 @@ director_logs_contain_live_ids() {
   local logs
   local missing=0
 
-  logs="$(docker logs --since 10m dune-director 2>&1 || true)"
+  logs="$(engine logs --since 10m dune-director 2>&1 || true)"
   while IFS='|' read -r map server_id; do
     [ -n "${server_id:-}" ] || continue
     if [[ "$logs" != *"$server_id"* ]]; then

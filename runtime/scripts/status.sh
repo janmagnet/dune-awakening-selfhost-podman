@@ -35,7 +35,7 @@ value_is_known() {
 
 is_running() {
   local name="$1"
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+  engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
 }
 
 is_private_ipv4() {
@@ -46,8 +46,8 @@ is_private_ipv4() {
 container_status() {
   local name="$1"
   if is_running "$name"; then
-    docker ps --filter "name=^${name}$" --format '{{.Status}}'
-  elif docker inspect "$name" >/dev/null 2>&1; then
+    engine ps --filter "name=^${name}$" --format '{{.Status}}'
+  elif engine inspect "$name" >/dev/null 2>&1; then
     echo "stopped"
     issue=1
   else
@@ -99,7 +99,7 @@ map_state() {
 
   if [ -n "$partition_id" ] && is_running dune-postgres; then
     farm_ready="$(
-      docker exec dune-postgres psql -U dune -d dune -Atc "
+      engine exec dune-postgres psql -U dune -d dune -Atc "
         select coalesce(fs.ready::text, 'f')
         from dune.world_partition wp
         left join dune.farm_state fs on fs.server_id = wp.server_id
@@ -113,7 +113,7 @@ map_state() {
     fi
   fi
 
-  logs="$(docker logs "$container" 2>&1 || true)"
+  logs="$(engine logs "$container" 2>&1 || true)"
 
   if grep -Eq "$pattern" <<< "$logs"; then
     echo "READY"
@@ -134,19 +134,19 @@ count_rmq_prefix() {
     return
   fi
 
-  docker exec dune-rmq-game rabbitmqctl list_connections user state 2>/dev/null \
+  engine exec dune-rmq-game rabbitmqctl list_connections user state 2>/dev/null \
     | awk -v prefix="$prefix" '$1 != "user" && index($1, prefix) == 1 && $2 == "running" { n++ } END { print n + 0 }'
 }
 
 recent_director_logs() {
   if is_running dune-director; then
-    docker logs --tail 5000 dune-director 2>&1 || true
+    engine logs --tail 5000 dune-director 2>&1 || true
   fi
 }
 
 recent_gateway_logs() {
   if is_running dune-server-gateway; then
-    docker logs --tail 5000 dune-server-gateway 2>&1 || true
+    engine logs --tail 5000 dune-server-gateway 2>&1 || true
   fi
 }
 
@@ -158,7 +158,7 @@ container_env_value() {
     return 1
   fi
 
-  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+  engine inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
     | awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); exit }'
 }
 
@@ -199,7 +199,7 @@ director_log_has() {
 }
 
 autoscaler_state() {
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-autoscaler; then
+  if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-autoscaler; then
     echo "RUNNING"
   else
     echo "STOPPED"
@@ -301,7 +301,7 @@ overmap_s2s_udp="$(check_udp "$overmap_s2s_port")"
 
 partition_count="unknown"
 if is_running dune-postgres; then
-  partition_count="$(docker exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" 2>/dev/null | tr -d '[:space:]' || true)"
+  partition_count="$(engine exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" 2>/dev/null | tr -d '[:space:]' || true)"
   if [ "${partition_count:-0}" -le 0 ] 2>/dev/null; then
     issue=1
   fi

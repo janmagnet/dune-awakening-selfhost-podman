@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+source runtime/scripts/engine.sh
+
 failures=0
 
 ok() { printf 'OK   %s\n' "$*"; }
@@ -179,7 +181,7 @@ assert usersettings["partitions"]["55"]["userengine"]["server_display_name"] == 
 print("OK   usersettings mirror survives 1 -> 2 -> 1 -> recreated 2")
 PY
 
-if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
   if runtime/scripts/sietches.sh sync >/tmp/dune-sietch-sync.out 2>/tmp/dune-sietch-sync.err; then
     ok "live sietch sync"
   else
@@ -221,7 +223,7 @@ usersettings = json.loads(Path("runtime/generated/usersettings.json").read_text(
 target = int(config.get("maps", {}).get("Survival_1", {}).get("active_dimensions") or 1)
 
 rows_raw = subprocess.check_output([
-    "docker", "exec", "dune-postgres", "psql",
+    "podman", "exec", "dune-postgres", "psql",
     "-U", "postgres", "-d", "dune", "-At", "-F", "\t",
     "-c",
     "select wp.partition_id, wp.dimension_index, coalesce(wp.server_id, ''), coalesce(wp.label, '') "

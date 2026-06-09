@@ -9,6 +9,7 @@ cd "$(dirname "$0")/../.."
 [ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
 source runtime/scripts/runtime-env.sh
 source runtime/scripts/image-tags.sh
+require_quadlet_privileges || exit 1
 WORLD_IMAGE_TAG="$(resolve_world_image_tag)"
 IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server:${WORLD_IMAGE_TAG}"
 
@@ -37,14 +38,14 @@ PARTITION_ID="${DUNE_SURVIVAL_PARTITION_ID:-1}"
 if [ -n "${DUNE_FAKE_K8S_SERVICEACCOUNT_DIR:-}" ]; then
   FAKE_K8S_SERVICEACCOUNT_DIR="$DUNE_FAKE_K8S_SERVICEACCOUNT_DIR"
 else
-  FAKE_K8S_SERVICEACCOUNT_DIR="$PWD/runtime/generated/dune-fake-k8s-serviceaccount-survival-1-$$"
+  FAKE_K8S_SERVICEACCOUNT_DIR="$PWD/runtime/generated/dune-fake-k8s-serviceaccount-survival-1"
 fi
 
 
 MULTIHOME_IP="$(resolve_bind_ip)"
 
 psql_value() {
-  docker exec dune-postgres psql -U postgres -d dune -Atc "$1"
+  engine exec dune-postgres psql -U postgres -d dune -Atc "$1"
 }
 
 bind_partition_to_live_server() {
@@ -69,7 +70,7 @@ bind_partition_to_live_server() {
     " | tr -d '\r[:space:]')"
 
     if [ -n "$live_server_id" ]; then
-      docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+      engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 begin;
 update dune.world_partition
 set server_id = '$live_server_id'
@@ -109,7 +110,7 @@ chmod -R 755 "$FAKE_K8S_SERVICEACCOUNT_DIR"
 mapfile -t SIETCH_RUNTIME_ARGS < <(runtime/scripts/sietches.sh runtime-args Survival_1 "$PARTITION_ID" 2>/dev/null || true)
 mapfile -t LOG_RUNTIME_ARGS < <(full_stdout_log_args)
 
-docker exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
 begin;
 delete from dune.farm_state
 where map = 'Survival_1'
@@ -122,89 +123,87 @@ where map = 'Survival_1'
 commit;
 " >/dev/null
 
-docker rm -f dune-server-survival-1 2>/dev/null || true
+REPO_DIR="$(pwd)"
 
-docker run -d \
-  --name dune-server-survival-1 \
-  --network host \
-  --restart unless-stopped \
-  --privileged \
-  --cap-add SYS_ADMIN \
-  --security-opt seccomp=unconfined \
-  --memory "$MEMORY" \
-  --memory-reservation "$MEMORY" \
-  -v "$PWD/runtime/game/survival-1/Saved:/home/dune/server/DuneSandbox/Saved" \
-  -v "$PWD/runtime/game/artifacts:/home/dune/artifacts" \
-  -v "$PWD/runtime/container:/opt/dune-local:ro" \
-  -v "$FAKE_K8S_SERVICEACCOUNT_DIR:/run/secrets/kubernetes.io/serviceaccount:ro" \
-  -e "POD_UID=docker-survival-1" \
-  -e "POD_NAME=${BATTLEGROUP_ID}-sg-survival-1-pod-1" \
-  -e "POD_IP=$MULTIHOME_IP" \
-  -e "EXTERNAL_ADDRESS_OVERRIDE=$SERVER_IP" \
-  -e "NODE_NAME=$(hostname)" \
-  -e "SERVER_INDEX=1" \
-  -e "FARM_NAME=$BATTLEGROUP_ID" \
-  -e "BATTLEGROUP_NAME=$BATTLEGROUP_ID" \
-  -e "BATTLEGROUP=$BATTLEGROUP_ID" \
-  -e "BATTLEGROUP_DISPLAY_NAME=$BATTLEGROUP_ID" \
-  -e "BATTLEGROUP_TITLE=$SERVER_TITLE" \
-  -e "FC_CRASHREPORTER_LOGS=/home/dune/server/DuneSandbox/Saved/CrashReporterLogs" \
-  -e "FuncomLiveServices__ServiceAuthToken=$FUNCOM_TOKEN" \
-  -e "FuncomLiveServices__RmqTlsEnabled=true" \
-  -e "RMQ_HTTP_TOKEN_AUTH_SECRET=$RMQ_HTTP_TOKEN_AUTH_SECRET" \
-  -e "DUNE_SERVER_LOGIN_PASSWORD_SECRET=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "DUNE_USERNAME_SERVER_LOGIN_SECRET=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "DUNE_LOGIN_PASSWORD_SKEW_SECONDS=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "ServerLoginPasswordSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "UsernameServerLoginSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "LoginPasswordSkew=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "BackendLoginConfiguration__ServerLoginPasswordSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "BackendLoginConfiguration__UsernameServerLoginSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "BackendLoginConfiguration__LoginPasswordSkew=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET" \
-  -e "BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginPasswordSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__UsernameServerLoginSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__LoginPasswordSkew=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "Secret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "UsernameSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "ServerLoginSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "ChecksumSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "BackendLoginConfiguration__Secret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "BackendLoginConfiguration__UsernameSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "BackendLoginConfiguration__ServerLoginSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "BackendLoginConfiguration__ChecksumSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__Secret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__UsernameSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__ChecksumSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "fls-apikey=$FLS_APIKEY" \
-  "$IMAGE" \
-  /opt/dune-local/run-server.sh \
-  Survival_1 \
-  "-FarmRegion=$SERVER_REGION" \
-  "-ini:engine:[FuncomLiveServices]:ServiceAuthToken=$FUNCOM_TOKEN" \
-  -RMQGameTlsEnabled=true \
-  "ServerName=$BATTLEGROUP_ID" \
-  "-MultiHome=$MULTIHOME_IP" \
-  -DatabaseName=dune \
-  -DatabaseHost=127.0.0.1:15432 \
-  -DatabaseUser=dune \
-  -DatabasePassword=dune \
-  "-PartitionIndex=$PARTITION_ID" \
-  "-ini:engine:[URL]:Port=$GAME_PORT" \
-  "-ini:engine:[URL]:IGWPort=$IGW_PORT" \
-  -battlegroup-director-url=127.0.0.1:11717 \
-  --RMQGameHostname=127.0.0.1 \
-  --RMQGamePort=31982 \
-  --RMQAdminHostname=127.0.0.1 \
-  --RMQAdminPort=32573 \
-  "${SIETCH_RUNTIME_ARGS[@]}" \
-  "${LOG_RUNTIME_ARGS[@]}"
+dune_systemctl stop dune-server-survival-1.service 2>/dev/null || true
+engine rm -f dune-server-survival-1 2>/dev/null || true
+
+ensure_quadlet_foundation
+
+quadlet_write dune-server-survival-1.container <<EOF
+# Generated by runtime/scripts/start-server-survival-1.sh. Do not edit by hand.
+[Unit]
+Description=Dune Awakening game server (Survival_1)
+
+[Container]
+ContainerName=dune-server-survival-1
+Image=${IMAGE}
+Pull=never
+Network=host
+AddCapability=SYS_ADMIN
+PodmanArgs=--privileged --security-opt=seccomp=unconfined --memory=${MEMORY} --memory-reservation=${MEMORY}
+Volume=${REPO_DIR}/runtime/game/survival-1/Saved:/home/dune/server/DuneSandbox/Saved:z
+Volume=${REPO_DIR}/runtime/game/artifacts:/home/dune/artifacts:z
+Volume=${REPO_DIR}/runtime/container:/opt/dune-local:ro,z
+Volume=${FAKE_K8S_SERVICEACCOUNT_DIR}:/run/secrets/kubernetes.io/serviceaccount:ro,z
+Environment="POD_UID=docker-survival-1"
+Environment="POD_NAME=${BATTLEGROUP_ID}-sg-survival-1-pod-1"
+Environment="POD_IP=${MULTIHOME_IP}"
+Environment="EXTERNAL_ADDRESS_OVERRIDE=${SERVER_IP}"
+Environment="NODE_NAME=$(hostname)"
+Environment="SERVER_INDEX=1"
+Environment="FARM_NAME=${BATTLEGROUP_ID}"
+Environment="BATTLEGROUP_NAME=${BATTLEGROUP_ID}"
+Environment="BATTLEGROUP=${BATTLEGROUP_ID}"
+Environment="BATTLEGROUP_DISPLAY_NAME=${BATTLEGROUP_ID}"
+Environment="BATTLEGROUP_TITLE=${SERVER_TITLE}"
+Environment="FC_CRASHREPORTER_LOGS=/home/dune/server/DuneSandbox/Saved/CrashReporterLogs"
+Environment="FuncomLiveServices__ServiceAuthToken=${FUNCOM_TOKEN}"
+Environment="FuncomLiveServices__RmqTlsEnabled=true"
+Environment="RMQ_HTTP_TOKEN_AUTH_SECRET=${RMQ_HTTP_TOKEN_AUTH_SECRET}"
+Environment="DUNE_SERVER_LOGIN_PASSWORD_SECRET=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="DUNE_USERNAME_SERVER_LOGIN_SECRET=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="DUNE_LOGIN_PASSWORD_SKEW_SECONDS=${LOGIN_PASSWORD_SKEW_SECONDS}"
+Environment="ServerLoginPasswordSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="UsernameServerLoginSecret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="LoginPasswordSkew=${LOGIN_PASSWORD_SKEW_SECONDS}"
+Environment="BackendLoginConfiguration__ServerLoginPasswordSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="BackendLoginConfiguration__UsernameServerLoginSecret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="BackendLoginConfiguration__LoginPasswordSkew=${LOGIN_PASSWORD_SKEW_SECONDS}"
+Environment="BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET"
+Environment="BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET"
+Environment="BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginPasswordSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__UsernameServerLoginSecret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__LoginPasswordSkew=${LOGIN_PASSWORD_SKEW_SECONDS}"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS"
+Environment="Secret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="UsernameSecret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="ServerLoginSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="ChecksumSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="BackendLoginConfiguration__Secret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="BackendLoginConfiguration__UsernameSecret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="BackendLoginConfiguration__ServerLoginSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="BackendLoginConfiguration__ChecksumSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__Secret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__UsernameSecret=${USERNAME_SERVER_LOGIN_SECRET}"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+Environment="AuthenticationConfiguration__BackendLoginConfiguration__ChecksumSecret=${SERVER_LOGIN_PASSWORD_SECRET}"
+PodmanArgs=--env=fls-apikey=${FLS_APIKEY}
+Exec=/opt/dune-local/run-server.sh Survival_1 "-FarmRegion=${SERVER_REGION}" "-ini:engine:[FuncomLiveServices]:ServiceAuthToken=${FUNCOM_TOKEN}" -RMQGameTlsEnabled=true "ServerName=${BATTLEGROUP_ID}" "-MultiHome=${MULTIHOME_IP}" -DatabaseName=dune -DatabaseHost=127.0.0.1:15432 -DatabaseUser=dune -DatabasePassword=dune "-PartitionIndex=${PARTITION_ID}" "-ini:engine:[URL]:Port=${GAME_PORT}" "-ini:engine:[URL]:IGWPort=${IGW_PORT}" -battlegroup-director-url=127.0.0.1:11717 --RMQGameHostname=127.0.0.1 --RMQGamePort=31982 --RMQAdminHostname=127.0.0.1 --RMQAdminPort=32573 ${SIETCH_RUNTIME_ARGS[*]} ${LOG_RUNTIME_ARGS[*]}
+
+[Service]
+Restart=always
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+quadlet_reload
+dune_systemctl start dune-server-survival-1.service
 
 sleep 20
 
@@ -212,8 +211,8 @@ if live_server_id="$(bind_partition_to_live_server "$PARTITION_ID" Survival_1 "$
   echo "Bound Survival_1 partition $PARTITION_ID to server_id: $live_server_id"
 fi
 
-docker ps --filter "name=dune-server-survival-1" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+engine ps --filter "name=dune-server-survival-1" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
 echo
 echo "=== survival logs ==="
-docker logs --tail 180 dune-server-survival-1
+engine logs --tail 180 dune-server-survival-1
