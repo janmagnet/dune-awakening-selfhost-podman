@@ -161,7 +161,7 @@ def download():
         print("", flush=True)
         print(f"[dune] SteamCMD app install failed with exit code {exc.returncode}.", flush=True)
         print("[dune] If SteamCMD printed \"state is 0x6\", common causes are:", flush=True)
-        print("[dune]   - not enough free disk space in Docker's volume storage", flush=True)
+        print("[dune]   - not enough free disk space in Podman's volume storage", flush=True)
         print("[dune]   - Steam temporarily refusing or failing the anonymous depot request", flush=True)
         print("[dune]   - Steam package/depot metadata changed and the local SteamCMD cache is stale", flush=True)
         print("[dune]   - network/CDN failure while contacting Steam", flush=True)

@@ -1,22 +1,16 @@
-# Dune Awakening Self-Host Docker
-
-> [!IMPORTANT]
-> A major update for this repository is currently in progress.
->
-> It has not been released yet. To follow development progress and stay up to date, join the Discord:  
-> [Dune: Awakening Docker](https://discord.gg/9pQqytu6BU)
+# Dune Awakening Self-Host Podman
 
 <p align="center">
   <img src="assets/cover.png" alt="Dune Awakening Self-Host Podman cover" />
 </p>
 
-![Docker](https://img.shields.io/badge/Docker-ready-brightgreen)
+![Podman](https://img.shields.io/badge/Podman-ready-brightgreen)
 ![Linux](https://img.shields.io/badge/Linux-supported-brightgreen)
 ![Self--Hosted](https://img.shields.io/badge/Self--Hosted-yes-brightgreen)
 ![Status](https://img.shields.io/badge/Status-experimental-orange)
 ![License](https://img.shields.io/badge/License-MIT-brightgreen)
 
-A community tool for running a self-hosted Dune: Awakening dedicated server with Docker.
+A community tool for running a self-hosted Dune: Awakening dedicated server with Podman.
 
 The easiest way to use this project is the guided menu:
 
@@ -241,7 +235,7 @@ sudo runtime/scripts/install-command.sh
 | `dune stop` | Stops autoscaler, publishers, game servers, Gateway, Director, TextRouter, RabbitMQ, and Postgres. | Players are disconnected. |
 | `dune status` | Full safe dashboard summary. | Good first troubleshooting command. |
 | `dune ready` | Fast OK/WAIT/FAIL readiness check. | Useful for scripts. |
-| `dune ps` | Shows Dune containers. | Docker-level view. |
+| `dune ps` | Shows Dune containers. | Podman-level view. |
 | `dune ports` | Shows expected/listening ports. | Use for firewall checks. |
 | `dune version` | Shows launcher/git/build/image/config info. | Useful before updates. |
 | `dune doctor` | Runs host, file, container, port, database, RabbitMQ, and service checks. | Start here when broken. |
@@ -344,7 +338,7 @@ dune deepdesert dual bootstrap
 dune deepdesert dual repair
 ```
 
-This is Docker-native. It does not use Kubernetes/k3s CRDs. It configures DeepDesert_1 dimensions and UserGame PvP/PvE routing. Funcom-controlled selector labels or Kanly badges may not match the server-side gameplay routing.
+This is Podman-native. It does not use Kubernetes/k3s CRDs. It configures DeepDesert_1 dimensions and UserGame PvP/PvE routing. Funcom-controlled selector labels or Kanly badges may not match the server-side gameplay routing.
 
 ### Database Commands
 
@@ -478,7 +472,7 @@ Generated runtime files live mostly under `runtime/generated/`. Local secrets li
 SERVER_IP=auto
 SERVER_TITLE="My Dune Server"
 SERVER_REGION="Europe Test"
-SERVER_PROVIDER="dune-docker"
+SERVER_PROVIDER="dune-podman"
 STEAM_APP_ID=4754530
 BATTLEGROUP_ID=
 ```
