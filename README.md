@@ -3,10 +3,6 @@
 > [!CAUTION]
 > This is a very early experimental Podman port of the excellent [Dune Awakening Self-Host Docker](https://github.com/Red-Blink/dune-awakening-selfhost-docker) tool by RedBlink. If in doubt then use the original Docker tool instead of this port.
 
-<p align="center">
-  <img src="assets/cover.png" alt="Dune Awakening Self-Host Podman cover" />
-</p>
-
 ![Podman](https://img.shields.io/badge/Podman-ready-brightgreen)
 ![Linux](https://img.shields.io/badge/Linux-supported-brightgreen)
 ![Self--Hosted](https://img.shields.io/badge/Self--Hosted-yes-brightgreen)
