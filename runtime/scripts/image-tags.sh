@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source runtime/scripts/engine.sh
-
 get_latest_local_tag() {
   local repo="$1"
-  engine images --format '{{.Repository}} {{.Tag}}' 2>/dev/null \
+  docker images --format '{{.Repository}} {{.Tag}}' 2>/dev/null \
     | awk -v repo="$repo" '$1 == repo && $2 != "<none>" { print $2 }' \
     | sort -rV \
     | head -n1
@@ -24,6 +22,23 @@ resolve_world_image_tag() {
   else
     printf '%s' "1968181-0-shipping"
   fi
+}
+
+resolve_game_server_image() {
+  local map_name="${1:-}" experimental_image=""
+  if [ "$map_name" = "Survival_1" ] && [ -f runtime/generated/experimental-tanks.json ]; then
+    experimental_image="$(DUNE_WORLD_IMAGE_TAG="$(resolve_world_image_tag)" python3 runtime/scripts/experimental_tanks.py resolve "$map_name")" || return 1
+    if [ -n "$experimental_image" ]; then
+      printf '%s' "$experimental_image"
+      return 0
+    fi
+  fi
+  if [ -n "${DUNE_GAME_SERVER_IMAGE:-}" ]; then
+    printf '%s' "$DUNE_GAME_SERVER_IMAGE"
+    return 0
+  fi
+
+  printf 'registry.funcom.com/funcom/self-hosting/seabass-server:%s' "$(resolve_world_image_tag)"
 }
 
 resolve_postgres_image_tag() {

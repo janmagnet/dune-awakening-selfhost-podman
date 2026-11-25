@@ -4,19 +4,22 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 [ -f .env ] && . ./.env
-[ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
-[ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+[ -r runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
 
 source runtime/scripts/image-tags.sh
+# shellcheck source=runtime/scripts/landsraad-instance-cleanup.sh
+source runtime/scripts/landsraad-instance-cleanup.sh
+
+# shellcheck source=runtime/scripts/lib/postgres.sh
+source runtime/scripts/lib/postgres.sh
+# shellcheck source=runtime/scripts/lib/container-lifecycle.sh
+# A missing helper (a partial copy of the scripts) must never stop a stop.
+source runtime/scripts/lib/container-lifecycle.sh 2>/dev/null || dune_container_removal_hook() { :; }
 
 ACTION="${1:-remove-stale}"
-WORLD_IMAGE_TAG="$(resolve_world_image_tag)"
-TARGET_IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server:${WORLD_IMAGE_TAG}"
+TARGET_IMAGE="$(resolve_game_server_image)"
 SERVER_ID_MAP_FILE="runtime/generated/autoscaler-server-ids.tsv"
-
-psql_value() {
-  engine exec dune-postgres psql -U postgres -d dune -Atc "$1"
-}
 
 is_world_game_container() {
   local name="$1"
@@ -50,12 +53,13 @@ remove_server_id_map() {
 
 cleanup_partition_assignment() {
   local partition_id="$1"
-  local server_id
+  local server_id map_name
 
   [ -n "$partition_id" ] || return 0
   server_id="$(psql_value "select coalesce(server_id, '') from dune.world_partition where partition_id = $partition_id limit 1;")"
+  map_name="$(psql_value "select coalesce(map, '') from dune.world_partition where partition_id = $partition_id limit 1;")"
 
-  engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+  dune_psql -v ON_ERROR_STOP=1 -c "
 begin;
 update dune.world_partition
 set server_id = null
@@ -74,6 +78,7 @@ commit;
 " >/dev/null
 
   remove_server_id_map "$server_id"
+  cleanup_landsraad_instance_after_shutdown "$map_name" "$partition_id"
 }
 
 remove_container() {
@@ -85,27 +90,35 @@ remove_container() {
   fi
 
   echo "Removing world server container: $name"
-  engine rm -f "$name" >/dev/null
+  dune_container_removal_hook "$name" recycle-world-game-servers
+  docker rm -f "$name" >/dev/null
 
-  if [ -n "$partition_id" ] && engine ps --format '{{.Names}}' | grep -qx dune-postgres; then
+  if [ -n "$partition_id" ] && docker ps --format '{{.Names}}' | grep -qx dune-postgres; then
     cleanup_partition_assignment "$partition_id"
   fi
 }
 
 remove_stale() {
-  local found=0
+  local found=0 map_name expected actual
   while IFS=$'\t' read -r name image; do
     [ -n "$name" ] || continue
     is_world_game_container "$name" || continue
-    if [ "$image" != "$TARGET_IMAGE" ]; then
+    map_name=""
+    case "$name" in
+      dune-server-survival-1|dune-server-survival-1-[0-9]*) map_name="Survival_1" ;;
+    esac
+    expected="$(resolve_game_server_image "$map_name")"
+    actual="$(docker inspect --format '{{.Image}}' "$name")"
+    expected="$(docker image inspect --format '{{.Id}}' "$expected")"
+    if [ "$actual" != "$expected" ]; then
       found=1
-      echo "Stale world server image detected: $name ($image != $TARGET_IMAGE)"
+      echo "Stale world server image detected: $name [$image] ($actual != $expected)"
       remove_container "$name"
     fi
-  done < <(engine ps -a --format '{{.Names}}\t{{.Image}}')
+  done < <(docker ps -a --format '{{.Names}}\t{{.Image}}')
 
   if [ "$found" -eq 0 ]; then
-    echo "No stale world server containers found for tag $WORLD_IMAGE_TAG."
+    echo "No stale world server containers found for image $TARGET_IMAGE."
   fi
 }
 
@@ -116,7 +129,7 @@ stop_all() {
     is_world_game_container "$name" || continue
     found=1
     remove_container "$name"
-  done < <(engine ps -a --format '{{.Names}}')
+  done < <(docker ps -a --format '{{.Names}}')
 
   if [ "$found" -eq 0 ]; then
     echo "No world server containers found."
@@ -135,7 +148,7 @@ stop_noncore() {
     esac
     found=1
     remove_container "$name"
-  done < <(engine ps -a --format '{{.Names}}')
+  done < <(docker ps -a --format '{{.Names}}')
 
   if [ "$found" -eq 0 ]; then
     echo "No non-core world server containers found."

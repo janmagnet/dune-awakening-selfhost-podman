@@ -1,28 +1,268 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
+# .env is runtime/operator-local and may not exist during static analysis.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-source runtime/scripts/engine.sh
-
+# Resolve this before dispatching so every child script and raw Docker Compose
+# command targets the same existing persistent volumes.
+. runtime/scripts/compose-project.sh
+DUNE_COMPOSE_PROJECT_NAME="$(dune_resolve_compose_project_name "$(pwd -P)")"
+export DUNE_COMPOSE_PROJECT_NAME
+export COMPOSE_PROJECT_NAME="$DUNE_COMPOSE_PROJECT_NAME"
 cmd="${1:-help}"
 target="${2:-}"
+
+case "$cmd:$target" in
+  console:status|console:url|console:help|console:--help|console:-h|console:|web:status|web:url|web:help|web:--help|web:-h|web:)
+    ;; # Console inspection does not need to persist configuration.
+  *)
+    if [ -f .env ] && [ -w .env ]; then
+      dune_persist_compose_project_name "$(pwd -P)" "$DUNE_COMPOSE_PROJECT_NAME"
+    fi
+    ;;
+esac
+
+auto_repair_stack_git_state() {
+  local version tag_commit head backup_dir remote
+
+  [ "${DUNE_SKIP_STACK_GIT_REPAIR:-0}" != "1" ] || return 0
+  [ -f VERSION ] || return 0
+  command -v git >/dev/null 2>&1 || return 0
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  remote="$(git remote get-url origin 2>/dev/null || true)"
+  [ -n "$remote" ] || return 0
+
+  version="$(tr -d '[:space:]' < VERSION)"
+  case "$version" in
+    v*) ;;
+    *) return 0 ;;
+  esac
+  [ -n "$(git status --porcelain -- VERSION 2>/dev/null || true)" ] || return 0
+
+  head="$(git rev-parse HEAD 2>/dev/null || true)"
+  tag_commit="$(git rev-parse -q --verify "refs/tags/${version}^{commit}" 2>/dev/null || true)"
+  if [ -z "$tag_commit" ]; then
+    git fetch --force --tags origin >/dev/null 2>&1 || return 0
+    git fetch --force origin "refs/tags/${version}:refs/tags/${version}" >/dev/null 2>&1 || true
+    tag_commit="$(git rev-parse -q --verify "refs/tags/${version}^{commit}" 2>/dev/null || true)"
+  fi
+  [ -n "$tag_commit" ] || return 0
+  [ "$head" != "$tag_commit" ] || return 0
+
+  echo "Stack Git state does not match installed VERSION ${version}."
+  echo "Repairing Git checkout so future stack updates track the correct release."
+  backup_dir="runtime/backups/self-update/git-state-repair-$(date +%Y%m%d-%H%M%S)-${version#v}"
+  mkdir -p "$backup_dir"
+  tar -czf "$backup_dir/project-files.tgz" \
+    --exclude='./.git' \
+    --exclude='./.env' \
+    --exclude='./runtime/generated' \
+    --exclude='./runtime/secrets' \
+    --exclude='./runtime/backups' \
+    --exclude='./runtime/game' \
+    --exclude='./runtime/text-router' \
+    --exclude='./work' \
+    . 2>/dev/null || true
+  echo "Current stack files backup:"
+  echo "  $backup_dir/project-files.tgz"
+  git reset --hard "$tag_commit"
+  echo "Stack Git state repaired to ${version}."
+}
+
+detect_web_console_ip() {
+  local ip=""
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i=1; i<=NF; i++) if ($i == "src") { print $(i + 1); exit } }' || true)"
+  fi
+  if [ -z "$ip" ] && command -v hostname >/dev/null 2>&1; then
+    ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -Ev '^(127\.|169\.254\.|172\.17\.|172\.18\.|172\.19\.|172\.2[0-9]\.|172\.3[0-1]\.)' | head -n1 || true)"
+  fi
+  printf '%s' "${ip:-127.0.0.1}"
+}
+
+print_web_console_url() {
+  local port="${ADMIN_BIND_PORT:-}"
+  if [ -z "$port" ] && [ -f .env ]; then
+    port="$(awk -F= '/^ADMIN_BIND_PORT=/ {print $2; exit}' .env | tr -d '[:space:]"'\''' || true)"
+  fi
+  port="${port:-8088}"
+  echo "Open Dune Docker Console in your browser:"
+  echo "  http://$(detect_web_console_ip):$port"
+}
+
+persist_env_value() {
+  local key="$1"
+  local value="$2"
+  local env_file=".env"
+  local tmp_file
+
+  touch "$env_file"
+  tmp_file="$(mktemp)"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { found = 0 }
+    $0 ~ "^" key "=" {
+      print key "=" value
+      found = 1
+      next
+    }
+    { print }
+    END {
+      if (!found) {
+        print key "=" value
+      }
+    }
+  ' "$env_file" >"$tmp_file"
+  mv "$tmp_file" "$env_file"
+}
+
+prepare_docker_socket_gid() {
+  if [ -z "${DOCKER_SOCKET_GID:-}" ] && [ -S /var/run/docker.sock ] && command -v stat >/dev/null 2>&1; then
+    DOCKER_SOCKET_GID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || true)"
+  fi
+  export DOCKER_SOCKET_GID="${DOCKER_SOCKET_GID:-0}"
+  persist_env_value DOCKER_SOCKET_GID "$DOCKER_SOCKET_GID"
+}
+
+command_can_sudo_reexec_safely() {
+  case "$cmd" in
+    status|ps|servers|ports|ping|ping-diagnostics|ready|logs|doctor)
+      return 0
+      ;;
+    metrics)
+      case "$target" in
+        ""|status|ps|logs|config|help|--help|-h)
+          return 0
+          ;;
+      esac
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ensure_docker_access_or_reexec() {
+  [ "${DUNE_SUDO_REEXEC:-0}" != "1" ] || return 0
+  [ "$(id -u)" -ne 0 ] || return 0
+  command_can_sudo_reexec_safely || return 0
+  command -v docker >/dev/null 2>&1 || return 0
+  docker info >/dev/null 2>&1 && return 0
+  command -v sudo >/dev/null 2>&1 || return 0
+  sudo -v || return 0
+  if sudo docker info >/dev/null 2>&1; then
+    echo "Docker access for this shell is not active yet; running this dune command with sudo."
+    exec sudo env \
+      "DUNE_SUDO_REEXEC=1" \
+      "DUNE_HOST_REPO_ROOT=${DUNE_HOST_REPO_ROOT:-$(pwd -P)}" \
+      "DUNE_COMPOSE_PROJECT_NAME=$DUNE_COMPOSE_PROJECT_NAME" \
+      "$0" "$@"
+  fi
+}
+
+start_compose_service_if_available() {
+  local compose_file="$1"
+  local service="$2"
+  local env_prefix="${3:-}"
+
+  if [ ! -f "$compose_file" ]; then
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker is not available; cannot start $service from $compose_file."
+    return 1
+  fi
+  if ! docker compose -f "$compose_file" config --services 2>/dev/null | grep -qx "$service"; then
+    echo "Compose service $service was not found in $compose_file."
+    return 1
+  fi
+  if docker ps --format '{{.Names}}' | grep -qx "$service"; then
+    return 0
+  fi
+
+  echo "Starting $service..."
+  case "$env_prefix" in
+    web)
+      prepare_docker_socket_gid
+      COMPOSE_PROJECT_NAME="${DUNE_WEB_COMPOSE_PROJECT_NAME:-dune-awakening-selfhost-docker}" DUNE_COMPOSE_PROJECT_NAME="$DUNE_COMPOSE_PROJECT_NAME" DUNE_HOST_REPO_ROOT="${DUNE_HOST_REPO_ROOT:-$(pwd -P)}" DUNE_HOST_UID="${DUNE_HOST_UID:-$(id -u)}" DUNE_HOST_GID="${DUNE_HOST_GID:-$(id -g)}" docker compose -f "$compose_file" up -d --build "$service"
+      ;;
+    *)
+      docker compose -f "$compose_file" up -d --build "$service"
+      ;;
+  esac
+}
+
+case "$cmd" in
+  init|help|--help|-h) ;;
+  *) [ "${DUNE_SUDO_REEXEC:-0}" = "1" ] || auto_repair_stack_git_state ;;
+esac
+
+ensure_docker_access_or_reexec "$@"
 
 case "$cmd" in
   init)
     runtime/scripts/init.sh
     ;;
 
+  experimental-tanks)
+    runtime/scripts/experimental-tanks.sh "${@:2}"
+    ;;
+
   manager|menu)
-    runtime/scripts/manager.sh
+    cat <<'EOF'
+The interactive CLI manager has moved to Dune Docker Console.
+
+Use dune --help to see available CLI commands for automation and troubleshooting.
+EOF
+    if [ -f docker-compose.web.yml ] && command -v docker >/dev/null 2>&1; then
+      prepare_docker_socket_gid
+      service="$(docker compose -f docker-compose.web.yml config --services 2>/dev/null | grep -E '^redblink-dune-docker-console$' | head -n1 || true)"
+      if [ -n "$service" ]; then
+        echo
+        if docker ps --format '{{.Names}}' | grep -qx redblink-dune-docker-console; then
+          echo "Dune Docker Console is already running."
+          print_web_console_url
+        else
+          echo "Starting Dune Docker Console..."
+          if COMPOSE_PROJECT_NAME="${DUNE_WEB_COMPOSE_PROJECT_NAME:-dune-awakening-selfhost-docker}" DUNE_COMPOSE_PROJECT_NAME="$DUNE_COMPOSE_PROJECT_NAME" DUNE_HOST_REPO_ROOT="${DUNE_HOST_REPO_ROOT:-$(pwd -P)}" DUNE_HOST_UID="${DUNE_HOST_UID:-$(id -u)}" DUNE_HOST_GID="${DUNE_HOST_GID:-$(id -g)}" docker compose -f docker-compose.web.yml up -d --build "$service"; then
+            echo "Dune Docker Console is running."
+            print_web_console_url
+          else
+            echo "Dune Docker Console could not be started automatically."
+            echo "Run: DUNE_HOST_REPO_ROOT=\"\$(pwd -P)\" docker compose -f docker-compose.web.yml up -d --build redblink-dune-docker-console"
+            exit 1
+          fi
+        fi
+        if [ -f runtime/secrets/admin-web-password.txt ]; then
+          echo
+          echo "Use your local admin password to sign in."
+        else
+          echo
+          echo "Run ./install.sh once if you need the first admin password shown again."
+        fi
+      else
+        echo
+        echo "Dune Docker Console service was not found in docker-compose.web.yml."
+      fi
+    else
+      echo
+      echo "Docker Compose or docker-compose.web.yml is unavailable."
+      echo "Run this from the repo root after Docker is available:"
+      echo "  docker compose -f docker-compose.web.yml up -d --build --force-recreate redblink-dune-docker-console"
+    fi
     ;;
 
   start)
-    runtime/scripts/start-all.sh
+    rm -f runtime/generated/manual-stop.env
+    start_compose_service_if_available docker-compose.yml orchestrator
+    start_compose_service_if_available docker-compose.web.yml redblink-dune-docker-console web
+    DUNE_IGNORE_MANUAL_STOP=1 runtime/scripts/start-all.sh
     ;;
 
   stop)
-    runtime/scripts/stop-all.sh
+    DUNE_MANUAL_STOP=1 runtime/scripts/stop-all.sh
     ;;
 
   status)
@@ -30,7 +270,7 @@ case "$cmd" in
     ;;
 
   ps)
-    engine ps --filter "name=dune-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    docker ps --filter "name=dune-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
     ;;
 
   servers)
@@ -50,6 +290,11 @@ case "$cmd" in
   autoscaler)
     shift || true
     if [ "$#" -eq 0 ]; then
+      # autoscaler.sh is configured entirely by its environment, because in
+      # normal operation it runs in a container that never sees .env and has the
+      # settings handed to it by start-autoscaler.sh. Running it in the
+      # foreground here has to do the same job.
+      set -a; [ -f .env ] && . ./.env; set +a
       runtime/scripts/autoscaler.sh
     else
       runtime/scripts/autoscaler-control.sh "$@"
@@ -73,20 +318,36 @@ case "$cmd" in
     runtime/scripts/logs.sh "$@"
     ;;
 
+  coriolis)
+    case "$target" in
+      status|"") runtime/scripts/coriolis-coordinator.sh status ;;
+      scan-once) runtime/scripts/coriolis-coordinator.sh scan-once ;;
+      *)
+        echo "Usage: runtime/scripts/dune coriolis [status|scan-once]" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+
   restart)
     case "$target" in
       survival|survival-1)
         set -a; [ -f .env ] && . ./.env; set +a
         runtime/scripts/start-server-survival-1.sh
+        runtime/scripts/spicefield-overrides.sh apply || true
         runtime/scripts/publish-sietch-overrides.sh restart || true
         runtime/scripts/publish-sietch-overrides.sh once || true
-        (
-          exec runtime/scripts/deferred-reconcile.sh
-        ) >/tmp/dune-deferred-reconcile.log 2>&1 &
+        # Scheduled, not backgrounded: a background child of this process dies
+        # with the console container that ran it, and the reconcile is a wait
+        # that can outlast a console reload by minutes.
+        DUNE_SKIP_SURVIVAL_DIRECTOR_REFRESH=1 runtime/scripts/schedule-deferred-reconcile.sh
         ;;
       overmap)
         set -a; [ -f .env ] && . ./.env; set +a
         runtime/scripts/start-server-overmap.sh
+        runtime/scripts/spicefield-overrides.sh apply || true
+        runtime/scripts/publish-network-server-state-overrides.sh restart || true
+        runtime/scripts/publish-network-server-state-overrides.sh once || true
         ;;
       gateway|sgw)
         set -a; [ -f .env ] && . ./.env; set +a
@@ -95,7 +356,11 @@ case "$cmd" in
         ;;
       director|bgd)
         set -a; [ -f .env ] && . ./.env; set +a
-        runtime/scripts/start-director.sh
+        runtime/scripts/restart-director.sh
+        runtime/scripts/spicefield-overrides.sh apply || true
+        runtime/scripts/publish-sietch-overrides.sh restart || true
+        runtime/scripts/publish-deepdesert-overrides.sh restart || true
+        runtime/scripts/publish-network-server-state-overrides.sh restart || true
         ;;
       text-router|tr)
         set -a; [ -f .env ] && . ./.env; set +a
@@ -110,6 +375,39 @@ case "$cmd" in
         exit 1
         ;;
     esac
+    ;;
+
+  stop-service)
+    case "$target" in
+      survival|survival-1)
+        runtime/scripts/stop-server-survival-1.sh
+        ;;
+      overmap)
+        runtime/scripts/stop-server-overmap.sh
+        ;;
+      "")
+        echo "Usage: runtime/scripts/dune stop-service <survival|overmap>"
+        exit 1
+        ;;
+      *)
+        echo "Unsupported stop-service target: $target"
+        exit 1
+        ;;
+    esac
+    ;;
+
+  stop-game-servers-for-db-writes)
+    runtime/scripts/stop-game-servers-for-db-writes.sh
+    ;;
+
+  console|web)
+    shift || true
+    runtime/scripts/console.sh "$@"
+    ;;
+
+  metrics)
+    shift || true
+    bash runtime/scripts/metrics-stack.sh "$@"
     ;;
 
   update)
@@ -130,12 +428,42 @@ case "$cmd" in
     runtime/scripts/restart-schedule.sh "$@"
     ;;
 
+  ip-change-restart)
+    shift || true
+    runtime/scripts/ip-change-restart.sh "$@"
+    ;;
+
+  encrypted-api)
+    shift || true
+    runtime/scripts/tls-front.sh "$@"
+    ;;
+
+  realtime-agent)
+    shift || true
+    runtime/scripts/realtime-agent.sh "$@"
+    ;;
+
+  shutdown-protection)
+    shift || true
+    runtime/scripts/shutdown-protection.sh "$@"
+    ;;
+
   version)
     runtime/scripts/version.sh
     ;;
 
   doctor)
     runtime/scripts/doctor.sh
+    ;;
+
+  storage)
+    shift || true
+    runtime/scripts/storage.sh "$@"
+    ;;
+
+  network)
+    shift || true
+    runtime/scripts/network-bind.sh "$@"
     ;;
 
   db)
@@ -148,6 +476,11 @@ case "$cmd" in
     runtime/scripts/db-manager.sh "$@"
     ;;
 
+  secrets)
+    shift || true
+    runtime/scripts/secrets-cli.sh "$@"
+    ;;
+
   config|server)
     shift || true
     runtime/scripts/config.sh "$@"
@@ -156,6 +489,11 @@ case "$cmd" in
   memory)
     shift || true
     runtime/scripts/memory.sh "$@"
+    ;;
+
+  memory-swap)
+    shift || true
+    runtime/scripts/memory-swap.sh "$@"
     ;;
 
   sietches)
@@ -181,84 +519,114 @@ case "$cmd" in
   help|--help|-h)
     cat <<'EOF'
 Usage:
-  runtime/scripts/dune init
-  runtime/scripts/dune manager
-  runtime/scripts/dune start
-  runtime/scripts/dune stop
-  runtime/scripts/dune status
-  runtime/scripts/dune version
-  runtime/scripts/dune doctor
-  runtime/scripts/dune ps
-  runtime/scripts/dune servers
-  runtime/scripts/dune spawn <map-name|partition-id>
-  runtime/scripts/dune despawn <map-name|partition-id|container-name>
-  runtime/scripts/dune autoscaler [status|start|stop|restart|logs|run]
-  runtime/scripts/dune ports
-  runtime/scripts/dune ping
-  runtime/scripts/dune ready
-  runtime/scripts/dune logs <service> [--raw]
-  runtime/scripts/dune restart <service>
-  runtime/scripts/dune update [check|auto enable|auto disable|auto status|--yes]
-  runtime/scripts/dune self-update [check|list|install [latest|previous|<tag>]]
-  runtime/scripts/dune restart-schedule [enable <hours>|disable|status]
-  runtime/scripts/dune db backup [output-dir]
-  runtime/scripts/dune db list
-  runtime/scripts/dune db status
-  runtime/scripts/dune db health
-  runtime/scripts/dune db import <backup-file>
-  runtime/scripts/dune db restore <backup-file>
-  runtime/scripts/dune db delete <backup-file>
-  runtime/scripts/dune db delete --all
-  runtime/scripts/dune db auto enable <hours> [retention-days]
-  runtime/scripts/dune db auto disable
-  runtime/scripts/dune db auto status
-  runtime/scripts/dune db auto retention <days>
-  runtime/scripts/dune db auto retention off
-  runtime/scripts/dune db transfer [--dry-run] [--yes] [--no-backup] <old-fls-id> <new-fls-id>
-  runtime/scripts/dune db transfer --file <plan.tsv> [--dry-run] [--yes]
-  runtime/scripts/dune db transfer pending|apply-pending|clear-pending
-  runtime/scripts/dune database [status|schemas|tables|counts|columns|preview|sql|export]
-  runtime/scripts/dune maps list
-  runtime/scripts/dune maps mode [map]
-  runtime/scripts/dune maps set <map> <dynamic|always-on>
-  runtime/scripts/dune maps reconcile
-  runtime/scripts/dune deepdesert dual [status|enable|disable|bootstrap|repair]
-  runtime/scripts/dune config title ["New Server Name"]
-  runtime/scripts/dune memory status
-  runtime/scripts/dune memory list-maps
-  runtime/scripts/dune memory set <map-name> <memory>
-  runtime/scripts/dune memory unset <map-name>
-  runtime/scripts/dune memory set default <memory>
-  runtime/scripts/dune memory unset default
-  runtime/scripts/dune sietches [list|show <map-name>|dimensions <map-name>]
-  runtime/scripts/dune sietches set-max <map-name> <count>
-  runtime/scripts/dune sietches set-active <map-name> <count>
-  runtime/scripts/dune sietches set-display <partition-id> <display-name>
-  runtime/scripts/dune sietches set-password <partition-id> [password]
-  runtime/scripts/dune sietches sync
-  runtime/scripts/dune sietches validate
-  runtime/scripts/dune admin item-search <query>
-  runtime/scripts/dune admin players [--online] [--show-full-ids]
-  runtime/scripts/dune admin kick <player-fls-id> [--dry-run] [--yes] [--force] [--label <name>]
-  runtime/scripts/dune admin kick --all-online [--yes] [--dry-run]
-  runtime/scripts/dune admin item-list [category]
-  runtime/scripts/dune admin grant-item <player-id|*> <item-name> [quantity] [durability]
-  runtime/scripts/dune admin grant-item-id <player-id|*> <item-id> [quantity] [durability]
-  runtime/scripts/dune admin grant-template <player-id|*> scout-ornithopter-mk6
-  runtime/scripts/dune admin player-location <player-id>
-  runtime/scripts/dune admin award-xp <player-id|*> <amount>
-  runtime/scripts/dune admin skill-points <player-id|*> <points>
-  runtime/scripts/dune admin skill-module <player-id|*> <module> <level>
-  runtime/scripts/dune admin skill-modules [query]
-  runtime/scripts/dune admin refill-water <player-id|*> [amount]
-  runtime/scripts/dune admin clean-inventory <player-id|*>
-  runtime/scripts/dune admin reset-progression <player-id|*>
-  runtime/scripts/dune admin teleport <player-id> <x> <y> <z> [yaw]
-  runtime/scripts/dune admin spawn-vehicle <player-id> <vehicle-id> <template-name> [offset-units]
-  runtime/scripts/dune admin spawn-vehicle-at <player-id> <vehicle-id> <template-name> <x> <y> <z> [rotation]
-  runtime/scripts/dune admin vehicle-list
-  runtime/scripts/dune admin unsupported
-  runtime/scripts/dune admin history
+  dune --help
+  dune init
+  dune start
+  dune stop
+  dune status
+  dune version
+  dune doctor
+  dune storage [status|cleanup [--dry-run] [--build-cache]]
+  dune ps
+  dune servers
+  dune spawn <map-name|partition-id>
+  dune despawn <map-name|partition-id|container-name>
+  dune autoscaler [status|start|stop|restart|logs|run]
+  dune ports
+  dune ping
+  dune ready
+  dune logs <service> [--raw]
+  dune restart <service>
+  dune console [restart|reload|status]
+  dune metrics [start|stop|restart|status|logs|config|pull]
+  dune update [check|--yes|install|install-assets [--force]|fix-steamcmd|fix-install-dir]
+  dune update auto [enable|disable|status]
+  dune self-update [check|list|install [latest|<tag>]]
+  dune restart-schedule [enable <HH:MM> [notify-minutes]|disable|status]
+  dune ip-change-restart [enable [interval-minutes] [notify-minutes]|disable|status|check-now]
+  dune encrypted-api [enable|disable|status|fingerprint]
+  dune realtime-agent [enable|disable|status]
+  dune shutdown-protection [enable|disable|remove|refresh|status]
+  dune network [status|fix]
+  dune db backup [output-dir]
+  dune db backup-system [output-dir]
+  dune db list
+  dune db list-system [output-dir]
+  dune db status
+  dune db health
+  dune db import <backup-file>
+  dune db restore <backup-file>
+  dune db restore <backup-file> --adopt-backup-battlegroup
+  dune db restore <backup-file> --keep-current-battlegroup
+  dune db delete <backup-file> [more-backups...]
+  dune db delete --all
+  dune db auto enable <HH:MM> [retention-days]
+  dune db auto disable
+  dune db auto status
+  dune db auto retention <days>
+  dune db auto retention off
+  dune db auto-system enable <HH:MM> [interval-hours] [keep]
+  dune db auto-system disable
+  dune db auto-system status
+  dune db auto-system passphrase set|remove
+  dune db transfer [--dry-run] [--yes] [--no-backup] <old-fls-id> <new-fls-id>
+  dune db transfer --file <plan.tsv> [--dry-run] [--yes]
+  dune db transfer pending|apply-pending|clear-pending
+  dune database [status|schemas|tables|counts|columns|preview|sql|export]
+  dune maps list
+  dune maps mode [map]
+  dune maps set <map> <dynamic|always-on|overmap-active|disabled>
+  dune maps reconcile
+  dune deepdesert dual [status|enable|disable|bootstrap|repair]
+  dune coriolis [status|scan-once]
+  dune admin login-queues [--all]
+  dune admin repair-login-queue <player-fls-id|queue-name> [--yes] [--force]
+  dune config title ["New Server Name"]
+  dune memory status
+  dune memory-swap status
+  dune memory-swap enable [per-server-gib] [pool-gib] [swappiness]
+  dune memory-swap disable
+  dune memory list-maps
+  dune memory set <map-name> <memory>
+  dune memory unset <map-name>
+  dune memory set default <memory>
+  dune memory unset default
+  dune sietches [list|show <map-name>|dimensions <map-name>]
+  dune sietches set-max <map-name> <count>
+  dune sietches set-active <map-name> <count>
+  dune sietches set-display <partition-id> <display-name>
+  dune sietches set-password <partition-id> [password]
+  dune sietches sync
+  dune sietches validate
+  dune admin item-search <query>
+  dune admin players [--online] [--show-full-ids]
+  dune admin kick <player-fls-id> [--dry-run] [--yes] [--force] [--label <name>]
+  dune admin kick --all-online [--yes] [--dry-run]
+  dune admin item-list [category]
+  dune admin grant-item <player-id|*> <item-name> [quantity] [durability]
+  dune admin grant-item-id <player-id|*> <item-id> [quantity] [durability]
+  dune admin grant-template <player-id|*> scout-ornithopter-mk6
+  dune admin player-location <player-id>
+  dune admin award-xp <player-id|*> <amount>
+  dune admin skill-points <player-id|*> <points>
+  dune admin skill-module <player-id|*> <module> <level>
+  dune admin skill-modules [query]
+  dune admin specialization-xp <character-name> (--all|--track <track>) [--level <level>] [--xp <xp>] [--grant-keystones] [--unlock-faction <Atreides|Harkonnen>] [--dry-run] [--yes] [--actor-id <id>]
+  dune admin specialization-max <character-name> [--grant-keystones] [--unlock-faction <Atreides|Harkonnen>] [--dry-run] [--yes]
+  dune admin refill-water <player-id|*> [amount]
+  dune admin clean-inventory <player-id|*>
+  dune admin reset-progression <player-id|*>
+  dune admin teleport <player-id> <x> <y> <z> [yaw]
+  dune admin spawn-vehicle <player-id> <vehicle-id> <template-name> [offset-units]
+  dune admin spawn-vehicle-at <player-id> <vehicle-id> <template-name> <x> <y> <z> [rotation]
+  dune admin broadcast-restart-warning <minutes>
+  dune admin vehicle-list
+  dune admin unsupported
+  dune admin history
+
+Web admin panel:
+  Use Dune Docker Console for guided server management.
+  CLI commands remain available for automation, support, and troubleshooting.
 
 Services for logs/restart:
   postgres
@@ -274,7 +642,7 @@ EOF
 
   *)
     echo "Unknown command: $cmd"
-    echo "Run: runtime/scripts/dune help"
+    echo "Run: dune --help"
     exit 1
     ;;
 esac

@@ -3,7 +3,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-source runtime/scripts/engine.sh
+[ -f .env ] && . ./.env
+# shellcheck disable=SC1091
+source runtime/scripts/memory-swap-common.sh
 
 CATALOG="runtime/generated/partition-catalog.json"
 SERVER_CATALOG="runtime/generated/server-catalog.json"
@@ -49,10 +51,12 @@ Usage:
   dune memory list-maps
   dune memory set <map-name> <memory>
   dune memory unset <map-name>
+  dune memory set partition:<partition-id> <memory>
+  dune memory unset partition:<partition-id>
   dune memory set default <memory>
   dune memory unset default
 
-Memory values use Podman formats such as 512m, 4096m, 4g, 8g, 12g, or 16g.
+Memory values use Docker formats such as 512m, 4096m, 2.50g, 4g, 8g, 12g, or 16g.
 Map names come from the generated world partition catalog.
 EOF
 }
@@ -68,12 +72,25 @@ normalize_key() {
 }
 
 validate_memory() {
-  printf '%s' "$1" | grep -Eq '^[1-9][0-9]*[mMgG]$'
+  printf '%s' "$1" | grep -Eq '^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)[mMgG]$'
 }
 
 env_key_for() {
   local name="$1"
+  if [[ "$name" =~ ^partition:([0-9]+)$ ]]; then
+    echo "DUNE_MEMORY_PARTITION_${BASH_REMATCH[1]}"
+    return
+  fi
   echo "DUNE_MEMORY_$(normalize_key "$name")"
+}
+
+partition_id_for_target() {
+  local target="$1"
+  if [[ "$target" =~ ^partition:([0-9]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
 }
 
 env_value() {
@@ -105,7 +122,7 @@ set_env_raw() {
   ' .env > "$tmp"
 
   mv "$tmp" .env
-  chmod 600 .env
+  chmod 644 .env
 }
 
 unset_env_raw() {
@@ -116,7 +133,7 @@ unset_env_raw() {
   tmp="$(mktemp)"
   awk -F= -v key="$key" '$1 != key { print }' .env > "$tmp"
   mv "$tmp" .env
-  chmod 600 .env
+  chmod 644 .env
 }
 
 require_catalog() {
@@ -230,13 +247,13 @@ running_info_for_map() {
 
   case "$map" in
     Survival_1)
-      if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-survival-1; then
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-survival-1; then
         echo "always|dune-server-survival-1|1"
       fi
       return
       ;;
     Overmap)
-      if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-overmap; then
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-overmap; then
         echo "always|dune-server-overmap|2"
       fi
       return
@@ -244,15 +261,34 @@ running_info_for_map() {
   esac
 
   safe="$(safe_container_fragment "$map")"
-  container="$(engine ps --format '{{.Names}}' 2>/dev/null | grep -E "^dune-server-${safe}-[0-9]+$" | head -n1 || true)"
+  container="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E "^dune-server-${safe}-[0-9]+$" | head -n1 || true)"
   if [ -n "$container" ] && [[ "$container" =~ -([0-9]+)$ ]]; then
     echo "dynamic|$container|${BASH_REMATCH[1]}"
+  fi
+}
+
+running_info_for_partition() {
+  local partition="$1"
+  local container
+  if [ "$partition" = "1" ]; then
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-server-survival-1; then
+      echo "always|dune-server-survival-1|1"
+    fi
+    return
+  fi
+  container="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E "^dune-server-.*-${partition}$" | head -n1 || true)"
+  if [ -n "$container" ]; then
+    echo "dynamic|$container|$partition"
   fi
 }
 
 restart_map_if_running() {
   local map="$1"
   local info kind container partition
+
+  if [ "${DUNE_MEMORY_SKIP_RESTART:-0}" = "1" ]; then
+    return 0
+  fi
 
   info="$(running_info_for_map "$map" || true)"
   [ -n "$info" ] || return 0
@@ -271,6 +307,61 @@ restart_map_if_running() {
       runtime/scripts/spawn-server.sh "$partition"
       ;;
   esac
+}
+
+restart_partition_if_running() {
+  local partition="$1"
+  local info kind container ignored
+
+  if [ "${DUNE_MEMORY_SKIP_RESTART:-0}" = "1" ]; then
+    return 0
+  fi
+
+  info="$(running_info_for_partition "$partition" || true)"
+  [ -n "$info" ] || return 0
+  IFS='|' read -r kind container ignored <<< "$info"
+
+  echo
+  echo "Partition $partition is currently running."
+  echo "The relevant map container will restart now so the memory change can apply."
+
+  if [ "$partition" = "1" ]; then
+    runtime/scripts/dune restart survival
+  else
+    runtime/scripts/despawn-server.sh "$partition"
+    runtime/scripts/spawn-server.sh "$partition"
+  fi
+}
+
+apply_live_memory_to_container() {
+  local container="$1"
+  local memory="$2"
+
+  [ -n "$container" ] || return 0
+  echo "Applying live memory limit ${memory} to ${container}."
+  docker update --memory "$memory" --memory-swap "$(memory_swap_total_for_limit "$memory")" --memory-reservation "$memory" "$container" >/dev/null
+}
+
+apply_live_memory_to_map_if_running() {
+  local map="$1"
+  local memory="$2"
+  local info kind container partition
+
+  info="$(running_info_for_map "$map" || true)"
+  [ -n "$info" ] || return 0
+  IFS='|' read -r kind container partition <<< "$info"
+  apply_live_memory_to_container "$container" "$memory"
+}
+
+apply_live_memory_to_partition_if_running() {
+  local partition="$1"
+  local memory="$2"
+  local info kind container ignored
+
+  info="$(running_info_for_partition "$partition" || true)"
+  [ -n "$info" ] || return 0
+  IFS='|' read -r kind container ignored <<< "$info"
+  apply_live_memory_to_container "$container" "$memory"
 }
 
 show_status() {
@@ -326,11 +417,25 @@ for row in server_catalog:
 rows = []
 seen = set()
 global_default = env.get("DUNE_MEMORY_DEFAULT", "")
+project_dynamic_defaults = {
+    "DeepDesert_1": "16g default",
+    "DLC_Story_LostHarvest_EcolabA": "2g default",
+    "DLC_Story_LostHarvest_EcolabB": "2g default",
+    "DLC_Story_LostHarvest_ForgottenLab": "2g default",
+}
+core_defaults = {
+    "Survival_1": "16g default",
+    "Overmap": "3g default",
+}
+partition_rows = []
 for row in catalog:
     name = str(row.get("map", ""))
     if not name or name in seen:
+        if name:
+            partition_rows.append(row)
         continue
     seen.add(name)
+    partition_rows.append(row)
     override = env.get(env_key(name), "")
     catalog_memory = str(
         server_by_map.get(name, {}).get("resources", {}).get("limits", {}).get("memory", "")
@@ -338,23 +443,43 @@ for row in catalog:
 
     if override:
         display = override
-    elif catalog_memory:
-        display = f"{catalog_memory} default"
+    elif name in core_defaults:
+        # The always-on launchers use project safety defaults unless the map
+        # has an explicit override. Catalog recommendations are informational
+        # and must not be presented as the effective Docker limit.
+        display = core_defaults[name]
     elif global_default:
         display = global_default
+    elif name in project_dynamic_defaults:
+        display = project_dynamic_defaults[name]
+    elif catalog_memory:
+        display = f"{catalog_memory} default"
     else:
-        fallback_defaults = {
-            "Survival_1": "16g default",
-            "Overmap": "3g default",
-            "DeepDesert_1": "16g default",
-        }
-        display = fallback_defaults.get(name, "3g default")
+        display = "3g default"
 
     rows.append((name, display))
 
 print(f"{'MAP':<28} MEMORY")
 for name, display in rows:
     print(f"{name:<28} {display}")
+for row in sorted(partition_rows, key=lambda item: (str(item.get("map", "")), int(item.get("dimension") or 0), int(item.get("id") or 0))):
+    name = str(row.get("map", ""))
+    partition_id = str(row.get("id") or "").strip()
+    if not name or not partition_id:
+        continue
+    override = env.get(f"DUNE_MEMORY_PARTITION_{partition_id}", "")
+    if name != "Survival_1" and not override:
+        continue
+    parent = env.get("DUNE_MEMORY_SURVIVAL_1", "")
+    if name != "Survival_1":
+        parent = env.get(env_key(name), "")
+    if name == "Survival_1" and partition_id == "1":
+        # The primary always-on Sietch launcher does not consume the global
+        # dynamic-map default. Match its real partition/map/project order.
+        display = override or parent or "16g default"
+    else:
+        display = override or parent or global_default or ("16g default" if name in {"Survival_1", "DeepDesert_1"} else "3g default")
+    print(f"{(name + ':' + partition_id):<28} {display}")
 PY
   else
     echo "Map catalog not found. Run dune memory list-maps after init."
@@ -434,6 +559,7 @@ set_memory() {
   local memory="$2"
   local map
   local key
+  local partition
 
   if ! validate_memory "$memory"; then
     echo "Invalid memory value: $memory"
@@ -449,6 +575,20 @@ set_memory() {
     return
   fi
 
+  partition="$(partition_id_for_target "$target" || true)"
+  if [ -n "$partition" ]; then
+    confirm_set "partition $partition" "$memory" || exit 1
+    key="$(env_key_for "$target")"
+    set_env_raw "$key" "$memory"
+    echo "Set $key=$memory"
+    if [ "${DUNE_MEMORY_SKIP_RESTART:-0}" = "1" ]; then
+      apply_live_memory_to_partition_if_running "$partition" "$memory"
+    else
+      restart_partition_if_running "$partition"
+    fi
+    return
+  fi
+
   map="$(canonical_map "$target" || true)"
   if [ -z "$map" ]; then
     echo "Unknown map: $target"
@@ -459,20 +599,38 @@ set_memory() {
   confirm_set "$map" "$memory" || exit 1
   key="$(env_key_for "$map")"
   set_env_raw "$key" "$memory"
+  if [ "$map" = "Survival_1" ]; then
+    unset_env_raw DUNE_MEMORY_PARTITION_1
+  fi
   echo "Set $key=$memory"
-  restart_map_if_running "$map"
+  if [ "${DUNE_MEMORY_SKIP_RESTART:-0}" = "1" ]; then
+    apply_live_memory_to_map_if_running "$map" "$memory"
+  else
+    restart_map_if_running "$map"
+  fi
 }
 
 unset_memory() {
   local target="$1"
   local map
   local key
+  local partition
 
   if [ "${target,,}" = "default" ]; then
     confirm_unset default || exit 1
     unset_env_raw DUNE_MEMORY_DEFAULT
     echo "Removed DUNE_MEMORY_DEFAULT"
     echo "New default behavior applies to future spawned/restarted maps."
+    return
+  fi
+
+  partition="$(partition_id_for_target "$target" || true)"
+  if [ -n "$partition" ]; then
+    confirm_unset "partition $partition" || exit 1
+    key="$(env_key_for "$target")"
+    unset_env_raw "$key"
+    echo "Removed $key"
+    restart_partition_if_running "$partition"
     return
   fi
 
@@ -505,6 +663,13 @@ case "$cmd" in
       exit 2
     fi
     set_memory "$2" "$3"
+    ;;
+  set-no-restart)
+    if [ "$#" -ne 3 ]; then
+      usage
+      exit 2
+    fi
+    DUNE_MEMORY_SKIP_RESTART=1 set_memory "$2" "$3"
     ;;
   unset)
     if [ "$#" -ne 2 ]; then

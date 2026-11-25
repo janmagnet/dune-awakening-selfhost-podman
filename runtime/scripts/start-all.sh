@@ -3,10 +3,32 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+LIFECYCLE_LOCK_FILE="${DUNE_BATTLEGROUP_LIFECYCLE_LOCK_FILE:-runtime/generated/battlegroup-lifecycle.lock}"
+if [ "${DUNE_BATTLEGROUP_LIFECYCLE_LOCK_HELD:-0}" != "1" ]; then
+  mkdir -p "$(dirname "$LIFECYCLE_LOCK_FILE")"
+  if flock -n -E 75 -o "$LIFECYCLE_LOCK_FILE" env DUNE_BATTLEGROUP_LIFECYCLE_LOCK_HELD=1 "$0" "$@"; then
+    exit 0
+  else
+    rc=$?
+    [ "$rc" -ne 75 ] || echo "Another battlegroup lifecycle operation is already running." >&2
+    exit "$rc"
+  fi
+fi
+
+runtime/scripts/repair-host-runtime-permissions.sh
+export DUNE_RUNTIME_PERMISSIONS_REPAIRED=1
+
 [ -f .env ] && . ./.env
-[ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 
 source runtime/scripts/runtime-env.sh
+
+# A configured installation must never silently start as "dune-docker" when
+# its persisted identity is missing. Recover only from evidence that matches
+# the current token, otherwise stop before starting stateful services.
+runtime/scripts/battlegroup-identity.sh ensure
+BATTLEGROUP_ID="$(resolve_battlegroup_id)"
+export BATTLEGROUP_ID
 
 set -a
 if [ -f .env ]; then
@@ -14,128 +36,246 @@ if [ -f .env ]; then
 fi
 set +a
 
-require_quadlet_privileges || exit 1
+run_timed_step() {
+  local label="$1"
+  shift
+  local start
+  local end
+  local elapsed
 
-echo "=== Installing/refreshing Quadlet units ==="
-runtime/scripts/render-quadlet.sh
+  start="$(date +%s)"
+  echo
+  echo "=== $label ==="
+  "$@"
+  end="$(date +%s)"
+  elapsed=$((end - start))
+  echo "Finished: $label (${elapsed}s)"
+}
 
-# Make sure directly-run containers that carry a restart policy (the dynamic game
-# servers the autoscaler spawns) come back after a host reboot.
-dune_systemctl enable podman-restart.service >/dev/null 2>&1 || true
+MANUAL_STOP_FILE="runtime/generated/manual-stop.env"
 
-echo
-echo "=== Starting Postgres ==="
-runtime/scripts/start-postgres.sh
+if [ -f "$MANUAL_STOP_FILE" ] && [ "${DUNE_IGNORE_MANUAL_STOP:-0}" != "1" ]; then
+  marker_boot_id="$(awk -F= '$1 == "DUNE_MANUAL_STOP_BOOT_ID" { print substr($0, length($1) + 2); exit }' "$MANUAL_STOP_FILE" 2>/dev/null || true)"
+  current_boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+  if [ -n "$marker_boot_id" ] && [ -n "$current_boot_id" ] && [ "$marker_boot_id" != "$current_boot_id" ]; then
+    rm -f "$MANUAL_STOP_FILE"
+  else
+    echo "Manual stop is active for this Linux boot. Refusing to start the Dune stack automatically."
+    echo "To start intentionally, run: runtime/scripts/dune start"
+    exit 2
+  fi
+fi
 
-echo
-echo "=== Ensuring Database Is Up To Date ==="
-runtime/scripts/update-db.sh
+if [ "${DUNE_START_KEEP_INFRA:-0}" = "1" ]; then
+  echo
+  echo "=== Retaining Stateful Infrastructure ==="
+  for required_container in dune-postgres dune-rmq-admin dune-rmq-game dune-text-router; do
+    if ! docker inspect -f '{{.State.Running}}' "$required_container" 2>/dev/null | grep -qx true; then
+      echo "Cannot retain infrastructure: $required_container is not running." >&2
+      exit 1
+    fi
+  done
+  echo "PostgreSQL, RabbitMQ, and TextRouter remain online during the game-farm restart."
+elif [ "${DUNE_START_SKIP_POSTGRES_START:-0}" = "1" ] \
+  && docker inspect -f '{{.State.Running}}' dune-postgres 2>/dev/null | grep -qx true; then
+  echo
+  echo "=== Starting Postgres ==="
+  echo "Postgres is already running from fresh install bootstrap; keeping it online."
+else
+  run_timed_step "Starting Postgres" runtime/scripts/start-postgres.sh
+fi
 
-echo
-echo "=== Synchronizing Sietch State ==="
+if [ "${DUNE_START_KEEP_INFRA:-0}" = "1" ] || [ "${DUNE_START_SKIP_DB_UPDATE:-0}" = "1" ]; then
+  echo
+  echo "=== Ensuring Database Is Up To Date ==="
+  if [ "${DUNE_START_KEEP_INFRA:-0}" = "1" ]; then
+    echo "Database remains online and unchanged during the game-farm restart."
+  else
+    echo "Database update already completed during fresh install bootstrap; skipping duplicate migration pass."
+  fi
+else
+  run_timed_step "Ensuring Database Is Up To Date" runtime/scripts/update-db.sh
+fi
+
+run_timed_step "Refreshing Map Catalogs" bash -c '
+runtime/scripts/extract-server-catalog.sh &
+pid_server=$!
+runtime/scripts/extract-partition-catalog.sh &
+pid_partition=$!
+catalog_status=0
+wait "$pid_server" || catalog_status=$?
+wait "$pid_partition" || catalog_status=$?
+exit "$catalog_status"
+'
+
+run_timed_step "Reconciling Official World Partitions" runtime/scripts/reconcile-world-partitions.sh
+
+if runtime/scripts/deepdesert.sh dual configured >/dev/null 2>&1; then
+  run_timed_step "Reconciling Dual Deep Desert" runtime/scripts/deepdesert.sh dual repair --yes
+fi
+
+run_timed_step "Applying Spice Field Overrides" runtime/scripts/spicefield-overrides.sh apply
+
+run_timed_step "Synchronizing Public IP" runtime/scripts/ensure-public-ip.sh sync
+
+run_timed_step "Reconciling Network Advertisement Addresses" bash -c '
+runtime/scripts/network-addresses.sh reconcile || {
+  echo "Network address reconciliation could not run yet. Startup will retry after game servers register."
+}
+'
+
+run_timed_step "Synchronizing Sietch State" bash -c '
 runtime/scripts/sietches.sh sync || {
   echo "Sietch state sync failed. Refusing to start with stale Sietch state."
   exit 1
 }
+'
 
-echo
-echo "=== Recycling Stale World Servers ==="
-runtime/scripts/recycle-world-game-servers.sh remove-stale
+run_timed_step "Recycling Stale World Servers" runtime/scripts/recycle-world-game-servers.sh remove-stale
 
-echo
-echo "=== Clearing Non-Core World Servers ==="
-runtime/scripts/recycle-world-game-servers.sh stop-noncore
+run_timed_step "Clearing Non-Core World Servers" runtime/scripts/recycle-world-game-servers.sh stop-noncore
 
-echo
-echo "=== Starting RabbitMQ ==="
-runtime/scripts/start-rabbitmq.sh
+if [ "${DUNE_START_KEEP_INFRA:-0}" = "1" ]; then
+  echo
+  echo "=== Keeping RabbitMQ And TextRouter Online ==="
+else
+  run_timed_step "Starting RabbitMQ" runtime/scripts/start-rabbitmq.sh
+  run_timed_step "Starting TextRouter" runtime/scripts/start-text-router.sh
+fi
 
-echo
-echo "=== Starting TextRouter ==="
-runtime/scripts/start-text-router.sh
+run_timed_step "Starting Director" runtime/scripts/start-director.sh
 
-echo
-echo "=== Starting Director ==="
-runtime/scripts/start-director.sh
+if [ "${DUNE_PARALLEL_CORE_MAP_STARTUP:-0}" = "1" ]; then
+  echo
+  echo "=== Starting Core Maps (Survival_1 + Overmap in parallel) ==="
+  core_start="$(date +%s)"
+  runtime/scripts/start-server-survival-1.sh &
+  survival_pid=$!
+  runtime/scripts/start-server-overmap.sh &
+  overmap_pid=$!
+  wait "$survival_pid"
+  wait "$overmap_pid"
+  core_end="$(date +%s)"
+  echo "Finished: Starting Core Maps ($((core_end - core_start))s)"
+else
+  run_timed_step "Starting Survival_1" runtime/scripts/start-server-survival-1.sh
+  run_timed_step "Starting Overmap" runtime/scripts/start-server-overmap.sh
+fi
 
-echo
-echo "=== Starting Survival_1 ==="
-runtime/scripts/start-server-survival-1.sh
+run_timed_step "Reapplying Spice Field Overrides After Core Startup" runtime/scripts/spicefield-overrides.sh apply
 
-echo
-echo "=== Starting Overmap ==="
-runtime/scripts/start-server-overmap.sh
+run_timed_step "Starting Spice Field Override Reconciler" runtime/scripts/spicefield-overrides.sh restart
 
-echo "=== Starting Sietch Override Publisher ==="
+run_timed_step "Reconciling Survival Sietches" bash -c '
+runtime/scripts/sietches.sh reconcile Survival_1 || {
+  echo "Survival_1 Sietch reconcile could not complete yet. Deferred reconcile will retry after core maps are ready."
+}
+'
+
+run_timed_step "Repairing Chat Exchanges" bash -c '
+runtime/scripts/repair-chat-exchanges.sh || {
+  echo "Guild chat exchange repair could not complete. Guild chat may be unavailable until the next repair pass."
+}
+'
+
+run_timed_step "Rechecking Network Advertisement Addresses" bash -c '
+runtime/scripts/network-addresses.sh reconcile || {
+  echo "Network address reconciliation could not complete. Run: runtime/scripts/network-addresses.sh status"
+}
+'
+
+run_timed_step "Starting Sietch Override Publisher" bash -c '
 runtime/scripts/publish-sietch-overrides.sh restart || {
   echo "Sietch override publisher did not start. Survival_1 custom browser names/passwords will not republish."
 }
+'
 
-echo "=== Starting Deep Desert Warm-Up Publisher ==="
+run_timed_step "Starting Deep Desert Warm-Up Publisher" bash -c '
 runtime/scripts/publish-deepdesert-overrides.sh restart || {
   echo "Deep Desert warm-up publisher did not start. Deep Desert may show offline instead of loading while warming."
 }
+'
 
-if [ -f runtime/generated/director-deepdesert-dual.ini ]; then
+run_timed_step "Stopping Legacy Network Server-State Rewriter" bash -c '
+runtime/scripts/publish-network-server-state-overrides.sh stop || true
+'
+
+if grep -Eq '^; ManagedInstanceCount=[23]$' runtime/generated/director-deepdesert-dual.ini 2>/dev/null; then
   echo
   echo "=== Dual Deep Desert Override Present ==="
-  echo "Deep Desert dual-mode config detected. Selector names/Kanly remain client/backend-controlled."
+  echo "Deep Desert dual-mode config detected. Its persisted PvP/PvE partition roles will be reconciled through the global gameplay profile."
 fi
 
-echo
-echo "=== Starting ServerGateway ==="
-runtime/scripts/start-server-gateway.sh
+run_timed_step "Starting ServerGateway" runtime/scripts/start-server-gateway.sh
 
-echo
-echo "=== Applying Local Public-IP Loopback Optimization ==="
+run_timed_step "Applying Local Public-IP Loopback Optimization" bash -c '
 runtime/scripts/local-loopback-optimize.sh || {
   echo "Local public-IP loopback optimization could not be applied. Public clients are unaffected; same-host clients may need NAT hairpin support."
 }
+'
 
-echo
-echo "=== Publishing Survival Sietch State ==="
+run_timed_step "Publishing Survival Sietch State" bash -c '
 runtime/scripts/publish-sietch-overrides.sh once || {
   echo "Could not publish the latest Survival_1 browser state snapshot."
 }
+'
 
-echo "=== Publishing Deep Desert Warm-Up State ==="
+run_timed_step "Publishing Deep Desert Warm-Up State" bash -c '
 runtime/scripts/publish-deepdesert-overrides.sh once || {
   echo "Could not publish the latest Deep Desert warm-up snapshot."
 }
+'
 
-if [ -f runtime/generated/director-deepdesert-dual.ini ]; then
+if grep -Eq '^; ManagedInstanceCount=[23]$' runtime/generated/director-deepdesert-dual.ini 2>/dev/null; then
   echo
   echo "=== Dual Deep Desert Note ==="
-  echo "Deep Desert dual-mode gameplay config is active. Selector names/Kanly remain cosmetic."
+  echo "Deep Desert dual-mode gameplay config is active. The global gameplay profile assigns the persisted partition roles."
 fi
 
-echo
-echo "=== Starting Autoscaler ==="
+run_timed_step "Starting Autoscaler" bash -c '
 runtime/scripts/start-autoscaler.sh || {
   echo "Autoscaler did not start. Dynamic maps will not spawn automatically."
   echo "Check with: dune autoscaler status"
 }
+'
+
+run_timed_step "Starting Coriolis Coordinator" bash -c '
+runtime/scripts/start-coriolis-coordinator.sh || {
+  echo "Coriolis coordinator did not start. Funcom farm-restart requests will not be handled automatically."
+}
+'
 
 echo
-echo "=== Scheduling Deferred Dimension Reconcile ==="
-(
-  exec runtime/scripts/deferred-reconcile.sh
-) >/tmp/dune-deferred-reconcile.log 2>&1 &
+if [ "${DUNE_START_FOREGROUND_DEFERRED_RECONCILE:-0}" = "1" ]; then
+  run_timed_step "Running Deferred Dimension Reconcile" runtime/scripts/deferred-reconcile.sh
+else
+  echo "=== Scheduling Deferred Dimension Reconcile ==="
+  runtime/scripts/schedule-deferred-reconcile.sh
+fi
 
 
 echo
 echo "=== Final quick status ==="
-engine ps --filter "name=dune-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+docker ps --filter "name=dune-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
 echo
 echo "=== Required TCP listeners ==="
-ss -lntp | grep -E ':(15432|31982|31983|32573|5059|11717)' || true
+postgres_port="$(resolve_postgres_port)"
+rmq_admin_port="$(resolve_rmq_admin_port)"
+rmq_game_port="$(resolve_rmq_game_port)"
+rmq_game_http_port="$(resolve_rmq_game_http_port)"
+text_router_port="$(resolve_text_router_port)"
+director_port="$(resolve_director_port)"
+ss -lntp | grep -E ":(${postgres_port}|${rmq_game_port}|${rmq_game_http_port}|${rmq_admin_port}|${text_router_port}|${director_port})" || true
 
 client_port_base="$(resolve_client_port_base)"
 igw_port_base="$(resolve_igw_port_base)"
 echo
 echo "=== Required UDP listeners ==="
 ss -lnup | grep -E ":(${client_port_base}|$((client_port_base + 1))|${igw_port_base}|$((igw_port_base + 1)))" || true
+
+rm -f runtime/generated/landsraad-restart-required
+rm -f runtime/generated/settings-restart-pending.json
 
 cat <<'EOF'
 

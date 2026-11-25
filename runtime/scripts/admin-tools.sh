@@ -3,7 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-source runtime/scripts/engine.sh
+# shellcheck source=command-auth-token.sh
+source runtime/scripts/command-auth-token.sh
 
 ITEMS_FILE="runtime/data/admin-items.json"
 VEHICLES_FILE="runtime/data/admin-vehicles.json"
@@ -11,7 +12,6 @@ SKILL_MODULES_FILE="runtime/data/admin-skill-modules.json"
 XP_EVENT_TAGS_FILE="runtime/data/admin-xp-event-tags.json"
 TOKEN_FILE="runtime/secrets/funcom-token.txt"
 COMMAND_TOKEN_FILE="runtime/secrets/command-auth-token.txt"
-BUILTIN_COMMAND_AUTH_TOKEN="Nu6VmPWUMvdPMeB7qErr"
 RMQ_CONTAINER="dune-rmq-game"
 POSTGRES_CONTAINER="dune-postgres"
 ADMIN_HISTORY_TSV="runtime/generated/admin-command-history.tsv"
@@ -24,22 +24,27 @@ Usage:
   runtime/scripts/dune admin players [--online] [--show-full-ids]
   runtime/scripts/dune admin kick <player-fls-id> [--dry-run] [--yes] [--force] [--label <name>]
   runtime/scripts/dune admin kick --all-online [--dry-run] [--yes]
+  runtime/scripts/dune admin login-queues [--all]
+  runtime/scripts/dune admin repair-login-queue <player-fls-id|queue-name> [--yes] [--force]
   runtime/scripts/dune admin item-search <query>
   runtime/scripts/dune admin item-list [category]
-  runtime/scripts/dune admin grant-item <player-id|*> <item-name-or-id> [quantity] [durability]
-  runtime/scripts/dune admin grant-item-id <player-id|*> <item-id> [quantity] [durability]
+  runtime/scripts/dune admin grant-item <player-id|*> <item-name-or-id> [quantity] [durability] [grade]
+  runtime/scripts/dune admin grant-item-id <player-id|*> <item-id> [quantity] [durability] [grade]
   runtime/scripts/dune admin grant-template <player-id|*> scout-ornithopter-mk6
   runtime/scripts/dune admin player-location <player-id>
   runtime/scripts/dune admin award-xp <player-id|*> <amount>
   runtime/scripts/dune admin skill-points <player-id|*> <points>
   runtime/scripts/dune admin skill-module <player-id|*> <module> <level>
   runtime/scripts/dune admin skill-modules [query]
+  runtime/scripts/dune admin specialization-xp <character-name> (--all|--track <track>) [--level <level>] [--xp <xp>] [--grant-keystones] [--unlock-faction <Atreides|Harkonnen>] [--dry-run] [--yes] [--actor-id <id>]
+  runtime/scripts/dune admin specialization-max <character-name> [--grant-keystones] [--unlock-faction <Atreides|Harkonnen>] [--dry-run] [--yes]
   runtime/scripts/dune admin refill-water <player-id|*> [amount]
   runtime/scripts/dune admin clean-inventory <player-id|*>
   runtime/scripts/dune admin reset-progression <player-id|*>
   runtime/scripts/dune admin teleport <player-id> <x> <y> <z> [yaw]
   runtime/scripts/dune admin spawn-vehicle <player-id> <vehicle-id> <template-name> [offset-units]
   runtime/scripts/dune admin spawn-vehicle-at <player-id> <vehicle-id> <template-name> <x> <y> <z> [rotation]
+  runtime/scripts/dune admin broadcast-restart-warning <minutes>
   runtime/scripts/dune admin vehicle-list
   runtime/scripts/dune admin unsupported
   runtime/scripts/dune admin history
@@ -67,6 +72,9 @@ except Exception:
     raise SystemExit(0)
 if obj.get("PlayerId") and obj.get("PlayerId") != "*":
     obj["PlayerId"] = "<redacted>"
+for key in ("X", "Y", "Z", "Rotation", "Yaw"):
+    if key in obj:
+        obj[key] = "<redacted>"
 print(json.dumps(obj, separators=(",", ":")))
 PY
 }
@@ -130,28 +138,8 @@ display_category() {
   printf '%s' "${value^}"
 }
 
-command_auth_token() {
-  local raw
-
-  if [ -n "${DUNE_COMMAND_AUTH_TOKEN:-}" ]; then
-    printf '%s' "$DUNE_COMMAND_AUTH_TOKEN"
-    return 0
-  fi
-
-  if [ -s "$COMMAND_TOKEN_FILE" ]; then
-    raw="$(tr -d '\r\n' < "$COMMAND_TOKEN_FILE")"
-    if [ -n "$raw" ]; then
-      printf '%s' "$raw"
-      return 0
-    fi
-  fi
-
-  # Matches the working upstream manager's command-auth fallback.
-  printf '%s' "$BUILTIN_COMMAND_AUTH_TOKEN"
-}
-
 require_rmq_game_running() {
-  if ! engine exec "$RMQ_CONTAINER" rabbitmqctl status >/dev/null 2>&1; then
+  if ! docker exec "$RMQ_CONTAINER" rabbitmqctl status >/dev/null 2>&1; then
     echo "RabbitMQ game container is not running: $RMQ_CONTAINER" >&2
     echo "Start the battlegroup first; item grants are published live to the running container." >&2
     exit 1
@@ -159,7 +147,7 @@ require_rmq_game_running() {
 }
 
 require_postgres_running() {
-  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
     echo "Postgres container is not running: $POSTGRES_CONTAINER" >&2
     exit 1
   fi
@@ -180,7 +168,7 @@ resolve_player_id() {
   fi
 
   resolved="$(
-    engine exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
+    docker exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
       select coalesce(nullif(\"user\", ''), nullif(funcom_id, ''))
       from dune.accounts
       where id = ${player_id}
@@ -201,11 +189,27 @@ account_id_for_player_id() {
   local player_id="$1"
 
   [ "$player_id" != "*" ] || return 0
-  engine exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
-    select id
-    from dune.accounts
-    where \"user\" = '${player_id//\'/\'\'}'
-       or funcom_id = '${player_id//\'/\'\'}'
+  if printf '%s' "$player_id" | grep -Eq '^[0-9]+$'; then
+    docker exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
+      select id
+      from dune.accounts
+      where id = ${player_id}
+      limit 1;
+    " 2>/dev/null | tr -d '[:space:]' || true
+    return 0
+  fi
+  docker exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
+    select id from (
+      select id
+      from dune.accounts
+      where \"user\" = '${player_id//\'/\'\'}'
+         or funcom_id = '${player_id//\'/\'\'}'
+      union
+      select id
+      from dune.encrypted_accounts
+      where convert_from(encrypted_funcom_id, 'UTF8') = '${player_id//\'/\'\'}'
+         or coalesce(\"user\"::text, '') = '${player_id//\'/\'\'}'
+    ) matches
     limit 1;
   " 2>/dev/null | tr -d '[:space:]' || true
 }
@@ -215,7 +219,7 @@ player_item_stack_count() {
   local item_id="$2"
 
   [ -n "$account_id" ] || return 0
-  engine exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
+  docker exec "$POSTGRES_CONTAINER" psql -U dune -d dune -At -c "
     select coalesce(sum(it.stack_size), 0)
     from dune.items it
     join dune.inventories inv on inv.id = it.inventory_id
@@ -244,6 +248,21 @@ except ValueError:
     raise SystemExit(1)
 if not 0 <= value <= 1:
     print("Durability must be a number between 0 and 1.", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+validate_quality() {
+  local quality="$1"
+  python3 - "$quality" <<'PY'
+import sys
+try:
+    value = int(sys.argv[1])
+except Exception:
+    print("Grade must be a whole number between 0 and 5.", file=sys.stderr)
+    raise SystemExit(1)
+if value < 0 or value > 5:
+    print("Grade must be a whole number between 0 and 5.", file=sys.stderr)
     raise SystemExit(1)
 PY
 }
@@ -404,17 +423,21 @@ build_inner_json() {
   local item_id="$2"
   local quantity="$3"
   local durability="$4"
-  python3 - "$player_id" "$item_id" "$quantity" "$durability" <<'PY'
+  local quality="${5:-0}"
+  python3 - "$player_id" "$item_id" "$quantity" "$durability" "$quality" <<'PY'
 import json
 import sys
 
-player_id, item_id, quantity, durability = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+player_id, item_id, quantity, durability, quality = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5])
 print(json.dumps({
     "ServerCommand": "AddItemToInventory",
     "PlayerId": player_id,
     "ItemName": item_id,
     "Quantity": quantity,
     "Durability": durability,
+    "Quality": quality,
+    "Grade": quality,
+    "ItemQuality": quality,
 }, separators=(",", ":")))
 PY
 }
@@ -451,13 +474,38 @@ print(json.dumps(obj, separators=(",", ":")))
 PY
 }
 
+build_restart_warning_json() {
+  local minutes="$1"
+  python3 - "$minutes" <<'PY'
+import json
+import sys
+
+minutes = int(sys.argv[1])
+title = "Server Restart Incoming"
+body = f"The server will restart in approximately {minutes} minutes."
+print(json.dumps({
+    "ServerCommand": "ServiceBroadcast",
+    "BroadcastType": "Generic",
+    "BroadcastPayload": {
+        "BroadcastDuration": 30,
+        "LocalizedText": [
+            {"Key": "en", "Title": title, "Body": body},
+            {"Key": "en-US", "Title": title, "Body": body},
+        ],
+    },
+}, separators=(",", ":")))
+PY
+}
+
 vehicle_list_command() {
   local query="${1:-}"
   require_catalog_file "$VEHICLES_FILE" "vehicle"
-  python3 - "$VEHICLES_FILE" "$query" <<'PY'
+  local catalog
+  catalog="$(runtime/scripts/experimental-tanks.sh catalog "$VEHICLES_FILE")"
+  python3 - "$catalog" "$query" <<'PY'
 import json, sys
 path, query = sys.argv[1], sys.argv[2].casefold()
-vehicles = json.load(open(path, encoding="utf-8"))
+vehicles = json.loads(path)
 for vehicle in vehicles:
     vid = str(vehicle.get("id") or "")
     actor = str(vehicle.get("actor_class") or "")
@@ -474,10 +522,12 @@ PY
 resolve_vehicle() {
   local vehicle_id="$1" template_name="${2:-}"
   require_catalog_file "$VEHICLES_FILE" "vehicle"
-  python3 - "$VEHICLES_FILE" "$vehicle_id" "$template_name" <<'PY'
+  local catalog
+  catalog="$(runtime/scripts/experimental-tanks.sh catalog "$VEHICLES_FILE")"
+  python3 - "$catalog" "$vehicle_id" "$template_name" <<'PY'
 import json, sys
 path, vehicle_id, template_name = sys.argv[1], sys.argv[2], sys.argv[3]
-vehicles = json.load(open(path, encoding="utf-8"))
+vehicles = json.loads(path)
 for vehicle in vehicles:
     if str(vehicle.get("id") or "").casefold() != vehicle_id.casefold():
         continue
@@ -577,6 +627,430 @@ except ValueError:
 PY
 }
 
+psql_admin() {
+  require_postgres_running
+  docker exec "$POSTGRES_CONTAINER" psql -U postgres -d dune "$@"
+}
+
+backup_database_for_admin_write() {
+  local output backup_file
+
+  output="$(DB_BACKUP_ORIGIN=admin-tools runtime/scripts/db.sh backup)"
+  printf '%s\n' "$output" >&2
+  backup_file="$(printf '%s\n' "$output" | awk '/runtime\/backups\/db\/.*\.backup$/ {print $1; exit}')"
+  [ -n "$backup_file" ] || backup_file="unknown"
+  printf '%s' "$backup_file"
+}
+
+specialization_tracks_csv() {
+  local mode="$1" track="$2"
+  if [ "$mode" = "all" ]; then
+    printf '%s' "Crafting,Gathering,Exploration,Combat,Sabotage"
+  else
+    printf '%s' "$track"
+  fi
+}
+
+specialization_track_sql_array() {
+  local tracks_csv="$1" track out="" sep=""
+  IFS=',' read -r -a tracks <<< "$tracks_csv"
+  for track in "${tracks[@]}"; do
+    case "$track" in
+      Crafting|Gathering|Exploration|Combat|Sabotage) ;;
+      *) echo "Invalid specialization track: $track" >&2; return 1 ;;
+    esac
+    out="$out$sep'$track'"
+    sep=","
+  done
+  printf 'ARRAY[%s]::dune.specializationtracktype[]' "$out"
+}
+
+validate_specialization_schema() {
+  local missing
+
+  missing="$(psql_admin -At -v ON_ERROR_STOP=1 -c "
+    with required(kind, name, present) as (
+      values
+        ('table', 'dune.specialization_tracks', to_regclass('dune.specialization_tracks') is not null),
+        ('table', 'dune.purchased_specialization_keystones', to_regclass('dune.purchased_specialization_keystones') is not null),
+        ('table', 'dune.specialization_keystones_map', to_regclass('dune.specialization_keystones_map') is not null),
+        ('table', 'dune.actors', to_regclass('dune.actors') is not null),
+        ('table', 'dune.player_state', to_regclass('dune.player_state') is not null),
+        ('table', 'dune.factions', to_regclass('dune.factions') is not null),
+        ('table', 'dune.player_faction', to_regclass('dune.player_faction') is not null),
+        ('table', 'dune.player_faction_reputation', to_regclass('dune.player_faction_reputation') is not null),
+        ('table', 'dune.journey_story_node', to_regclass('dune.journey_story_node') is not null),
+        ('type', 'dune.specializationtracktype', to_regtype('dune.specializationtracktype') is not null)
+    )
+    select string_agg(kind || ' ' || name, ', ')
+    from required
+    where not present;
+  " | tr -d '\r')"
+
+  if [ -n "$missing" ]; then
+    echo "Missing required specialization schema object(s): $missing" >&2
+    exit 1
+  fi
+}
+
+specialization_character_matches() {
+  local character="$1" character_sql
+  character_sql="${character//\'/\'\'}"
+  psql_admin -At -F $'\t' -v ON_ERROR_STOP=1 -c "
+    with exact_matches as (
+      select distinct
+        coalesce(ps.player_pawn_id, a.id) as actor_id,
+        ps.character_name,
+        ps.account_id,
+        coalesce(ps.online_status::text, 'Unknown') as online_status,
+        true as exact_match
+      from dune.player_state ps
+      left join dune.actors a on a.id = ps.player_pawn_id
+      where lower(ps.character_name) = lower('$character_sql')
+        and coalesce(ps.player_pawn_id, a.id) is not null
+        and (a.id is null or a.class ilike '%PlayerCharacter%')
+      union
+      select distinct
+        a.id as actor_id,
+        ps.character_name,
+        ps.account_id,
+        coalesce(ps.online_status::text, 'Unknown') as online_status,
+        true as exact_match
+      from dune.player_state ps
+      join dune.actors a on a.owner_account_id = ps.account_id
+      where ps.player_pawn_id is null
+        and lower(ps.character_name) = lower('$character_sql')
+        and a.class ilike '%PlayerCharacter%'
+    ),
+    partial_matches as (
+      select distinct
+        coalesce(ps.player_pawn_id, a.id) as actor_id,
+        ps.character_name,
+        ps.account_id,
+        coalesce(ps.online_status::text, 'Unknown') as online_status,
+        false as exact_match
+      from dune.player_state ps
+      left join dune.actors a on a.id = ps.player_pawn_id
+      where ps.character_name ilike '%' || '$character_sql' || '%'
+        and coalesce(ps.player_pawn_id, a.id) is not null
+        and (a.id is null or a.class ilike '%PlayerCharacter%')
+      union
+      select distinct
+        a.id as actor_id,
+        ps.character_name,
+        ps.account_id,
+        coalesce(ps.online_status::text, 'Unknown') as online_status,
+        false as exact_match
+      from dune.player_state ps
+      join dune.actors a on a.owner_account_id = ps.account_id
+      where ps.player_pawn_id is null
+        and ps.character_name ilike '%' || '$character_sql' || '%'
+        and a.class ilike '%PlayerCharacter%'
+    ),
+    chosen as (
+      select * from exact_matches
+      union all
+      select * from partial_matches
+      where not exists (select 1 from exact_matches)
+    )
+    select actor_id, character_name, account_id, online_status, exact_match
+    from chosen
+    order by exact_match desc, character_name, actor_id;
+  " | tr -d '\r'
+}
+
+resolve_specialization_character() {
+  local character="$1" actor_override="${2:-}" rows count
+
+  if [ -n "$actor_override" ]; then
+    validate_int "$actor_override" "Actor id"
+    rows="$(psql_admin -At -F $'\t' -v ON_ERROR_STOP=1 -c "
+      select a.id, coalesce(ps.character_name, '<unknown>'), coalesce(ps.account_id::text, ''), coalesce(ps.online_status::text, 'Unknown'), true
+      from dune.actors a
+      left join dune.player_state ps on ps.player_pawn_id = a.id or ps.account_id = a.owner_account_id
+      where a.id = $actor_override::bigint
+        and a.class ilike '%PlayerCharacter%'
+      limit 1;
+    " | tr -d '\r')"
+    [ -n "$rows" ] || { echo "No PlayerCharacter actor found for actor_id $actor_override." >&2; exit 1; }
+    printf '%s\n' "$rows"
+    return 0
+  fi
+
+  rows="$(specialization_character_matches "$character")"
+  count="$(printf '%s\n' "$rows" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+  case "${count:-0}" in
+    0)
+      echo "No character matched: $character" >&2
+      exit 1
+      ;;
+    1)
+      printf '%s\n' "$rows"
+      ;;
+    *)
+      echo "Character name is ambiguous: $character" >&2
+      echo "Matches:" >&2
+      printf '%s\n' "$rows" | awk -F '\t' '{ printf "  - %s (actor_id=%s, account_id=%s, status=%s)\n", $2, $1, $3, $4 }' >&2
+      echo "Rerun with an exact full character name, or use --actor-id <id>." >&2
+      exit 1
+      ;;
+  esac
+}
+
+specialization_preview() {
+  local actor_id="$1"
+  psql_admin -P pager=off -v ON_ERROR_STOP=1 -c "
+    select track_type, xp_amount, level
+    from dune.specialization_tracks
+    where player_id = $actor_id::bigint
+    order by track_type::text;
+  "
+}
+
+normalize_faction_name() {
+  local faction="$1"
+  case "${faction,,}" in
+    atreides) printf '%s' "Atreides" ;;
+    harkonnen) printf '%s' "Harkonnen" ;;
+    none|"") printf '%s' "" ;;
+    *) echo "Faction must be Atreides or Harkonnen." >&2; return 1 ;;
+  esac
+}
+
+specialization_apply_sql() {
+  local actor_id="$1" account_id="$2" level="$3" xp="$4" tracks_csv="$5" grant_keystones="$6" unlock_faction="$7"
+  local track_array keystone_sql faction_sql unlock_faction_sql journey_id_column journey_id_value faction_nodes
+
+  track_array="$(specialization_track_sql_array "$tracks_csv")"
+  unlock_faction_sql="${unlock_faction//\'/\'\'}"
+  keystone_sql=""
+  if [ "$grant_keystones" = "1" ]; then
+    keystone_sql="
+      insert into dune.purchased_specialization_keystones (player_id, keystone_id)
+      select $actor_id::bigint, id
+      from dune.specialization_keystones_map
+      on conflict do nothing;
+    "
+  fi
+  faction_sql=""
+  if [ -n "$unlock_faction" ]; then
+    journey_id_column="$(psql_admin -At -v ON_ERROR_STOP=1 -c "
+      select case
+        when exists (
+          select 1 from information_schema.columns
+          where table_schema = 'dune' and table_name = 'journey_story_node' and column_name = 'character_id'
+        ) then 'character_id'
+        when exists (
+          select 1 from information_schema.columns
+          where table_schema = 'dune' and table_name = 'journey_story_node' and column_name = 'account_id'
+        ) then 'account_id'
+        else ''
+      end;
+    " | tr -d '\r[:space:]')"
+    if [ -z "$journey_id_column" ]; then
+      echo "Cannot unlock faction journey because dune.journey_story_node has no supported player identity column." >&2
+      exit 1
+    fi
+    if [ "$journey_id_column" = "character_id" ]; then
+      journey_id_value="$(psql_admin -At -v ON_ERROR_STOP=1 -c "select id from dune.player_state where account_id = $account_id::bigint and player_pawn_id = $actor_id::bigint;" | tr -d '\r[:space:]')"
+      if [ -z "$journey_id_value" ]; then
+        echo "Cannot unlock faction journey because no player_state row was found for account_id $account_id." >&2
+        exit 1
+      fi
+    else
+      journey_id_value="$account_id"
+    fi
+    faction_nodes="$(python3 - <<'PY'
+import json
+from pathlib import Path
+cards = json.loads(Path("console/api/src/duneDb/journey-cards.json").read_text())
+root = "DA_FQ_ClimbTheRanks"
+selected = root + ".JoinAHouse"
+nodes = [selected]
+for node in nodes:
+    nodes.extend(cards[node].get("c", []))
+print(json.dumps({"selected": nodes, "siblings": cards[root]["c"]}).replace("'", "''"))
+PY
+)"
+    faction_sql="
+      insert into dune.player_faction (actor_id, faction_id, utc_time_faction_change)
+      select $actor_id::bigint, f.id, now()
+      from dune.factions f
+      where lower(f.name) = lower('$unlock_faction_sql')
+      on conflict (actor_id)
+      do update set faction_id = excluded.faction_id, utc_time_faction_change = excluded.utc_time_faction_change;
+
+      insert into dune.player_faction_reputation (actor_id, faction_id, reputation_amount)
+      select $actor_id::bigint, f.id, 0
+      from dune.factions f
+      where lower(f.name) = lower('$unlock_faction_sql')
+      on conflict (actor_id, faction_id)
+      do nothing;
+
+      insert into dune.journey_story_node
+        ($journey_id_column, story_node_id, complete_condition_state, reveal_condition_state,
+         has_pending_reward, fail_condition_state, metadata_state, reset_group)
+      select $journey_id_value::bigint, node, 'true', 'true', false, '{}', '{}', 'Default'
+      from jsonb_array_elements_text('$faction_nodes'::jsonb->'selected') as selected(node)
+      on conflict ($journey_id_column, story_node_id) do update
+      set complete_condition_state = 'true'::jsonb,
+          reveal_condition_state = 'true'::jsonb,
+          has_pending_reward = false,
+          fail_condition_state = '{}'::jsonb;
+
+      insert into dune.journey_story_node
+        ($journey_id_column, story_node_id, complete_condition_state, reveal_condition_state,
+         has_pending_reward, fail_condition_state, metadata_state, reset_group)
+      select $journey_id_value::bigint, 'DA_FQ_ClimbTheRanks', 'true', '{}', false, '{}', '{}', 'Default'
+      where not exists (
+        select 1 from jsonb_array_elements_text('$faction_nodes'::jsonb->'siblings') as sibling(node)
+        where not exists (select 1 from dune.journey_story_node j
+          where j.$journey_id_column = $journey_id_value::bigint and j.story_node_id = sibling.node
+            and j.complete_condition_state = 'true'::jsonb))
+      on conflict ($journey_id_column, story_node_id) do update set complete_condition_state = 'true'::jsonb;
+    "
+  fi
+
+  psql_admin -v ON_ERROR_STOP=1 -c "
+      begin;
+      insert into dune.specialization_tracks (player_id, track_type, xp_amount, level)
+      select $actor_id::bigint, unnest($track_array), $xp::bigint, $level::integer
+      on conflict (player_id, track_type)
+      do update set xp_amount = excluded.xp_amount, level = excluded.level;
+      $keystone_sql
+      $faction_sql
+      commit;
+    "
+}
+
+specialization_xp_command() {
+  local character="${1:-}" mode="" track="" level="100" xp="44182" grant_keystones=0 dry_run=0 assume_yes=0 actor_override="" unlock_faction=""
+  local arg tracks_csv row actor_id character_name account_id online_status exact_match answer backup_file payload
+
+  [ -n "$character" ] || { echo "Usage: dune admin specialization-xp <character-name> (--all|--track <track>) [--level <level>] [--xp <xp>] [--grant-keystones] [--unlock-faction <Atreides|Harkonnen>] [--dry-run] [--yes]" >&2; exit 2; }
+  shift || true
+  while [ "$#" -gt 0 ]; do
+    arg="$1"
+    case "$arg" in
+      --all) mode="all" ;;
+      --track)
+        shift || { echo "--track requires a value." >&2; exit 2; }
+        mode="track"; track="$1"
+        ;;
+      --level)
+        shift || { echo "--level requires a value." >&2; exit 2; }
+        level="$1"
+        ;;
+      --xp)
+        shift || { echo "--xp requires a value." >&2; exit 2; }
+        xp="$1"
+        ;;
+      --grant-keystones) grant_keystones=1 ;;
+      --unlock-faction)
+        shift || { echo "--unlock-faction requires a value." >&2; exit 2; }
+        unlock_faction="$(normalize_faction_name "$1")"
+        ;;
+      --dry-run) dry_run=1 ;;
+      --yes|-y) assume_yes=1 ;;
+      --actor-id)
+        shift || { echo "--actor-id requires a value." >&2; exit 2; }
+        actor_override="$1"
+        ;;
+      --*) echo "Unknown specialization-xp option: $arg" >&2; exit 2 ;;
+      *) echo "Unexpected argument: $arg" >&2; exit 2 ;;
+    esac
+    shift
+  done
+  [ "${DUNE_ADMIN_DRY_RUN:-0}" = "1" ] && dry_run=1
+  [ "${DUNE_ADMIN_ASSUME_YES:-0}" = "1" ] && assume_yes=1
+  [ -n "$mode" ] || { echo "Choose --all or --track <track>." >&2; exit 2; }
+  validate_int "$level" "Level"
+  validate_int "$xp" "XP amount"
+  [ "$level" -ge 0 ] && [ "$level" -le 100 ] || { echo "Level must be between 0 and 100." >&2; exit 1; }
+  [ "$xp" -ge 0 ] || { echo "XP amount must be zero or greater." >&2; exit 1; }
+
+  tracks_csv="$(specialization_tracks_csv "$mode" "$track")"
+  specialization_track_sql_array "$tracks_csv" >/dev/null
+  validate_specialization_schema
+  row="$(resolve_specialization_character "$character" "$actor_override")"
+  IFS=$'\t' read -r actor_id character_name account_id online_status exact_match <<< "$row"
+  if [ -n "$unlock_faction" ] && [ -z "${account_id:-}" ]; then
+    echo "Cannot unlock faction journey because the selected actor did not resolve to a player_state account_id." >&2
+    exit 1
+  fi
+
+  echo "Specialization update preview:"
+  echo "  Character: $character_name"
+  echo "  Actor id: $actor_id"
+  echo "  Account id: ${account_id:-unknown}"
+  echo "  Status: ${online_status:-Unknown}"
+  echo "  Tracks: $tracks_csv"
+  echo "  Level: $level"
+  echo "  XP amount: $xp"
+  echo "  Grant all keystones: $([ "$grant_keystones" = "1" ] && echo yes || echo no)"
+  echo "  Unlock faction journey: ${unlock_faction:-no}"
+  echo
+  echo "Current specialization tracks:"
+  specialization_preview "$actor_id" || true
+
+  payload="$(python3 - "$actor_id" "$character_name" "$tracks_csv" "$level" "$xp" "$grant_keystones" "$unlock_faction" <<'PY'
+import json, sys
+actor_id, name, tracks, level, xp, keystones, faction = sys.argv[1:]
+print(json.dumps({
+    "ActorId": int(actor_id),
+    "Character": name,
+    "Tracks": tracks.split(","),
+    "Level": int(level),
+    "XpAmount": int(xp),
+    "GrantKeystones": keystones == "1",
+    "UnlockFaction": faction or None,
+}, separators=(",", ":")))
+PY
+)"
+
+  if [ "$dry_run" = "1" ]; then
+    echo
+    echo "Dry run: no backup created and no database writes performed."
+    echo "Would upsert dune.specialization_tracks and grant keystones: $([ "$grant_keystones" = "1" ] && echo yes || echo no)."
+    [ -z "$unlock_faction" ] || echo "Would unlock faction journey for: $unlock_faction."
+    audit_admin_action "SpecializationXP" "$actor_id" "$character_name" "$payload" "postgres:dune" "dry-run"
+    return 0
+  fi
+
+  echo
+  echo "WARNING: this directly edits specialization tables in PostgreSQL."
+  [ -z "$unlock_faction" ] || echo "WARNING: this will also set the player's faction to $unlock_faction and mark JoinAHouse journey nodes complete."
+  echo "A database backup will be created before the write."
+  if [ "$assume_yes" != "1" ]; then
+    read -r -p "Type APPLY SPECIALIZATION XP to continue: " answer
+    [ "$answer" = "APPLY SPECIALIZATION XP" ] || { echo "Cancelled."; exit 1; }
+  fi
+
+  backup_file="$(backup_database_for_admin_write)"
+  echo
+  specialization_apply_sql "$actor_id" "$account_id" "$level" "$xp" "$tracks_csv" "$grant_keystones" "$unlock_faction"
+  audit_admin_action "SpecializationXP" "$actor_id" "$character_name" "$payload" "postgres:dune" "applied backup=$backup_file"
+
+  echo
+  echo "Specialization update applied."
+  echo "  Character: $character_name"
+  echo "  Actor id: $actor_id"
+  echo "  Tracks updated: $tracks_csv"
+  echo "  XP amount: $xp"
+  echo "  Level: $level"
+  echo "  Keystones granted: $([ "$grant_keystones" = "1" ] && echo yes || echo no)"
+  echo "  Faction journey unlocked: ${unlock_faction:-no}"
+  echo "  Backup: $backup_file"
+  echo "The player may need to relog, or affected services may need a restart, if specialization state is cached."
+}
+
+specialization_max_command() {
+  local character="${1:-}"
+  [ -n "$character" ] || { echo "Usage: dune admin specialization-max <character-name> [--grant-keystones] [--unlock-faction <Atreides|Harkonnen>] [--dry-run] [--yes]" >&2; exit 2; }
+  shift || true
+  specialization_xp_command "$character" --all --level 100 --xp 44182 "$@"
+}
+
 build_outer_b64() {
   local inner_json="$1"
   local token
@@ -612,7 +1086,7 @@ publish_inner_json() {
   eval_code='Outer = base64:decode(<<"'"$outer_b64"'">>), XName = rabbit_misc:r(<<"/">>, exchange, <<"heartbeats">>), X = rabbit_exchange:lookup_or_die(XName), MsgId = list_to_binary("smgmt-'"$label"'-" ++ integer_to_list(erlang:system_time(millisecond))), P = {list_to_atom("P_basic"), <<"Content">>, undefined, [], undefined, undefined, undefined, undefined, undefined, MsgId, undefined, undefined, <<"fls">>, <<"fls_backend">>, undefined}, Content = rabbit_basic:build_content(P, Outer), {ok, Msg} = rabbit_basic:message(XName, <<"notifications">>, Content), Result = rabbit_queue_type:publish_at_most_once(X, Msg), io:format("publish=~p exchange=heartbeats routing=notifications app_id=fls_backend user_id=fls label='"$label"'~n", [Result]).'
 
   set +e
-  output="$(engine exec "$RMQ_CONTAINER" rabbitmqctl eval "$eval_code" 2>&1)"
+  output="$(docker exec "$RMQ_CONTAINER" rabbitmqctl eval "$eval_code" 2>&1)"
   local rc=$?
   set -e
 
@@ -623,7 +1097,9 @@ publish_inner_json() {
   fi
 
   printf '%s\n' "$output" | redact_sensitive_output
-  if ! printf '%s\n' "$output" | grep -q 'publish=ok'; then
+  # grep -q may close the pipe early, causing printf to fail with SIGPIPE
+  # under pipefail even though RabbitMQ accepted the command. Consume all output.
+  if ! printf '%s\n' "$output" | grep -F 'publish=ok' >/dev/null; then
     echo "RabbitMQ publish did not report publish=ok." >&2
     exit 1
   fi
@@ -632,18 +1108,19 @@ publish_inner_json() {
 player_rows() {
   local online_only="$1"
   require_postgres_running
-  engine exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
+  docker exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
     select
-      convert_from(e.encrypted_funcom_id, 'UTF8') as fls_id,
+      coalesce(nullif(a."user", ''), nullif(e."user", '')) as fls_id,
       coalesce(ps.character_name, '') as character_name,
       coalesce(ps.online_status::text, 'Unknown') as online_status,
       coalesce(fs.map, '') as map,
       coalesce(wp.partition_id::text, '') as partition_id
     from dune.encrypted_accounts e
+    left join dune.accounts a on a.id = e.id
     left join dune.player_state ps on ps.account_id = e.id
     left join dune.farm_state fs on fs.server_id = ps.server_id
     left join dune.world_partition wp on wp.server_id = ps.server_id
-    where convert_from(e.encrypted_funcom_id, 'UTF8') <> ''
+    where coalesce(nullif(a."user", ''), nullif(e."user", '')) <> ''
       $([ "$online_only" = "1" ] && printf "and coalesce(ps.online_status::text, 'Offline') <> 'Offline'")
     order by ps.online_status desc nulls last, ps.character_name nulls last, fls_id;
   " 2>/dev/null
@@ -674,12 +1151,174 @@ players_command() {
   [ "$count" -gt 0 ] || echo "No known players found."
 }
 
+normalize_login_queue_name() {
+  local target="$1"
+
+  target="${target%$'\r'}"
+  target="${target%$'\n'}"
+  [ -n "$target" ] || { echo "Player FLS id or queue name is required." >&2; exit 2; }
+  case "$target" in
+    *_queue) ;;
+    *) target="${target}_queue" ;;
+  esac
+  if ! printf '%s' "$target" | grep -Eq '^[A-Za-z0-9_+.-]+_queue$'; then
+    echo "Invalid login queue name: $target" >&2
+    exit 2
+  fi
+  printf '%s' "$target"
+}
+
+login_queue_player_id() {
+  local queue="$1"
+  printf '%s' "${queue%_queue}"
+}
+
+rmq_login_queues() {
+  require_rmq_game_running
+  docker exec "$RMQ_CONTAINER" rabbitmqctl -q list_queues name consumers messages state owner_pid \
+    | awk -F '\t' '$1 ~ /_queue$/ { print }'
+}
+
+rmq_login_queue_row() {
+  local queue="$1" rows
+  rows="$(rmq_login_queues)" || return 2
+  printf '%s\n' "$rows" | awk -F '\t' -v queue="$queue" '$1 == queue { print; found = 1 } END { exit found ? 0 : 1 }'
+}
+
+login_queues_command() {
+  local show_all=0 rows row queue consumers messages state owner player status_row online_status map shown=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --all) show_all=1 ;;
+      *) echo "Unknown login-queues option: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  rows="$(rmq_login_queues || true)"
+  if [ -z "$(printf '%s\n' "$rows" | sed '/^$/d')" ]; then
+    echo "No per-player login queues found."
+    return 0
+  fi
+
+  printf '%-24s %-9s %-9s %-10s %-12s %s\n' "Player" "Consumers" "Messages" "State" "DB Status" "Map"
+  while IFS=$'\t' read -r queue consumers messages state owner; do
+    [ -n "${queue:-}" ] || continue
+    player="$(login_queue_player_id "$queue")"
+    status_row="$(player_status_for_fls "$player" || true)"
+    IFS='|' read -r online_status map <<< "$status_row"
+    online_status="${online_status:-Unknown}"
+    map="${map:-}"
+
+    if [ "$show_all" != "1" ] && printf '%s' "$online_status" | grep -Eiq '^online$'; then
+      continue
+    fi
+
+    printf '%-24s %-9s %-9s %-10s %-12s %s\n' "$(redact_fls "$player")" "${consumers:-0}" "${messages:-0}" "${state:-unknown}" "$online_status" "$map"
+    shown=$((shown + 1))
+  done <<< "$rows"
+
+  if [ "$shown" -eq 0 ]; then
+    echo "No offline/unknown per-player login queues found. Use --all to include online players."
+  fi
+}
+
+repair_login_queue_command() {
+  local target="${1:-}" yes=0 force=0 queue player row consumers messages state owner status_row online_status map answer payload output rc
+  [ -n "$target" ] || { echo "Usage: dune admin repair-login-queue <player-fls-id|queue-name> [--yes] [--force]" >&2; exit 2; }
+  shift || true
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --yes|-y) yes=1 ;;
+      --force) force=1 ;;
+      *) echo "Unknown repair-login-queue option: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  queue="$(normalize_login_queue_name "$target")"
+  player="$(login_queue_player_id "$queue")"
+  if row="$(rmq_login_queue_row "$queue")"; then
+    :
+  else
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+      echo "No RabbitMQ login queue exists for $(redact_fls "$player"). Nothing needs to be deleted."
+      return 0
+    fi
+    echo "Could not inspect the login queue. Nothing was deleted. Check RabbitMQ and try again." >&2
+    return 1
+  fi
+
+  IFS=$'\t' read -r queue consumers messages state owner <<< "$row"
+  status_row="$(player_status_for_fls "$player" || true)"
+  IFS='|' read -r online_status map <<< "$status_row"
+  online_status="${online_status:-Unknown}"
+  map="${map:-}"
+
+  echo "Target queue: $queue"
+  echo "Player:       $(redact_fls "$player")"
+  echo "Queue state:  consumers=${consumers:-0} messages=${messages:-0} state=${state:-unknown}"
+  echo "Client connection: $([ -n "${owner:-}" ] && printf 'Connected' || printf 'No exclusive owner')"
+  echo "DB status:    $online_status${map:+ on $map}"
+
+  if ! [[ "${consumers:-}" =~ ^[0-9]+$ ]] || [ "${state:-}" != running ]; then
+    echo "The queue is not in a verified idle state. Nothing was deleted." >&2
+    return 1
+  fi
+  if [ "$consumers" -gt 0 ] || [ -n "${owner:-}" ]; then
+    echo "The login queue is still in use. Nothing was deleted. Close the game, wait for the client to disconnect, then try again." >&2
+    return 1
+  fi
+
+  if printf '%s' "$online_status" | grep -Eiq '^online$' && [ "$force" != "1" ]; then
+    echo "Refusing to delete the login queue because the player still appears Online." >&2
+    echo "If the player is confirmed stuck/offline from the client side, rerun with --force --yes." >&2
+    exit 1
+  fi
+
+  if [ "$yes" != "1" ]; then
+    printf 'Delete this login queue so the next login can recreate it? [y/N]: '
+    read -r answer
+    case "$answer" in
+      y|Y|yes|YES) ;;
+      *) echo "Cancelled."; return 0 ;;
+    esac
+  fi
+
+  payload="{\"Queue\":\"$queue\",\"PlayerId\":\"$player\",\"Consumers\":\"${consumers:-0}\",\"Messages\":\"${messages:-0}\",\"State\":\"${state:-unknown}\",\"DbStatus\":\"$online_status\"}"
+  set +e
+  # The broker checks consumers atomically as well: a client can reconnect
+  # between inspection and deletion. --force bypasses stale DB status only.
+  output="$(docker exec "$RMQ_CONTAINER" rabbitmqctl -q delete_queue "$queue" --if-unused 2>&1)"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    if row="$(rmq_login_queue_row "$queue")"; then
+      :
+    else
+      if [ "$?" -eq 1 ]; then
+        echo "The login queue is already gone. Nothing else was deleted."
+        return 0
+      fi
+    fi
+    printf '%s\n' "$output" >&2
+    echo "The queue was not repaired. Close the game, wait for the client to disconnect, then try again. Active queues are never forcibly deleted." >&2
+    audit_admin_action "RepairLoginQueue" "$(redact_fls "$player")" "$queue" "$payload" "rabbitmq-game" "failed" "$output"
+    exit "$rc"
+  fi
+
+  audit_admin_action "RepairLoginQueue" "$(redact_fls "$player")" "$queue" "$payload" "rabbitmq-game" "deleted"
+  echo "Deleted stale login queue for $(redact_fls "$player")."
+  echo "Ask the player to connect again; the game client should recreate a clean queue."
+}
+
 player_status_for_fls() {
   local fls="$1"
-  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
     return 2
   fi
-  engine exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
+  docker exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
     with matched_accounts as (
       select a.id
       from dune.accounts a
@@ -701,10 +1340,10 @@ player_status_for_fls() {
 
 player_location_for_fls() {
   local fls="$1"
-  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
     return 2
   fi
-  engine exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
+  docker exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
     with matched_accounts as (
       select a.id
       from dune.accounts a
@@ -730,10 +1369,10 @@ player_location_for_fls() {
 
 player_position_for_fls() {
   local fls="$1"
-  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$POSTGRES_CONTAINER"; then
     return 2
   fi
-  engine exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
+  docker exec "$POSTGRES_CONTAINER" psql -U postgres -d dune -At -F '|' -c "
     with matched_accounts as (
       select a.id
       from dune.accounts a
@@ -758,7 +1397,9 @@ player_position_for_fls() {
       ((a.transform).rotation).z::float8,
       ((a.transform).rotation).w::float8,
       coalesce(a.dimension_index::text, ''),
-      coalesce(a.class, '')
+      coalesce(a.class, ''),
+      a.id::text,
+      a.serial::text
     from matched_accounts m
     join dune.player_state ps on ps.account_id = m.id
     join dune.actors a on a.id = ps.player_pawn_id
@@ -768,25 +1409,79 @@ player_position_for_fls() {
   " 2>/dev/null | tr -d '\r' || true
 }
 
+fresh_player_position_for_fls() {
+  local player="$1" baseline="$2" row deadline
+  local -a first current
+  IFS='|' read -r -a first <<< "$baseline"
+  if [ "${first[0]:-}" != "Online" ] || [ -z "${first[3]:-}" ] ||
+     ! [[ "${first[13]:-}" =~ ^[0-9]+$ && "${first[14]:-}" =~ ^[0-9]+$ ]]; then
+    echo "Cannot verify a fresh position for this online character. Nothing was spawned." >&2
+    return 1
+  fi
+  echo "Waiting for a fresh player position. Please stand still on clear ground." >&2
+  deadline=$((SECONDS + 120))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 2
+    row="$(player_position_for_fls "$player")"
+    IFS='|' read -r -a current <<< "$row"
+    # A logout, pawn replacement or travel invalidates the original request.
+    if [ "${current[0]:-}" != "Online" ] ||
+       [ "${current[1]:-}" != "${first[1]}" ] ||
+       [ "${current[2]:-}" != "${first[2]}" ] ||
+       [ "${current[3]:-}" != "${first[3]}" ] ||
+       [ "${current[13]:-}" != "${first[13]}" ]; then
+      echo "The character moved to another session or went offline. Nothing was spawned; try again after loading in." >&2
+      return 1
+    fi
+    # A new serial proves the game saved a new position after this request.
+    # Repeated reads of an unchanged row cannot establish freshness.
+    if [[ "${current[14]:-}" =~ ^[0-9]+$ ]] && [ "${current[14]}" != "${first[14]}" ]; then
+      printf '%s\n' "$row"
+      return 0
+    fi
+  done
+  echo "The game did not save a fresh player position in time. Nothing was spawned; stand still and try again." >&2
+  return 1
+}
+
 compute_spawn_in_front() {
-  local x="$1" y="$2" z="$3" qx="$4" qy="$5" qz="$6" qw="$7" offset="$8"
-  python3 - "$x" "$y" "$z" "$qx" "$qy" "$qz" "$qw" "$offset" <<'PY'
+  local x="$1" y="$2" z="$3" qx="$4" qy="$5" qz="$6" qw="$7" offset="$8" z_offset="${9:-0}"
+  python3 - "$x" "$y" "$z" "$qx" "$qy" "$qz" "$qw" "$offset" "$z_offset" <<'PY'
 import json, math, sys
-x, y, z, qx, qy, qz, qw, offset = map(float, sys.argv[1:])
-# Unreal uses X/Y as horizontal axes and Z as up. Derive yaw from the pawn quaternion.
-siny_cosp = 2.0 * (qw * qz + qx * qy)
-cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
-yaw = math.atan2(siny_cosp, cosy_cosp)
-sx = x + math.cos(yaw) * offset
-sy = y + math.sin(yaw) * offset
+x, y, z, qx, qy, qz, qw, offset, z_offset = map(float, sys.argv[1:])
+if not all(math.isfinite(v) for v in (x, y, z, qx, qy, qz, qw, offset, z_offset)):
+    raise SystemExit("The saved position is invalid. Nothing was spawned.")
+# Unreal uses X/Y as horizontal axes and Z as up. Use the pawn's +X forward vector,
+# projected onto the ground plane, so pitch/roll do not skew the spawn point.
+fx = 1.0 - 2.0 * (qy * qy + qz * qz)
+fy = 2.0 * (qx * qy + qw * qz)
+length = math.hypot(fx, fy)
+if length < 1e-6:
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+    fx, fy = math.cos(yaw), math.sin(yaw)
+else:
+    fx, fy = fx / length, fy / length
+yaw = math.atan2(fy, fx)
+sx = x + fx * offset
+sy = y + fy * offset
 print(json.dumps({
     "x": sx,
     "y": sy,
-    "z": z,
+    "z": z + z_offset,
     "rotation": math.degrees(yaw),
     "yawRadians": yaw,
 }, separators=(",", ":")))
 PY
+}
+
+is_flying_vehicle() {
+  local vehicle_id="$1" actor_class="$2"
+  case "$vehicle_id:$actor_class" in
+    *Ornithopter*|*ornithopter*|*FlyingVehicles*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 kick_command() {
@@ -896,8 +1591,10 @@ grant_item() {
   local item_value="${3:-}"
   local quantity="${4:-1}"
   local durability="${5:-1.0}"
+  local quality="${6:-0}"
   local original_player_id item_json item_id item_name item_category item_source inner_json
-  local verify_account_id before_count after_count
+  local verify_account_id before_count after_count expected_count verified_quantity
+  local status_row status_rc online_status online_map error_text
 
   if [ -z "$player_id" ] || [ -z "$item_value" ]; then
     usage >&2
@@ -907,6 +1604,7 @@ grant_item() {
   require_items_file
   validate_quantity "$quantity"
   validate_durability "$durability"
+  validate_quality "$quality"
 
   original_player_id="$player_id"
   player_id="$(resolve_player_id "$player_id")"
@@ -916,7 +1614,7 @@ grant_item() {
   item_category="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["category"])' "$item_json")"
   item_source="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["source"])' "$item_json")"
 
-  inner_json="$(build_inner_json "$player_id" "$item_id" "$quantity" "$durability")"
+  inner_json="$(build_inner_json "$player_id" "$item_id" "$quantity" "$durability" "$quality")"
 
   echo "Grant item:"
   if [ "$original_player_id" != "$player_id" ]; then
@@ -931,6 +1629,7 @@ grant_item() {
   echo "  Resolved id: $item_id"
   echo "  Quantity: $quantity"
   echo "  Durability: $durability"
+  echo "  Grade: $quality"
 
   if [ "${DUNE_ADMIN_DRY_RUN:-0}" = "1" ]; then
     echo
@@ -942,6 +1641,32 @@ grant_item() {
   fi
 
   echo
+  set +e
+  status_row="$(player_status_for_fls "$player_id")"
+  status_rc=$?
+  set -e
+  if [ "$status_rc" -eq 2 ]; then
+    error_text="Cannot verify whether the player is online because Postgres is unavailable."
+    echo "$error_text" >&2
+    audit_admin_action "AddItemToInventory" "$(redact_fls "$player_id")" "$item_name x$quantity" "$inner_json" "$ADMIN_COMMAND_PATH" "failed" "$error_text"
+    exit 1
+  fi
+  if [ -z "$status_row" ]; then
+    error_text="Cannot verify whether the player is online. Item grants require an online player."
+    echo "$error_text" >&2
+    audit_admin_action "AddItemToInventory" "$(redact_fls "$player_id")" "$item_name x$quantity" "$inner_json" "$ADMIN_COMMAND_PATH" "failed" "$error_text"
+    exit 1
+  fi
+  IFS='|' read -r online_status online_map <<< "$status_row"
+  echo "  Player status: ${online_status:-Unknown}"
+  echo "  Player map: ${online_map:-unknown}"
+  if ! printf '%s' "${online_status:-Offline}" | grep -Eiq '^online$'; then
+    error_text="Player is ${online_status:-Offline}."
+    echo "$error_text" >&2
+    audit_admin_action "AddItemToInventory" "$(redact_fls "$player_id")" "$item_name x$quantity" "$inner_json" "$ADMIN_COMMAND_PATH" "failed" "$error_text"
+    exit 1
+  fi
+
   require_token_file
   verify_account_id="$(account_id_for_player_id "$player_id")"
   before_count="$(player_item_stack_count "$verify_account_id" "$item_id")"
@@ -952,8 +1677,9 @@ grant_item() {
   audit_admin_action "AddItemToInventory" "$(redact_fls "$player_id")" "$item_name x$quantity" "$inner_json" "$ADMIN_COMMAND_PATH" "published"
   after_count="$(player_item_stack_count "$verify_account_id" "$item_id")"
   if [ -n "${before_count:-}" ] && [ -n "${after_count:-}" ]; then
+    expected_count="$((before_count + quantity))"
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-      [ "$after_count" -gt "$before_count" ] && break
+      [ "$after_count" -ge "$expected_count" ] && break
       sleep 1
       after_count="$(player_item_stack_count "$verify_account_id" "$item_id")"
       [ -n "${after_count:-}" ] || break
@@ -962,8 +1688,12 @@ grant_item() {
   echo "Grant item command published."
 
   if [ -n "${before_count:-}" ] && [ -n "${after_count:-}" ]; then
-    if [ "$after_count" -gt "$before_count" ]; then
-      echo "Verified inventory stack increased: $item_name ($before_count -> $after_count)."
+    verified_quantity="$((after_count - before_count))"
+    if [ "$verified_quantity" -ge "$quantity" ]; then
+      echo "Verified full inventory grant: $item_name x$quantity ($before_count -> $after_count)."
+    elif [ "$verified_quantity" -gt 0 ]; then
+      echo "WARNING: inventory grant was incomplete: requested $quantity, verified $verified_quantity for $item_name ($before_count -> $after_count)." >&2
+      echo "The game server accepted only part of the live grant. The missing quantity was not retried because retrying could duplicate delivered items." >&2
     else
       echo "WARNING: publish succeeded, but the player's inventory stack did not increase for $item_name." >&2
       echo "The game server may reject this template for AddItemToInventory, or the player may need to relog/refresh inventory." >&2
@@ -1098,7 +1828,7 @@ publish_player_command() {
   local player_id="$2"
   local destructive="${3:-0}"
   shift 3
-  local resolved_player inner_json answer audit_target output rc result error_text status_row status map
+  local resolved_player inner_json answer audit_target output rc result error_text status_row status map require_online=0
 
   [ -n "$player_id" ] || { echo "PlayerId is required." >&2; exit 2; }
   resolved_player="$(resolve_player_id "$player_id")"
@@ -1117,12 +1847,52 @@ publish_player_command() {
   fi
 
   inner_json="$(build_passthrough_json "$command_id" "PlayerId=$resolved_player=string" "$@")"
+  case "$command_id" in
+    AwardXP|SkillsSetUnspentSkillPoints|SkillsSetModuleLevel|UpdateAllWaterFillables|SpawnVehicleAt|TeleportTo) require_online=1 ;;
+  esac
+
+  if [ "${DUNE_ADMIN_DRY_RUN:-0}" = "1" ]; then
+    echo "Payload shape:"
+    python3 - "$inner_json" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+if payload.get("PlayerId") != "*":
+    payload["PlayerId"] = "<redacted>"
+for key in ("X", "Y", "Z", "Rotation", "Yaw"):
+    if key in payload:
+        payload[key] = "<redacted>"
+print(json.dumps(payload, separators=(",", ":")))
+PY
+    echo "Dry run: not publishing."
+    audit_admin_action "$command_id" "$audit_target" "$command_id" "$inner_json" "$ADMIN_COMMAND_PATH" "dry-run"
+    return 0
+  fi
 
   if [ "$resolved_player" != "*" ]; then
-    status_row="$(player_status_for_fls "$resolved_player" || true)"
+    set +e
+    status_row="$(player_status_for_fls "$resolved_player")"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 2 ] && [ "$require_online" = "1" ]; then
+      error_text="Cannot verify whether the player is online."
+      echo "$error_text" >&2
+      audit_admin_action "$command_id" "$audit_target" "$command_id" "$inner_json" "$ADMIN_COMMAND_PATH" "failed" "$error_text"
+      exit 1
+    fi
     if [ -n "$status_row" ]; then
       IFS='|' read -r status map <<< "$status_row"
       echo "Target state: status=${status:-Unknown} map=${map:-unknown}"
+      if [ "$require_online" = "1" ] && ! printf '%s' "${status:-Offline}" | grep -Eiq '^online$'; then
+        error_text="Player is ${status:-Offline}."
+        echo "$error_text" >&2
+        audit_admin_action "$command_id" "$audit_target" "$command_id" "$inner_json" "$ADMIN_COMMAND_PATH" "failed" "$error_text"
+        exit 1
+      fi
+    elif [ "$require_online" = "1" ]; then
+      error_text="Cannot verify whether the player is online."
+      echo "$error_text" >&2
+      audit_admin_action "$command_id" "$audit_target" "$command_id" "$inner_json" "$ADMIN_COMMAND_PATH" "failed" "$error_text"
+      exit 1
     else
       echo "WARNING: target was not found in local player_state/accounts; publishing by FLS id anyway." >&2
     fi
@@ -1134,14 +1904,11 @@ import json, sys
 payload = json.loads(sys.argv[1])
 if payload.get("PlayerId") != "*":
     payload["PlayerId"] = "<redacted>"
+for key in ("X", "Y", "Z", "Rotation", "Yaw"):
+    if key in payload:
+        payload[key] = "<redacted>"
 print(json.dumps(payload, separators=(",", ":")))
 PY
-
-  if [ "${DUNE_ADMIN_DRY_RUN:-0}" = "1" ]; then
-    echo "Dry run: not publishing."
-    audit_admin_action "$command_id" "$audit_target" "$command_id" "$inner_json" "$ADMIN_COMMAND_PATH" "dry-run"
-    return 0
-  fi
 
   set +e
   output="$(publish_inner_json "$inner_json" "$command_id" 2>&1)"
@@ -1159,13 +1926,93 @@ PY
   echo "$command_id command accepted by $ADMIN_COMMAND_PATH."
 }
 
+vehicle_max_id() {
+  psql_admin -At -v ON_ERROR_STOP=1 -c "
+    select coalesce(max(v.id), 0)
+    from dune.vehicles v;
+  " 2>/dev/null | tr -d '\r[:space:]' || true
+}
+
+repair_spawned_vehicle_permissions() {
+  local player="$1" actor_class="$2" x="$3" y="$4" z="$5" before_id="$6"
+  local actor_class_sql updated_id
+
+  [ -n "$actor_class" ] || return 0
+  [ -n "$before_id" ] || before_id=0
+
+  actor_class_sql="${actor_class//\'/\'\'}"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    updated_id="$(psql_admin -qAt -v ON_ERROR_STOP=1 -c "
+      with player_ref as (
+        select ps.player_controller_id
+        from dune.player_state ps
+        left join dune.accounts ac on ac.id = ps.account_id
+        left join dune.encrypted_accounts ea on ea.id = ps.account_id
+        where ps.character_state::text = 'Active'
+          and (
+            ac.\"user\" = '${player//\'/\'\'}'
+            or ac.funcom_id = '${player//\'/\'\'}'
+            or convert_from(ea.encrypted_funcom_id, 'UTF8') = '${player//\'/\'\'}'
+            or coalesce(ea.\"user\"::text, '') = '${player//\'/\'\'}'
+          )
+        order by ps.online_status::text = 'Online' desc, ps.last_login_time desc nulls last
+        limit 1
+      ),
+      candidate as (
+        select a.id, pr.player_controller_id
+        from dune.vehicles v
+        join dune.actors a on a.id = v.id
+        cross join player_ref pr
+        where v.id > ${before_id}
+          and a.class = '${actor_class_sql}'
+          and a.transform is not null
+          and abs(((a.transform).location).x::float8 - (${x})::float8) <= 5000
+          and abs(((a.transform).location).y::float8 - (${y})::float8) <= 5000
+          and abs(((a.transform).location).z::float8 - (${z})::float8) <= 5000
+        order by
+          power(((a.transform).location).x::float8 - (${x})::float8, 2) +
+          power(((a.transform).location).y::float8 - (${y})::float8, 2) +
+          power(((a.transform).location).z::float8 - (${z})::float8, 2),
+          a.id desc
+        limit 1
+      ),
+      permission_row as (
+        insert into dune.permission_actor(actor_id, actor_name, actor_type, access_level, is_child)
+        select c.id, '##' || regexp_replace(split_part(split_part(a.class, '.', 2), '_C', 1), '^BP_', ''), 2, 3, false
+        from candidate c
+        join dune.actors a on a.id = c.id
+        on conflict (actor_id) do nothing
+        returning actor_id
+      )
+      insert into dune.permission_actor_rank(permission_actor_id, player_id, rank)
+      select c.id, c.player_controller_id, 1
+      from candidate c
+      where c.player_controller_id is not null
+        and not exists (
+          select 1
+          from dune.permission_actor_rank existing
+          where existing.permission_actor_id = c.id
+            and existing.player_id = c.player_controller_id
+        )
+      returning permission_actor_id;
+    " 2>/dev/null | tr -d '\r' | awk '/^[0-9]+$/ { print; exit }' || true)"
+    if [ -n "$updated_id" ]; then
+      echo "Vehicle permissions repaired: actor_id=$updated_id"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "WARNING: no newly spawned matching vehicle was found for permission repair. Check dune.permission_actor_rank manually if the vehicle appears ownerless." >&2
+}
+
 player_location_command() {
   local target="${1:-}" row status map partition server x y z qx qy qz qw dimension actor_class
   [ -n "$target" ] || { echo "Usage: dune admin player-location <player-id>" >&2; exit 2; }
   target="$(resolve_player_id "$target")"
   row="$(player_position_for_fls "$target" || true)"
   [ -n "$row" ] || { echo "No player location found for $(redact_fls "$target")." >&2; exit 1; }
-  IFS='|' read -r status map partition server x y z qx qy qz qw dimension actor_class <<< "$row"
+  IFS='|' read -r status map partition server x y z qx qy qz qw dimension actor_class _ _ <<< "$row"
   echo "Player: $(redact_fls "$target")"
   echo "Status: ${status:-Unknown}"
   echo "Map: ${map:-unknown}"
@@ -1247,35 +2094,73 @@ teleport_command() {
   publish_player_command "TeleportTo" "$player" 0 "${args[@]}"
 }
 
+guard_tank_spawn() {
+  local player="$1" row status map partition server dimension container
+  row="$(player_position_for_fls "$player")"
+  IFS='|' read -r status map partition server _ _ _ _ _ _ _ dimension _ <<< "$row"
+  if [ "$status" != "Online" ] || [ "$map" != "Survival_1" ] || ! [[ "$partition" =~ ^[0-9]+$ ]]; then
+    echo "Tank spawning requires an online player in a patched Hagga Sietch." >&2; return 1
+  fi
+  container="dune-server-survival-1"
+  [ "$dimension" = "0" ] || container="dune-server-survival-1-$partition"
+  runtime/scripts/experimental-tanks.sh guard "$map" "$container" "$partition" "$server"
+}
+
 spawn_vehicle_at_command() {
   local player="${1:-}" class_name="${2:-}" template="${3:-}" x="${4:-}" y="${5:-}" z="${6:-}" rotation="${7:-0}"
-  local vehicle_json vehicle_id actor_class
+  local resolved_player vehicle_json vehicle_id actor_class before_vehicle_id
   [ -n "$player" ] && [ -n "$class_name" ] && [ -n "$template" ] && [ -n "$x" ] && [ -n "$y" ] && [ -n "$z" ] || {
     echo "Usage: dune admin spawn-vehicle-at <player-id> <vehicle-id> <template-name> <x> <y> <z> [rotation]" >&2
     exit 2
   }
+  resolved_player="$(resolve_player_id "$player")"
+  [ "$resolved_player" != "*" ] || { echo "Vehicle spawn requires a specific player." >&2; exit 2; }
   validate_float "$x" "X"; validate_float "$y" "Y"; validate_float "$z" "Z"; validate_float "$rotation" "Rotation"
   vehicle_json="$(resolve_vehicle "$class_name" "$template")"
   vehicle_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["id"])' "$vehicle_json")"
   actor_class="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["actor_class"])' "$vehicle_json")"
   template="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["template"])' "$vehicle_json")"
+  if [ "$vehicle_id" = "Tank" ]; then guard_tank_spawn "$resolved_player"; fi
   echo "Vehicle: $vehicle_id"
   echo "Actor class: $actor_class"
   echo "Template: $template"
-  publish_player_command "SpawnVehicleAt" "$player" 0 \
+  before_vehicle_id=0
+  if [ "${DUNE_ADMIN_DRY_RUN:-0}" != "1" ]; then
+    before_vehicle_id="$(vehicle_max_id)"
+  fi
+  publish_player_command "SpawnVehicleAt" "$resolved_player" 0 \
     "ClassName=$vehicle_id=string" "TemplateName=$template=string" \
     "X=$x=float" "Y=$y=float" "Z=$z=float" "Rotation=$rotation=float" "Persistent=1.0=float"
+  if [ "${DUNE_ADMIN_DRY_RUN:-0}" != "1" ]; then
+    repair_spawned_vehicle_permissions "$resolved_player" "$actor_class" "$x" "$y" "$z" "$before_vehicle_id"
+  fi
 }
 
 spawn_vehicle_command() {
-  local player="${1:-}" class_name="${2:-}" template="${3:-}" offset="${4:-400}"
+  local player="${1:-}" class_name="${2:-}" template="${3:-}" offset="${4:-1000}"
   local resolved_player row status map partition server x y z qx qy qz qw dimension actor_class spawn_json sx sy sz rotation
+  local vehicle_json vehicle_id vehicle_actor_class z_offset=0 original_offset
   [ -n "$player" ] && [ -n "$class_name" ] && [ -n "$template" ] || {
     echo "Usage: dune admin spawn-vehicle <player-id> <vehicle-id> <template-name> [offset-units]" >&2
     echo "Use spawn-vehicle-at for advanced manual coordinates." >&2
     exit 2
   }
   validate_float "$offset" "Offset"
+  original_offset="$offset"
+  vehicle_json="$(resolve_vehicle "$class_name" "$template")"
+  vehicle_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["id"])' "$vehicle_json")"
+  vehicle_actor_class="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["actor_class"])' "$vehicle_json")"
+  template="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["template"])' "$vehicle_json")"
+  if is_flying_vehicle "$vehicle_id" "$vehicle_actor_class"; then
+    z_offset="${DUNE_ADMIN_FLYING_VEHICLE_Z_OFFSET:-700}"
+    offset="$(python3 - "$offset" "${DUNE_ADMIN_FLYING_VEHICLE_MIN_OFFSET:-3000}" <<'PY'
+import sys
+offset = float(sys.argv[1])
+minimum = float(sys.argv[2])
+print(max(offset, minimum))
+PY
+)"
+  fi
   resolved_player="$(resolve_player_id "$player")"
   [ "$resolved_player" != "*" ] || { echo "Vehicle spawn requires a specific player." >&2; exit 2; }
   row="$(player_position_for_fls "$resolved_player" || true)"
@@ -1284,23 +2169,45 @@ spawn_vehicle_command() {
     echo "Vehicle spawn-in-front requires the player to be online with player_state.player_pawn_id and actors.transform available." >&2
     exit 1
   fi
-  IFS='|' read -r status map partition server x y z qx qy qz qw dimension actor_class <<< "$row"
+  row="$(fresh_player_position_for_fls "$resolved_player" "$row")" || return 1
+  IFS='|' read -r status map partition server x y z qx qy qz qw dimension actor_class _ _ <<< "$row"
+  if ! printf '%s' "${status:-Offline}" | grep -Eiq '^online$'; then
+    echo "Player is ${status:-Offline}. Vehicle spawn requires the player to be online." >&2
+    exit 1
+  fi
   for value in "$x" "$y" "$z" "$qx" "$qy" "$qz" "$qw"; do
     [ -n "$value" ] || { echo "Live location/facing is incomplete for $(redact_fls "$resolved_player")." >&2; exit 1; }
   done
-  spawn_json="$(compute_spawn_in_front "$x" "$y" "$z" "$qx" "$qy" "$qz" "$qw" "$offset")"
+  spawn_json="$(compute_spawn_in_front "$x" "$y" "$z" "$qx" "$qy" "$qz" "$qw" "$offset" "$z_offset")"
   sx="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["x"])' "$spawn_json")"
   sy="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["y"])' "$spawn_json")"
   sz="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["z"])' "$spawn_json")"
   rotation="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["rotation"])' "$spawn_json")"
-  echo "Player location: map=${map:-unknown} partition=${partition:-unknown} X=$x Y=$y Z=$z"
-  echo "Computed spawn point $offset units in front: X=$sx Y=$sy Z=$sz Rotation=$rotation"
-  spawn_vehicle_at_command "$resolved_player" "$class_name" "$template" "$sx" "$sy" "$sz" "$rotation"
+  echo "Fresh player position confirmed: map=${map:-unknown} partition=${partition:-unknown}"
+  if [ "$z_offset" != "0" ] || [ "$offset" != "$original_offset" ]; then
+    echo "Flying vehicle adjustment: offset=$offset units, Z lift=$z_offset units"
+  fi
+  echo "Spawning $offset units in front of the character."
+  spawn_vehicle_at_command "$resolved_player" "$vehicle_id" "$template" "$sx" "$sy" "$sz" "$rotation"
+}
+
+broadcast_restart_warning_command() {
+  local minutes="${1:-}"
+  [ -n "$minutes" ] || { echo "Usage: dune admin broadcast-restart-warning <minutes>" >&2; exit 2; }
+  validate_int "$minutes" "Minutes"
+  if [ "$minutes" -lt 1 ] || [ "$minutes" -gt 1440 ]; then
+    echo "Minutes must be between 1 and 1440." >&2
+    exit 2
+  fi
+  local inner_json
+  inner_json="$(build_restart_warning_json "$minutes")"
+  publish_inner_json "$inner_json" "restart-warning"
+  audit_admin_action "ServiceBroadcast" "all" "Server Restart Incoming" "$inner_json" "$ADMIN_COMMAND_PATH" "published"
 }
 
 unsupported_command() {
   cat <<'EOF'
-Unsupported upstream admin actions in this Podman port:
+Unsupported upstream admin actions in this Docker port:
 
 - Journey / quest / tag progression commands are not exposed. The inspected upstream
   service removed JourneyCompleteJourneyEntry because it publishes successfully but
@@ -1309,10 +2216,10 @@ Unsupported upstream admin actions in this Podman port:
   server-side handler in this stack.
 - CheatScript and ServerExec are not exposed because the inspected upstream service
   marks them as live-tested no-ops.
-- Direct specialization-XP-by-track is not exposed. Live testing in the reference manager
-  found AwardXP ignores Category and grants generic player XP only.
+- Direct specialization track edits are exposed as specialization-xp/specialization-max
+  database admin tools. They update PostgreSQL directly and create a backup before writes.
 
-Implemented tools use the same Podman-native RabbitMQ admin command path as item
+Implemented tools use the same Docker-native RabbitMQ admin command path as item
 grants and write audit history to runtime/generated/admin-command-history.tsv.
 Detailed JSONL audit records are written to runtime/generated/admin-command-audit.jsonl.
 EOF
@@ -1323,6 +2230,14 @@ case "$cmd" in
   players)
     shift || true
     players_command "$@"
+    ;;
+  login-queues)
+    shift || true
+    login_queues_command "$@"
+    ;;
+  repair-login-queue)
+    shift || true
+    repair_login_queue_command "$@"
     ;;
   kick)
     shift || true
@@ -1368,6 +2283,14 @@ case "$cmd" in
     shift || true
     skill_modules_command "${1:-}"
     ;;
+  specialization-xp)
+    shift || true
+    specialization_xp_command "$@"
+    ;;
+  specialization-max)
+    shift || true
+    specialization_max_command "$@"
+    ;;
   refill-water)
     shift || true
     refill_water_command "$@"
@@ -1391,6 +2314,10 @@ case "$cmd" in
   spawn-vehicle-at)
     shift || true
     spawn_vehicle_at_command "$@"
+    ;;
+  broadcast-restart-warning)
+    shift || true
+    broadcast_restart_warning_command "$@"
     ;;
   vehicle-list)
     shift || true

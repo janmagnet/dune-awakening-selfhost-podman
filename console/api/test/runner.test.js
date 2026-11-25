@@ -1,0 +1,518 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { CURRENT_GAME_LOG_SCRIPT, appendBoundedOutput, buildDuneArgs, dockerContainerForLogService, isReadOnlySql, parseVehicleList, runDockerCurrentGameLog, runDockerLogs, validateServiceName } from "../src/runner.js";
+import { redact } from "../src/redact.js";
+import { taskOperations } from "../src/tasks.js";
+
+test("validates known service names and aliases", () => {
+  assert.equal(validateServiceName("gateway"), "gateway");
+  assert.equal(validateServiceName("sgw"), "gateway");
+  assert.equal(validateServiceName("coriolis"), "coriolis");
+  assert.equal(dockerContainerForLogService("coriolis"), "dune-coriolis-coordinator");
+  assert.equal(dockerContainerForLogService("console"), "redblink-dune-docker-console");
+  assert.throws(() => validateServiceName("console"), "Console log access must not grant generic service control");
+  assert.equal(validateServiceName("dune-server-survival-1-43"), "dune-server-survival-1-43");
+  assert.throws(() => validateServiceName("gateway; rm -rf /"));
+});
+
+test("Experimental Tanks require an explicit Hagga restart confirmation", () => {
+  assert.deepEqual(buildDuneArgs("experimentalTanksStatus"), ["experimental-tanks", "status"]);
+  assert.deepEqual(buildDuneArgs("experimentalTanksApply", { enabled: true, confirmRestart: true }), ["experimental-tanks", "apply", "true"]);
+  assert.deepEqual(buildDuneArgs("experimentalTanksApply", { enabled: false, confirmRestart: true }), ["experimental-tanks", "apply", "false"]);
+  assert.throws(() => buildDuneArgs("experimentalTanksApply", { enabled: true }));
+  assert.throws(() => buildDuneArgs("experimentalTanksApply", { enabled: "true", confirmRestart: true }));
+});
+
+test("bounds captured child-process output while retaining its newest tail", () => {
+  assert.equal(appendBoundedOutput("abc", "def", 10), "abcdef");
+  const output = appendBoundedOutput("old-".repeat(30), "new-output", 48);
+  assert.ok(output.length <= 48);
+  assert.match(output, /earlier output truncated/);
+  assert.ok(output.endsWith("new-output"));
+});
+
+test("live Docker logs do not buffer output and stop when the client aborts", async () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = (signal) => {
+    child.killedWith = signal;
+    queueMicrotask(() => child.emit("close", null, signal));
+  };
+  const controller = new AbortController();
+  const lines = [];
+  const resultPromise = runDockerLogs("gateway", {
+    follow: true,
+    captureOutput: false,
+    signal: controller.signal,
+    timeoutMs: 1000,
+    spawnImpl: () => child,
+    onLine: (line) => lines.push(line)
+  });
+
+  child.stdout.emit("data", Buffer.from("large live log line\n"));
+  controller.abort();
+  const result = await resultPromise;
+
+  assert.equal(child.killedWith, "SIGTERM");
+  assert.deepEqual(lines, ["large live log line\n"]);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "");
+});
+
+test("orchestrator logs use the Compose service instead of a fixed container name", async () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => {};
+  let command = null;
+  let args = null;
+  let spawnOptions = null;
+  const resultPromise = runDockerLogs("orchestrator", {
+    tail: 25,
+    timeoutMs: 1000,
+    spawnImpl: (nextCommand, nextArgs, nextOptions) => {
+      command = nextCommand;
+      args = nextArgs;
+      spawnOptions = nextOptions;
+      return child;
+    }
+  });
+  child.emit("close", 0, null);
+  await resultPromise;
+
+  assert.equal(command, "docker");
+  assert.deepEqual(args, ["compose", "logs", "--tail", "25", "orchestrator"]);
+  assert.equal(spawnOptions.shell, false);
+  assert.ok(!args.includes("dune-orchestrator"));
+});
+
+test("current game logs are read from the allowlisted container without interpolating service input", async () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => {};
+  let command = null;
+  let args = null;
+  const resultPromise = runDockerCurrentGameLog("dune-server-deepdesert-1-59", {
+    tail: 1234,
+    timeoutMs: 1000,
+    spawnImpl: (nextCommand, nextArgs) => {
+      command = nextCommand;
+      args = nextArgs;
+      return child;
+    }
+  });
+  child.stdout.emit("data", Buffer.from("Current Coriolis World Seed: 4\n"));
+  child.emit("close", 0, null);
+  const result = await resultPromise;
+
+  assert.equal(command, "docker");
+  assert.deepEqual(args.slice(0, 3), ["exec", "dune-server-deepdesert-1-59", "sh"]);
+  assert.equal(args.at(-1), "1234");
+  assert.match(result.stdout, /World Seed: 4/);
+  assert.throws(() => runDockerCurrentGameLog("dune-server-deepdesert-1-59; touch /tmp/nope"), /Unsupported service/);
+});
+
+test("allows dynamic map containers as log targets", () => {
+  assert.equal(dockerContainerForLogService("survival-1"), "dune-server-survival-1");
+  assert.equal(dockerContainerForLogService("dune-server-survival-1-43"), "dune-server-survival-1-43");
+  assert.equal(dockerContainerForLogService("dune-server-sh-arrakeen-3"), "dune-server-sh-arrakeen-3");
+});
+
+test("builds allowlisted command arguments without shell interpolation", () => {
+  assert.deepEqual(buildDuneArgs("status"), ["status"]);
+  assert.deepEqual(buildDuneArgs("doctor"), ["doctor"]);
+  assert.deepEqual(buildDuneArgs("networkBindFix"), ["network", "fix"]);
+  assert.deepEqual(buildDuneArgs("storageCleanupImages"), ["storage", "cleanup", "--unused-images"]);
+  assert.deepEqual(buildDuneArgs("storageCleanupBuildCache"), ["storage", "cleanup", "--build-cache"]);
+  assert.deepEqual(buildDuneArgs("restartService", { service: "director" }), ["restart", "director"]);
+  assert.deepEqual(buildDuneArgs("restartServiceStop", { service: "survival" }), ["stop-service", "survival"]);
+  assert.deepEqual(buildDuneArgs("restartServiceStop", { service: "overmap" }), ["stop-service", "overmap"]);
+  assert.deepEqual(buildDuneArgs("restartServiceStart", { service: "survival" }), ["restart", "survival"]);
+  assert.deepEqual(buildDuneArgs("logs", { service: "gateway" }), ["logs", "gateway"]);
+  assert.deepEqual(buildDuneArgs("backupRestore", { backup: "dune-db-test.backup" }), ["db", "restore", "dune-db-test.backup", "--no-safety-backup"]);
+  assert.deepEqual(buildDuneArgs("backupRestore", { backup: "dune-db-test.backup", identityMode: "adopt-backup" }), ["db", "restore", "dune-db-test.backup", "--no-safety-backup", "--adopt-backup-battlegroup"]);
+  assert.deepEqual(buildDuneArgs("backupRestore", { backup: "dune-db-test.backup", identityMode: "keep-current" }), ["db", "restore", "dune-db-test.backup", "--no-safety-backup", "--keep-current-battlegroup"]);
+  assert.throws(() => buildDuneArgs("backupRestore", { backup: "dune-db-test.backup", identityMode: "automatic" }), /Unsupported backup Battlegroup identity choice/);
+  assert.deepEqual(buildDuneArgs("backupDelete", { backup: "dune-db-test.backup" }), ["db", "delete", "dune-db-test.backup"]);
+  assert.deepEqual(buildDuneArgs("backupDeleteSelected", { backups: ["one.backup", "two.backup", "one.backup"] }), ["db", "delete", "one.backup", "two.backup"]);
+  assert.throws(() => buildDuneArgs("backupDeleteSelected", { backups: [] }), /Select between 1 and 100 backups/);
+  assert.deepEqual(buildDuneArgs("backupDeleteAll"), ["db", "delete", "--all"]);
+  assert.deepEqual(buildDuneArgs("stopGameServersForDbWrites"), ["stop-game-servers-for-db-writes"]);
+  assert.deepEqual(buildDuneArgs("adminAddXp", { playerId: "FLS_TEST", amount: 1000 }), ["admin", "award-xp", "FLS_TEST", "1000"]);
+  assert.deepEqual(buildDuneArgs("updateApply"), ["update", "--yes"]);
+  assert.deepEqual(buildDuneArgs("updateInstallAssets"), ["update", "install-assets"]);
+  assert.deepEqual(buildDuneArgs("updateAutoStatus"), ["update", "auto", "status"]);
+  assert.deepEqual(buildDuneArgs("updateAutoEnable"), ["update", "auto", "enable", "60", "1", "1", "15,10,5,1", "0", "360", "0", "0"]);
+  assert.deepEqual(buildDuneArgs("updateAutoEnable", {
+    intervalMinutes: 30,
+    applyEnabled: true,
+    notifyEnabled: true,
+    notifyMinutes: "10, 5, 1",
+    waitUntilEmpty: true,
+    maxWaitMinutes: 240
+  }), ["update", "auto", "enable", "30", "1", "1", "10,5,1", "1", "240", "0", "0"]);
+  assert.deepEqual(buildDuneArgs("updateAutoEnable", { updateConsole: true, manageTanks: true }),
+    ["update", "auto", "enable", "60", "1", "1", "15,10,5,1", "0", "360", "1", "1"]);
+  assert.throws(() => buildDuneArgs("updateAutoEnable", { updateConsole: "false" }), /updateConsole must be true or false/);
+  assert.throws(() => buildDuneArgs("updateAutoEnable", { manageTanks: 1 }), /manageTanks must be true or false/);
+  assert.deepEqual(buildDuneArgs("updateAutoDisable"), ["update", "auto", "disable"]);
+  assert.deepEqual(buildDuneArgs("selfUpdateApply"), ["self-update", "install", "latest"]);
+  assert.deepEqual(buildDuneArgs("selfUpdateQaApply", { sha: "a".repeat(40) }), ["self-update", "install-qa", "a".repeat(40)]);
+  assert.throws(() => buildDuneArgs("selfUpdateQaApply", { sha: "main; touch /tmp/nope" }), /Invalid QA build/);
+  assert.deepEqual(buildDuneArgs("backupAutoStatus"), ["db", "auto", "status"]);
+  assert.deepEqual(buildDuneArgs("backupAutoEnable", { time: "05:30", retentionDays: 14 }), ["db", "auto", "enable", "05:30", "14", "24"]);
+  assert.deepEqual(buildDuneArgs("backupAutoEnable", { time: "05:30", retentionDays: 0 }), ["db", "auto", "enable", "05:30", "0", "24"]);
+  assert.deepEqual(buildDuneArgs("backupAutoEnable", { time: "05:30", retentionDays: 0, intervalHours: 12 }), ["db", "auto", "enable", "05:30", "0", "12"]);
+  assert.deepEqual(buildDuneArgs("backupAutoDisable"), ["db", "auto", "disable"]);
+  assert.deepEqual(buildDuneArgs("restartScheduleStatus"), ["restart-schedule", "status"]);
+  assert.deepEqual(buildDuneArgs("restartScheduleEnable", { time: "04:30" }), ["restart-schedule", "enable", "04:30", "15"]);
+  assert.deepEqual(buildDuneArgs("restartScheduleEnable", { time: "04:30", notifyMinutes: 30 }), ["restart-schedule", "enable", "04:30", "30"]);
+  assert.deepEqual(buildDuneArgs("restartScheduleDisable"), ["restart-schedule", "disable"]);
+  assert.deepEqual(buildDuneArgs("ipChangeRestartStatus"), ["ip-change-restart", "status"]);
+  assert.deepEqual(buildDuneArgs("ipChangeRestartEnable", { intervalMinutes: 10, notifyMinutes: 1 }), ["ip-change-restart", "enable", "10", "1"]);
+  assert.deepEqual(buildDuneArgs("ipChangeRestartDisable"), ["ip-change-restart", "disable"]);
+  assert.deepEqual(buildDuneArgs("ipChangeRestartCheckNow"), ["ip-change-restart", "check-now"]);
+  assert.deepEqual(buildDuneArgs("adminTeleport", { playerId: "FLS_TEST", x: 1, y: 2, z: 3, yaw: 90 }), ["admin", "teleport", "FLS_TEST", "1", "2", "3", "90"]);
+  assert.deepEqual(buildDuneArgs("adminGiveItem", { playerId: "FLS_TEST", itemName: "Water", quantity: 2 }), ["admin", "grant-item", "FLS_TEST", "Water", "2", "1", "0"]);
+  assert.deepEqual(buildDuneArgs("adminGiveItem", { playerId: "FLS_TEST", itemName: "Water", quantity: 2, quality: 3 }), ["admin", "grant-item", "FLS_TEST", "Water", "2", "1", "3"]);
+  assert.deepEqual(buildDuneArgs("adminGiveItemId", { playerId: "FLS_TEST", itemId: "WaterBottle_1", quantity: 2, quality: 0 }), ["admin", "grant-item-id", "FLS_TEST", "WaterBottle_1", "2", "1", "0"]);
+  assert.deepEqual(buildDuneArgs("adminGiveItemId", { playerId: "FLS_TEST", itemId: "WaterBottle_1", quantity: 2, durability: 0.5, quality: 5 }), ["admin", "grant-item-id", "FLS_TEST", "WaterBottle_1", "2", "1", "5"]);
+  assert.deepEqual(buildDuneArgs("adminGiveItems", { playerId: "FLS_TEST", template: "scout-ornithopter-mk6" }), ["admin", "grant-template", "FLS_TEST", "scout-ornithopter-mk6"]);
+  assert.deepEqual(buildDuneArgs("adminSetSkillPoints", { playerId: "FLS_TEST", points: 12 }), ["admin", "skill-points", "FLS_TEST", "12"]);
+  assert.deepEqual(buildDuneArgs("adminSetSkillModule", { playerId: "FLS_TEST", module: "Training_Test", level: 2 }), ["admin", "skill-module", "FLS_TEST", "Training_Test", "2"]);
+  assert.deepEqual(buildDuneArgs("adminKickAllOnline"), ["admin", "kick", "--all-online", "--yes"]);
+  assert.deepEqual(buildDuneArgs("adminSpawnVehicle", { playerId: "FLS_TEST", vehicleId: "Sandbike", template: "T6", offset: 400 }), ["admin", "spawn-vehicle", "FLS_TEST", "Sandbike", "T6", "400"]);
+  assert.deepEqual(buildDuneArgs("adminCleanInventory", { playerId: "FLS_TEST" }), ["admin", "clean-inventory", "FLS_TEST"]);
+  assert.deepEqual(buildDuneArgs("adminResetProgression", { playerId: "FLS_TEST" }), ["admin", "reset-progression", "FLS_TEST"]);
+  assert.deepEqual(buildDuneArgs("mapsMode", { map: "DeepDesert_1" }), ["maps", "mode", "DeepDesert_1"]);
+  assert.deepEqual(buildDuneArgs("mapsSetMode", { map: "DeepDesert_1", mode: "always-on" }), ["maps", "set", "DeepDesert_1", "always-on"]);
+  assert.deepEqual(buildDuneArgs("mapsSetMode", { map: "DeepDesert_1", mode: "overmap-active" }), ["maps", "set", "DeepDesert_1", "overmap-active"]);
+  assert.deepEqual(buildDuneArgs("mapsSetMode", { map: "DeepDesert_1", mode: "disabled" }), ["maps", "set", "DeepDesert_1", "disabled"]);
+  assert.deepEqual(buildDuneArgs("mapsSpawn", { target: "30" }), ["spawn", "30"]);
+  assert.deepEqual(buildDuneArgs("mapsDespawn", { target: "DeepDesert_1" }), ["despawn", "DeepDesert_1", "--force"]);
+  assert.deepEqual(buildDuneArgs("autoscalerAction", { action: "restart" }), ["autoscaler", "restart"]);
+  assert.deepEqual(buildDuneArgs("memorySet", { map: "DeepDesert_1", memory: "8g" }), ["memory", "set", "DeepDesert_1", "8g"]);
+  assert.deepEqual(buildDuneArgs("memorySet", { map: "DeepDesert_1", memory: "2.50g" }), ["memory", "set", "DeepDesert_1", "2.50g"]);
+  assert.deepEqual(buildDuneArgs("memorySetNoRestart", { map: "DeepDesert_1", partitionId: "8", memory: "10g" }), ["memory", "set-no-restart", "partition:8", "10g"]);
+  assert.deepEqual(buildDuneArgs("memorySetNoRestart", { map: "DeepDesert_1", partitionId: "8", memory: "0.50g" }), ["memory", "set-no-restart", "partition:8", "0.50g"]);
+  assert.deepEqual(buildDuneArgs("sietchesSetActive", { map: "Survival_1", count: 2 }), ["sietches", "set-active", "Survival_1", "2"]);
+  assert.deepEqual(buildDuneArgs("sietchesDimensions", { map: "Survival_1" }), ["sietches", "dimensions", "Survival_1", "--active-only"]);
+  assert.deepEqual(buildDuneArgs("sietchesDimensionIds", { map: "Survival_1" }), ["sietches", "dimensions", "Survival_1", "--active-only", "--ids"]);
+  assert.deepEqual(buildDuneArgs("sietchesSetDisplay", { partitionId: 38, displayName: "Sietch Alpha" }), ["sietches", "set-display", "38", "Sietch Alpha"]);
+  assert.deepEqual(buildDuneArgs("sietchesSetDisplay", { partitionId: 38, displayName: "The Kulon Show" }), ["sietches", "set-display", "38", "The Kulon Show"]);
+  assert.deepEqual(buildDuneArgs("sietchesSetDisplay", { partitionId: 38, displayName: "sietch   Alraab v2" }), ["sietches", "set-display", "38", "sietch   Alraab v2"]);
+  assert.deepEqual(buildDuneArgs("sietchesSetSettings", { partitionId: 38, displayName: "New Home", password: "secret" }), ["sietches", "set-settings", "38", "New Home", "secret"]);
+  assert.deepEqual(buildDuneArgs("sietchesRestart", { partitionId: 38 }), ["sietches", "restart", "38"]);
+  assert.deepEqual(buildDuneArgs("sietchesRestartStop", { partitionId: 38 }), ["sietches", "stop-partition", "38"]);
+  assert.deepEqual(buildDuneArgs("sietchesRestartStart", { partitionId: 38 }), ["sietches", "start-partition", "38"]);
+  assert.deepEqual(buildDuneArgs("sietchesSetDisplay", { partitionId: 38, displayName: "" }), ["sietches", "set-display", "38", ""]);
+  assert.throws(() => buildDuneArgs("sietchesSetDisplay", { partitionId: 38, displayName: "Duke's Sietch" }), /not supported/);
+  assert.throws(() => buildDuneArgs("sietchesSetDisplay", { partitionId: 38, displayName: "Alpha|Beta" }), /not supported/);
+  assert.deepEqual(buildDuneArgs("deepdesertAction", { action: "disable" }), ["deepdesert", "dual", "disable", "--yes", "--force"]);
+  assert.deepEqual(buildDuneArgs("deepdesertAction", { instances: 3, thirdRole: "pvp" }), ["deepdesert", "layout", "set", "3", "--third-role", "pvp", "--yes", "--force"]);
+  assert.deepEqual(buildDuneArgs("deepdesertAction", { instances: 2 }), ["deepdesert", "layout", "set", "2", "--third-role", "pve", "--yes", "--force"]);
+  assert.throws(() => buildDuneArgs("deepdesertAction", { instances: 3, thirdRole: "open" }), /must be pve or pvp/);
+  assert.throws(() => buildDuneArgs("deepdesertAction", { instances: 4 }), /Expected integer 1-3/);
+  assert.deepEqual(buildDuneArgs("userSettingsEngineValues"), ["usersettings", "engine-values"]);
+  assert.deepEqual(buildDuneArgs("userSettingsMapEngineValues", { map: "Survival_1" }), ["usersettings", "map-engine-values", "Survival_1"]);
+  assert.deepEqual(buildDuneArgs("userSettingsPartitionEngineValues", { map: "Survival_1", partitionId: 3 }), ["usersettings", "partition-engine-values", "Survival_1", "3"]);
+  assert.deepEqual(buildDuneArgs("userSettingsGlobalValues"), ["usersettings", "global-values"]);
+  assert.deepEqual(buildDuneArgs("userSettingsMapValues", { map: "Survival_1" }), ["usersettings", "map-values", "Survival_1"]);
+  assert.deepEqual(buildDuneArgs("userSettingsPartitionValues", { map: "Survival_1", partitionId: 1 }), ["usersettings", "partition-values", "Survival_1", "1"]);
+  assert.deepEqual(buildDuneArgs("userSettingsServerCustomValues", { scope: "serverCustomGlobal", map: "Survival_1" }), ["usersettings", "server-custom-values", "global", "Survival_1", ""]);
+  assert.deepEqual(buildDuneArgs("userSettingsServerCustomValues", { scope: "serverCustomPartition", map: "Survival_1", partitionId: 1 }), ["usersettings", "server-custom-values", "partition", "Survival_1", "1"]);
+  assert.deepEqual(buildDuneArgs("userSettingsSave", { scope: "serverCustomMap", map: "Overmap", values: { gathering_amount: "2.0" } }).slice(0, 5), ["usersettings", "bulk-save", "serverCustomMap", "Overmap", ""]);
+  assert.deepEqual(buildDuneArgs("userSettingsResetAndRestart", { scope: "global" }), ["usersettings", "reset-global-game"]);
+  assert.deepEqual(buildDuneArgs("userSettingsResetAndRestart", { scope: "mapEngine", map: "Survival_1" }), ["usersettings", "reset-map-engine", "Survival_1"]);
+  assert.deepEqual(buildDuneArgs("userSettingsResetAndRestart", { scope: "partitionEngine", map: "Survival_1", partitionId: 3 }), ["usersettings", "reset-partition-engine", "Survival_1", "3"]);
+  assert.deepEqual(buildDuneArgs("userSettingsClientGameIni", {}), ["usersettings", "client-game-ini"]);
+  assert.deepEqual(buildDuneArgs("userSettingsClientGameIni", { map: "Survival_1" }), ["usersettings", "client-game-ini", "Survival_1"]);
+  assert.deepEqual(buildDuneArgs("userSettingsClientGameIni", { map: "Survival_1", partitionId: 3 }), ["usersettings", "client-game-ini", "Survival_1", "3"]);
+  assert.deepEqual(buildDuneArgs("userSettingsClientEngineIni", {}), ["usersettings", "client-engine-ini"]);
+  assert.deepEqual(buildDuneArgs("userSettingsClientEngineIni", { map: "Survival_1" }), ["usersettings", "client-engine-ini", "Survival_1"]);
+  assert.deepEqual(buildDuneArgs("userSettingsClientEngineIni", { map: "Survival_1", partitionId: 3 }), ["usersettings", "client-engine-ini", "Survival_1", "3"]);
+  assert.throws(() => buildDuneArgs("adminAddXp", { playerId: "bad;id", amount: 1000 }));
+  assert.throws(() => buildDuneArgs("backupRestore", { backup: "../dump.backup" }));
+  assert.throws(() => buildDuneArgs("adminGiveItem", { playerId: "FLS_TEST", itemName: "", quantity: 1 }));
+  assert.throws(() => buildDuneArgs("adminGiveItemId", { playerId: "FLS_TEST", itemId: "bad;id", quantity: 1 }));
+  assert.throws(() => buildDuneArgs("adminGiveItem", { playerId: "FLS_TEST", itemName: "Water", quantity: 0 }));
+  assert.throws(() => buildDuneArgs("adminGiveItem", { playerId: "FLS_TEST", itemName: "Water", quantity: 1, quality: -1 }));
+  assert.throws(() => buildDuneArgs("adminGiveItem", { playerId: "FLS_TEST", itemName: "Water", quantity: 1, quality: 6 }));
+  assert.throws(() => buildDuneArgs("adminSetSkillPoints", { playerId: "FLS_TEST", points: -1 }));
+  assert.throws(() => buildDuneArgs("adminSpawnVehicle", { playerId: "FLS_TEST", vehicleId: "Sandbike;bad", template: "T6" }));
+  assert.throws(() => buildDuneArgs("mapsSetMode", { map: "DeepDesert_1;bad", mode: "dynamic" }));
+  assert.throws(() => buildDuneArgs("mapsSetMode", { map: "DeepDesert_1", mode: "bad" }));
+  assert.throws(() => buildDuneArgs("mapsSpawn", { target: "../bad" }));
+  assert.throws(() => buildDuneArgs("autoscalerAction", { action: "run" }));
+  assert.throws(() => buildDuneArgs("memorySet", { map: "DeepDesert_1", memory: "8gb" }));
+  assert.throws(() => buildDuneArgs("memorySet", { map: "DeepDesert_1", memory: "2.g" }));
+  assert.throws(() => buildDuneArgs("memorySet", { map: "DeepDesert_1", memory: "0g" }));
+  assert.throws(() => buildDuneArgs("sietchesSetPassword", { partitionId: 1, password: "bad\npw" }));
+  assert.throws(() => buildDuneArgs("sietchesRestart", { partitionId: "../38" }));
+  assert.throws(() => buildDuneArgs("deepdesertAction", { action: "reset" }));
+  assert.throws(() => buildDuneArgs("restartScheduleEnable", { time: "24:00" }));
+  assert.throws(() => buildDuneArgs("restartScheduleEnable", { time: "04:30", notifyMinutes: 0 }));
+  assert.throws(() => buildDuneArgs("ipChangeRestartEnable", { intervalMinutes: 0, notifyMinutes: 1 }));
+  assert.throws(() => buildDuneArgs("ipChangeRestartEnable", { intervalMinutes: 10, notifyMinutes: 61 }));
+  assert.throws(() => buildDuneArgs("backupAutoEnable", { time: "99:00" }));
+  assert.throws(() => buildDuneArgs("backupAutoEnable", { time: "05:00", intervalHours: 0 }));
+  assert.throws(() => buildDuneArgs("backupAutoRetention", { retentionDays: -1 }));
+  assert.throws(() => buildDuneArgs("updateAutoEnable", { intervalMinutes: 4 }));
+  assert.throws(() => buildDuneArgs("updateAutoEnable", { notifyMinutes: 0 }));
+  assert.throws(() => buildDuneArgs("updateAutoEnable", { notifyMinutes: "15,bad,1" }));
+  assert.throws(() => buildDuneArgs("updateAutoEnable", { notifyMinutes: "15,40,10,5" }));
+  assert.throws(() => buildDuneArgs("updateAutoEnable", { notifyMinutes: "15,10,10,5" }));
+  assert.throws(() => buildDuneArgs("updateAutoEnable", { maxWaitMinutes: -1 }));
+  assert.throws(() => buildDuneArgs("unknown"));
+});
+
+test("validates admin catalog wrapper arguments", () => {
+  assert.deepEqual(buildDuneArgs("adminItemSearch", { q: "water" }), ["admin", "item-search", "water"]);
+  assert.deepEqual(buildDuneArgs("adminItemList"), ["admin", "item-list"]);
+  assert.deepEqual(buildDuneArgs("adminItemListCategory", { category: "materials" }), ["admin", "item-list", "materials"]);
+  assert.deepEqual(buildDuneArgs("adminVehicleSearch", { q: "bike" }), ["admin", "vehicle-list", "bike"]);
+  assert.deepEqual(buildDuneArgs("adminSkillModulesSearch", { q: "blade" }), ["admin", "skill-modules", "blade"]);
+  assert.throws(() => buildDuneArgs("adminItemSearch", { q: "x" }));
+  assert.throws(() => buildDuneArgs("adminItemSearch", { q: "water\nbad" }));
+  assert.throws(() => buildDuneArgs("adminVehicleSearch", { q: "bike\nbad" }));
+});
+
+test("uses the global UserGame reset operation in restart tasks", () => {
+  assert.deepEqual(taskOperations("userSettingsResetAndRestart", { scope: "global", restartMode: "none" }), [
+    "userSettingsResetGlobalGame",
+    "userSettingsMaterializeCurrent"
+  ]);
+});
+
+test("uses scoped UserEngine reset operations in restart tasks", () => {
+  assert.deepEqual(taskOperations("userSettingsResetAndRestart", { scope: "mapEngine", restartMode: "none" }), [
+    "userSettingsResetMapEngine",
+    "userSettingsMaterializeCurrent"
+  ]);
+  assert.deepEqual(taskOperations("userSettingsResetAndRestart", { scope: "partitionEngine", restartMode: "none" }), [
+    "userSettingsResetPartitionEngine",
+    "userSettingsMaterializeCurrent"
+  ]);
+});
+
+test("can save and materialize UserGame modifiers without restarting immediately", () => {
+  assert.deepEqual(taskOperations("userSettingsSaveAndRestart", { scope: "global", restartMode: "none" }), [
+    "userSettingsSave",
+    "userSettingsMaterializeCurrent"
+  ]);
+});
+
+test("restartService splits survival into stop/start so a flush can land between them", () => {
+  assert.deepEqual(taskOperations("restartService", { service: "survival" }), [
+    "restartServiceStop",
+    "restartServiceStart"
+  ]);
+  assert.deepEqual(taskOperations("restartService", { service: "survival-1" }), [
+    "restartServiceStop",
+    "restartServiceStart"
+  ]);
+  // Other services never host bases, so the flush window is a no-op for
+  // them -- a single combined op is still correct.
+  assert.deepEqual(taskOperations("restartService", { service: "overmap" }), ["restartService"]);
+  assert.deepEqual(taskOperations("restartService", { service: "director" }), ["restartService"]);
+});
+
+test("a settings-driven survival restart also splits into stop/start", () => {
+  assert.deepEqual(taskOperations("userSettingsSaveAndRestart", { scope: "partitionEngine", restartMode: "service", service: "survival" }), [
+    "userSettingsSave",
+    "userSettingsMaterializeCurrent",
+    "restartServiceStop",
+    "restartServiceStart"
+  ]);
+  assert.deepEqual(taskOperations("userSettingsSaveAndRestart", { scope: "partitionEngine", restartMode: "service", service: "overmap" }), [
+    "userSettingsSave",
+    "userSettingsMaterializeCurrent",
+    "restartService"
+  ]);
+});
+
+test("sietchesRestart always splits into stop/start", () => {
+  assert.deepEqual(taskOperations("sietchesRestart", { partitionId: 31 }), [
+    "sietchesRestartStop",
+    "sietchesRestartStart"
+  ]);
+});
+
+test("does not respawn maps when changing a running map to disabled", () => {
+  assert.deepEqual(taskOperations("mapsApplySettings", { modeChanged: true, mode: "disabled", restartMode: "respawn" }), [
+    "mapsSetMode"
+  ]);
+  assert.deepEqual(taskOperations("mapsApplySettings", { modeChanged: true, mode: "overmap-active", restartMode: "respawn" }), [
+    "mapsSetMode",
+    "mapsDespawn",
+    "mapsSpawn"
+  ]);
+});
+
+test("saves map memory before applying a mode that can spawn the map", () => {
+  assert.deepEqual(taskOperations("mapsApplySettings", {
+    memoryChanged: true,
+    modeChanged: true,
+    mode: "always-on",
+    restartMode: "none"
+  }), [
+    "memorySetNoRestart",
+    "mapsSetMode"
+  ]);
+});
+
+test("parses RedBlink vehicle-list output into vehicles and templates", () => {
+  const output = `Sandbike
+actor: /Game/Dune/Systems/Vehicles/Blueprints/GroundVehicles/BP_Sandbike_CHOAM.BP_Sandbike_CHOAM_C
+templates: T1_ExtraSeat, T2_Inventory, T3_Boost, T4_Scanner, T5, T6
+Buggy
+actor: /Game/Dune/Systems/Vehicles/Blueprints/GroundVehicles/BP_Buggy_CHOAM.BP_Buggy_CHOAM_C
+templates: T3_Inventory, T4_Boost, T5_Mining, T6_Combat
+Tank
+actor: /Game/Dune/Systems/Vehicles/Blueprints/GroundVehicles/BP_Tank_CHOAM.BP_Tank_CHOAM_C
+templates: T6_CombatFire, T6_CombatDart`;
+  const vehicles = parseVehicleList(output);
+  assert.equal(vehicles.length, 3);
+  assert.equal(vehicles[0].id, "Sandbike");
+  assert.match(vehicles[0].actor, /BP_Sandbike_CHOAM/);
+  assert.deepEqual(vehicles[0].templates, ["T1_ExtraSeat", "T2_Inventory", "T3_Boost", "T4_Scanner", "T5", "T6"]);
+  assert.deepEqual(vehicles[1].templates, ["T3_Inventory", "T4_Boost", "T5_Mining", "T6_Combat"]);
+});
+
+test("detects read-only SQL and requires explicit destructive allowance", () => {
+  assert.equal(isReadOnlySql("select * from dune.player_state"), true);
+  assert.equal(isReadOnlySql("with x as (select 1) select * from x"), true);
+  assert.equal(isReadOnlySql("update dune.player_state set character_name = 'x'"), false);
+  assert.deepEqual(buildDuneArgs("databaseQuery", { query: "select 1" }), ["database", "sql", "select 1"]);
+  assert.throws(() => buildDuneArgs("databaseQuery", { query: "delete from dune.player_state" }));
+  assert.deepEqual(buildDuneArgs("databaseQuery", { query: "delete from dune.player_state", allowDestructive: true }), ["database", "sql", "delete from dune.player_state"]);
+  assert.throws(() => buildDuneArgs("databaseExport", { query: "delete from dune.player_state" }));
+});
+
+test("redacts token-like sensitive values", () => {
+  const jwt = "eyJaaaaaaaaaaaaaaaaaaaaaaaa.eyJbbbbbbbbbbbbbbbbbbbbbbbb.cccccccccccccc";
+  const text = `ServiceAuthToken=secret ${jwt} password: hunter2 runtime/secrets/funcom-token.txt`;
+  const output = redact(text);
+  assert.match(output, /<redacted>/);
+  assert.doesNotMatch(output, /hunter2/);
+  assert.doesNotMatch(output, /eyJaaaaaaaa/);
+  assert.doesNotMatch(output, /runtime\/secrets\/funcom-token\.txt/);
+});
+
+// Credentials reach operator-facing text from more than postgres. These are
+// generic rules rather than a list of names, so a variable added later is
+// covered without anyone remembering to add it here.
+test("redacts credentials in any URI scheme, not only postgres", () => {
+  const longScheme = `a${"b".repeat(200)}+secure`;
+  for (const uri of ["amqp://admin:RmqS3cret@rabbitmq:5672", "redis://user:hunter2@cache:6379", "https://bob:pw123@example.com/x", `${longScheme}://user:longSchemeSecret@example.com/x`]) {
+    const output = redact(uri);
+    assert.doesNotMatch(output, /RmqS3cret|hunter2|pw123|longSchemeSecret/);
+    // The host has to survive -- redacting it would make the error useless.
+    assert.match(output, /@(rabbitmq|cache|example\.com)/);
+  }
+});
+
+test("redaction remains fast on long uncontrolled input", () => {
+  const input = `${"-".repeat(500_000)}! not-a-uri DUNE_COMMAND_AUTH_TOKEN=${"x".repeat(500_000)}`;
+  const started = Date.now();
+  const output = redact(input);
+  assert.ok(Date.now() - started < 2_000);
+  assert.doesNotMatch(output, /x{100}/);
+});
+
+test("redacts any *_TOKEN / *_SECRET / *_KEY assignment by shape", () => {
+  const output = redact("DUNE_COMMAND_AUTH_TOKEN=abc123deadbeef rejected, X_API_KEY=zzz");
+  assert.doesNotMatch(output, /abc123deadbeef|zzz/);
+  assert.match(output, /DUNE_COMMAND_AUTH_TOKEN=<redacted>/);
+  // The surrounding message still has to read as a diagnosis.
+  assert.match(output, /rejected/);
+});
+
+test("leaves an error carrying no credential untouched, and is idempotent", () => {
+  assert.equal(redact("connect ECONNREFUSED 127.0.0.1:15432"), "connect ECONNREFUSED 127.0.0.1:15432");
+  assert.equal(redact(redact("amqp://admin:s3cret@rabbitmq:5672")), redact("amqp://admin:s3cret@rabbitmq:5672"));
+});
+
+// The Coriolis block is written once at startup, so it sits near the top of the
+// current session's log. Tailing that file found it only while the server was
+// young: on a live farm the log reached 24,539 lines with the block at 383-576,
+// so `tail -n 10000` started at 14,438 and returned none of it. Because an
+// active log that opens is treated as authoritative, the Deep Desert layout --
+// and with it the rendered terrain -- silently went missing after a few hours.
+test("reads the Coriolis block out of a log far too long to tail", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dune-log-"));
+  try {
+    const logPath = path.join(dir, "DuneSandbox_PIDX-8.log");
+    const line = (n) => `[2026.09.19-15.13.05:243][  0][939]LogNet: routine chatter ${n}`;
+    const body = [
+      ...Array.from({ length: 382 }, (_, i) => line(i)),
+      "[2026.09.19-15.13.05:243][  0][939]LogCoriolis: Display: Current Coriolis World Seed: 6",
+      "[2026.09.19-15.13.05:243][  0][939]LogCoriolis: Display: Next Coriolis Cycle start date UTC: 2026.09.22-11.00.00",
+      ...Array.from({ length: 190 }, (_, i) => line(i)),
+      "[2026.09.19-15.13.35:072][104][939][8]LogWorldLayout: Display: BP_DuneGameState_C_2147481318: 'DA_DeepDesert_1_Layout_06' layout selected with 682 content blocks.",
+      // Far more than any tail window, exactly as a server up 32 hours produces.
+      ...Array.from({ length: 24000 }, (_, i) => line(i))
+    ];
+    await fs.writeFile(logPath, `${body.join("\n")}\n`);
+
+    // The real script, pointed at the fixture instead of the game's log dir.
+    const script = CURRENT_GAME_LOG_SCRIPT.replace(
+      "log_dir=/home/dune/server/DuneSandbox/Saved/Logs",
+      `log_dir=${dir}`
+    );
+    const run = (args) => new Promise((resolve) => {
+      const child = spawn("sh", ["-c", script, "dune-current-game-log", ...args]);
+      let stdout = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+      child.on("close", (code) => resolve({ code, stdout }));
+    });
+
+    const { code, stdout } = await run(["10000"]);
+    assert.equal(code, 0);
+    assert.match(stdout, /Current Coriolis World Seed: 6/);
+    assert.match(stdout, /Next Coriolis Cycle start date UTC/);
+    assert.match(stdout, /DA_DeepDesert_1_Layout_06/);
+
+    // The block really is out of reach of the tail this replaced.
+    const tailed = await new Promise((resolve) => {
+      const child = spawn("sh", ["-c", `tail -n 10000 "${logPath}"`]);
+      let out = "";
+      child.stdout.on("data", (chunk) => { out += chunk.toString(); });
+      child.on("close", () => resolve(out));
+    });
+    assert.ok(!/DA_DeepDesert_1_Layout_06/.test(tailed));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an active log with no Coriolis block succeeds empty rather than erroring", async () => {
+  // Upstream treats an open active log as authoritative even when it has no
+  // block yet, so a warming-up server cannot revive the previous cycle's seed
+  // from retained Docker output. Exiting non-zero here would break that.
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dune-log-"));
+  try {
+    await fs.writeFile(path.join(dir, "DuneSandbox_PIDX-8.log"), "LogNet: nothing of interest\n");
+    const script = CURRENT_GAME_LOG_SCRIPT.replace(
+      "log_dir=/home/dune/server/DuneSandbox/Saved/Logs",
+      `log_dir=${dir}`
+    );
+    const { code, stdout } = await new Promise((resolve) => {
+      const child = spawn("sh", ["-c", script, "dune-current-game-log", "10000"]);
+      let out = "";
+      child.stdout.on("data", (chunk) => { out += chunk.toString(); });
+      child.on("close", (exit) => resolve({ code: exit, stdout: out }));
+    });
+    assert.equal(code, 0);
+    assert.equal(stdout.trim(), "");
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});

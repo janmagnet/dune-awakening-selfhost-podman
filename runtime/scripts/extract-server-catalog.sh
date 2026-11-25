@@ -6,17 +6,34 @@ cd "$(dirname "$0")/../.."
 mkdir -p runtime/generated
 
 [ -f .env ] && . ./.env
-[ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 source runtime/scripts/runtime-env.sh
 
 SERVER_REGION="$(resolve_server_region)"
 SERVER_IP="$(resolve_server_ip)"
 export SERVER_REGION SERVER_IP
+catalog_extract_timeout_seconds="${DUNE_CATALOG_EXTRACT_TIMEOUT_SECONDS:-120}"
+catalog_output="runtime/generated/server-catalog.json"
+catalog_tmp="$(mktemp "${catalog_output}.tmp.XXXXXX")"
+orchestrator_container="$(dune_compose_running_service_container "$DUNE_COMPOSE_PROJECT_NAME" orchestrator 2>/dev/null || true)"
 
-engine exec -i dune-orchestrator python3 - <<'PY'
-from pathlib import Path
+if [ -z "$orchestrator_container" ]; then
+  echo "The orchestrator container is not running; cannot extract the server catalog." >&2
+  exit 1
+fi
+
+cleanup_catalog_tmp() {
+  rm -f -- "$catalog_tmp"
+}
+trap cleanup_catalog_tmp EXIT
+
+echo "Extracting server catalog from world-template.yaml..."
+
+timeout --kill-after=2s "${catalog_extract_timeout_seconds}s" docker exec -i "$orchestrator_container" python3 - > "$catalog_tmp" <<'PY'
 import json
 import re
+import sys
+from pathlib import Path
 import yaml
 
 src = Path("/srv/dune/server/scripts/setup/templates/world-template.yaml")
@@ -55,15 +72,22 @@ for i, s in enumerate(sets):
         "raw": s,
     })
 
-out = Path("/work/server-catalog.json")
-out.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+json.dump(catalog, sys.stdout, indent=2)
+sys.stdout.write("\n")
 
-print(f"server sets: {len(catalog)}")
+print(f"server sets: {len(catalog)}", file=sys.stderr)
 for item in catalog:
-    print(f"{item['index']:02d} name={item['name']} map={item['map']}")
+    print(f"{item['index']:02d} name={item['name']} map={item['map']}", file=sys.stderr)
 PY
 
-engine exec dune-orchestrator cat /work/server-catalog.json > runtime/generated/server-catalog.json
+if [ ! -s "$catalog_tmp" ]; then
+  echo "Generated server catalog is empty." >&2
+  exit 1
+fi
+
+chmod 0644 "$catalog_tmp"
+mv -f -- "$catalog_tmp" "$catalog_output"
+trap - EXIT
 
 echo
-echo "Wrote runtime/generated/server-catalog.json"
+echo "Wrote $catalog_output"

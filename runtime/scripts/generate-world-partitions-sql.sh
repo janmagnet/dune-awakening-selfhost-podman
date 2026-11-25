@@ -6,14 +6,14 @@ cd "$(dirname "$0")/../.."
 mkdir -p runtime/generated
 
 [ -f .env ] && . ./.env
-[ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 source runtime/scripts/runtime-env.sh
 
 SERVER_REGION="$(resolve_server_region)"
 SERVER_IP="$(resolve_server_ip)"
 export SERVER_REGION SERVER_IP
 
-engine exec -i dune-orchestrator python3 - <<'PY' > runtime/generated/reset-world-partitions.sql
+docker compose exec -T orchestrator python3 - <<'PY' > runtime/generated/reset-world-partitions.sql
 from pathlib import Path
 import json
 import re

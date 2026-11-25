@@ -1,6 +1,9 @@
 .env
 runtime/secrets/
 runtime/generated/
+runtime/backups/
+runtime/system-backup/
+runtime/addons/
 runtime/game/
 runtime/rabbitmq-admin/
 runtime/rabbitmq-game/
@@ -11,3 +14,9 @@ runtime/fake-k8s-serviceaccount/
 work/
 *.log
 .git/
+node_modules/
+**/node_modules/
+**/dist/
+**/.vite/
+**/.vite-temp/
+**/tsconfig.tsbuildinfo

@@ -3,8 +3,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-source runtime/scripts/engine.sh
-
 failures=0
 
 ok() { printf 'OK   %s\n' "$*"; }
@@ -38,6 +36,13 @@ check_json_array runtime/data/admin-items.json "item catalog"
 check_json_array runtime/data/admin-vehicles.json "vehicle catalog"
 check_json_array runtime/data/admin-skill-modules.json "skill module catalog"
 check_json_array runtime/data/admin-xp-event-tags.json "XP event tag catalog"
+
+grant_json="$(bash -c 'source runtime/scripts/admin-tools.sh >/dev/null 2>&1 || true; build_inner_json FLS_TEST WaterBottle_1 2 1 4' 2>/dev/null || true)"
+if printf '%s' "$grant_json" | grep -q '"Quality":4' && printf '%s' "$grant_json" | grep -q '"Durability":1'; then
+  ok "grant item payload includes selected grade and full durability"
+else
+  fail "grant item payload is missing selected grade or full durability"
+fi
 
 python3 - <<'PY' || fail "catalog required fields"
 import json
@@ -79,11 +84,11 @@ payload_checks=(
 )
 
 for args in "${payload_checks[@]}"; do
-  if DUNE_ADMIN_DRY_RUN=1 DUNE_ADMIN_ASSUME_YES=1 runtime/scripts/dune admin $args >/tmp/dune-admin-validate.out 2>/tmp/dune-admin-validate.err; then
+  if DUNE_ADMIN_DRY_RUN=1 DUNE_ADMIN_ASSUME_YES=1 runtime/scripts/dune admin $args >/tmp/admin-tools-validate.out 2>/tmp/admin-tools-validate.err; then
     ok "payload builds: dune admin $args"
   else
     fail "payload build failed: dune admin $args"
-    sed -n '1,12p' /tmp/dune-admin-validate.err >&2 || true
+    sed -n '1,12p' /tmp/admin-tools-validate.err >&2 || true
   fi
 done
 
@@ -113,19 +118,19 @@ else
   fail "runtime/generated is not writable"
 fi
 
-if engine ps --format '{{.Names}}' >/tmp/dune-admin-docker.out 2>/tmp/dune-admin-docker.err; then
+if docker ps --format '{{.Names}}' >/tmp/admin-tools-docker.out 2>/tmp/admin-tools-docker.err; then
   for container in dune-rmq-game dune-postgres; do
-    if grep -qx "$container" /tmp/dune-admin-docker.out; then
+    if grep -qx "$container" /tmp/admin-tools-docker.out; then
       ok "$container container detected"
     else
       warn "$container container is not running; live admin commands will fail until the battlegroup is running"
     fi
   done
 else
-  warn "podman is unavailable; live container checks skipped"
+  warn "docker is unavailable; live container checks skipped"
 fi
 
-rm -f /tmp/dune-admin-validate.out /tmp/dune-admin-validate.err /tmp/dune-admin-docker.out /tmp/dune-admin-docker.err
+rm -f /tmp/admin-tools-validate.out /tmp/admin-tools-validate.err /tmp/admin-tools-docker.out /tmp/admin-tools-docker.err
 
 if [ "$failures" -ne 0 ]; then
   printf '\n%d validation failure(s).\n' "$failures" >&2

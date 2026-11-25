@@ -1,0 +1,169 @@
+# Documentation Index
+
+This folder mirrors the repo's own structure: component docs live under a folder
+named for the component they document (`console/`, `runtime/`, `addons/`), while
+docs that span the whole product stay at this root
+(`operator-guide.md`). Cross-cutting concerns (`security/`, `incidents/`) get their
+own top-level folders.
+
+Docs marked **Historical record** describe a point-in-time state (a branch, a PR,
+an issue) and are not kept up to date — read them for context, not as current
+reference.
+
+Docs marked **Observed** describe the closed-source game — its database schema,
+its services, its mechanics — rather than anything in this repo. They are
+maintained, but they cannot be kept accurate by reviewing our own changes,
+because nothing here causes them to drift: a Funcom build does. Each one names
+the game build it was verified against, so a reader can tell how stale it might
+be. Treat an `Observed` claim older than the running build as unverified until
+re-checked against a live database or container.
+
+Everything else is marked **Current** and is expected to stay accurate as this
+repo's code changes.
+
+## Adding a new doc
+
+1. **Pick the folder by what the doc documents, not what kind of doc it is.**
+   If it explains a piece of `console/api` or `console/web`, it goes in
+   `docs/console/`. If it explains something under `runtime/`, it goes in
+   `docs/runtime/`. Addon-platform behavior goes in `docs/addons/`. Only use
+   `docs/security/` or `docs/incidents/` for concerns that cut across
+   components (a vulnerability class, a post-incident review) rather than a
+   single feature. Don't add a new top-level folder for one document — put it
+   in the closest existing one.
+2. **Decide the status up front**, and put the line right after the
+   H1, matching the existing docs:
+   - Living reference that should be kept accurate as code changes:
+     `**Status:** Current | **Last Updated:** <Month Year>`
+   - A description of the closed-source game rather than of this repo — schema,
+     services, mechanics, anything only a running build can confirm:
+     `**Status:** Observed — verified against game build <build> (<Month Year>). Re-verify after a game update.`
+     Cite the evidence inline (the query, the container, the log line) so the
+     next person can re-run it rather than re-derive it. Prefer this over
+     `Current` whenever a claim would survive our review unchanged while
+     quietly becoming false — that has already happened here.
+   - A frozen snapshot of a PR, branch, or issue — a test report, a change
+     summary, implementation notes — goes in `docs/archive/` with:
+     `**Status:** Historical record — describes the state at <PR/branch/issue>. Not maintained.`
+     Add a pointer to the current doc that superseded it, if one exists.
+3. **Add one line to this index**, in the matching section above: a link, one
+   sentence of purpose, and the status word. A doc with no line here is
+   effectively invisible — this file is the only thing every other doc is
+   guaranteed to be reachable from.
+4. **Cross-link the doc's nearest relatives** (the feature doc it complements,
+   the security review of the same code path, the API reference section that
+   covers its endpoints) directly in the doc body, not just in this index.
+
+## Architecture
+
+A deliberate exception to this file's own "don't add a new top-level
+folder for one document" rule above: a whole-system overview doesn't
+belong to any single existing folder (`console/`, `runtime/`, `addons/`)
+by nature, so it gets its own.
+
+- [architecture/SYSTEM-OVERVIEW.md](architecture/SYSTEM-OVERVIEW.md) — Current. Whole-system engineering architecture reference: component map, the console's API/web/data layers, the `dune` CLI and Compose-project-name resolution, runtime state directories, and the Discord-integration split. Start here for a code-level overview before diving into a single component's docs.
+- [architecture/DATABASE.md](architecture/DATABASE.md) — Observed. The `dune` database: the encryption view layer, `world_partition` event-log provisioning, the eight notify channels and why direct DML is often a silent no-op, capability probes, the objects the console creates itself, and a domain map of the game's tables. Deliberately documents mechanisms rather than transcribing a schema that drifts with every game build — regenerate the inventory with `runtime/scripts/schema-report.sh`.
+- [architecture/SERVICES.md](architecture/SERVICES.md) — Observed. The always-on closed-source services (TextRouter, Director, Gateway, the two RabbitMQ brokers): each one's role and trust boundary, the messaging authorization topology (both brokers delegate all auth to TextRouter), the real startup order, and a failure-to-symptom map. Game servers are out of scope.
+- [architecture/WORLD-MODEL.md](architecture/WORLD-MODEL.md) — Observed. How the game addresses world space: map, dimension and partition as columns on `dune.world_partition`, why world state is keyed by `(map, dimension_index)`, and the full partition catalog of live worlds and on-demand content maps.
+
+## Console (`console/api`, `console/web`)
+
+- [API-REFERENCE.md](console/API-REFERENCE.md) — Current. Full HTTP API reference for every console endpoint.
+- [api-keys.md](console/api-keys.md) — Current. Named, revocable API keys for external callers: scopes that default to no access, given per namespace as Read/Read+write or as an explicit list of actions, the `settings`/`database`/`setup` namespaces no key can ever reach and the write-denied `updates` and `addons`, hash-only storage with a one-time reveal, and per-key expiry, disable and rate limits.
+- [themes.md](console/themes.md) — Current. The per-browser Console Theme picker: what is offered (23 palettes in Console and Dune faction sections, plus 42 House and outfit swatch palettes, filterable), what the swatch palettes derive from, why light themes are hidden, how themes map onto the console's CSS variables, the contrast guard, and how to add a palette.
+- [blueprints.md](console/blueprints.md) — Current. Blueprint import/export developer documentation.
+- [PRE-AUGMENTED-GEAR.md](console/PRE-AUGMENTED-GEAR.md) — Current. API reference for granting gear with augments pre-applied.
+- [generator-fuel-burn-rates.md](console/generator-fuel-burn-rates.md) — Current. Per-generator fuel burn constants and where they live in code.
+- [generator-refill-caps.md](console/generator-refill-caps.md) — Current. Refill-generators endpoint behavior and per-type fuel caps.
+- [base-permissions.md](console/base-permissions.md) — Current. Editing base ownership and sharing: ranks, the config-driven roster cap, and why the change needs no map restart.
+- [base-child-permissions.md](console/base-child-permissions.md) — Current. The Base Permissions tab: the per-piece access-level scale (Public/Guild/Associate/Co-Owner/Owner), why Associate is "Sub-Fief," setting individual pieces to a specific level, and the pending-permission queue for a live map.
+- [vehicle-permissions.md](console/vehicle-permissions.md) — Current. Editing vehicle ownership and sharing: the same roster engine as base permissions, including the Transfer to Custodian action.
+- [base-inventory.md](console/base-inventory.md) — Current. The base Inventory tab: which placeables count as storage, the two inventories every refinery carries, per-slot container contents, and the Give/Fill/Delete container actions (none of which require a stopped map).
+- [vehicle-storage.md](console/vehicle-storage.md) — Current. The Vehicles → Components View Contents overlay: which module counts as storage, why a vehicle's cargo hangs off its actor id rather than the (empty) `vehicle_module_id` link, and why the view is read-only.
+- [base-deletion.md](console/base-deletion.md) — Current. Permanently deleting a base: what "the base" means for enumeration, the pending-delete queue for a live map, the mandatory pre-delete safety backup, and why a pending delete freezes every other mutation on that base.
+- [vehicle-deletion.md](console/vehicle-deletion.md) — Current. Permanently deleting a vehicle: the FK cascade closure verified against a real schema dump, its own parallel pending-delete queue, the vehicle-specific `dune.actors.state` guard bases have no equivalent of, where a stored vehicle's owner is recorded, and the separately-permissioned delete for a vehicle that is Stored for Recovery.
+- [base-backups.md](console/base-backups.md) — Current. What the game's own "pick up base" tool actually does in the database, why the Bases panel excludes a picked-up base, the Coriolis compatibility patch that preserves saved Deep Desert base actors, and how to export and import base backups between servers and players.
+- [database-backups.md](console/database-backups.md) — Current. Safe database restore behavior when the backup and current deployment use different Battlegroup IDs, and encrypted system backups that carry configuration and secrets to a new host, including scheduled system backups with a saved, write-only passphrase and automatic-only pruning.
+- [deleted-characters.md](console/deleted-characters.md) — Current. Find characters deleted from the server that still hold bases or vehicles.
+- [restart-queue.md](console/restart-queue.md) — Current. The Restart Queue toggle: player-aware countdowns with in-game warnings, the two broadcast variants, concurrency rules, crash recovery, the "Restart later" deferred-restart option, and the join-lock limitation.
+- [exchange.md](console/exchange.md) — Current. The read-only Market Board: aggregated-by-item CHOAM exchange listings, seller resolution, how bot listings are identified, the bot/blacklist filter config, the Market Bot seed/buyback engine, and the Bot items tab's per-item catalog overrides.
+- [encrypted-api.md](console/encrypted-api.md) — Optional. The encrypted front door for the Console API: HTTPS with its own long-lived key that clients pin, the API-only door (`GET /api/*` with an API key, no web UI, no cookies), the fingerprint shown by the installer, Settings and `dune encrypted-api`, and how to compare it.
+- [console-iam.md](console-iam.md) — Current. The Console's IAM layer: how every authenticated route maps to one action, the tiers and policy overrides, and the split namespaces.
+- [realtime.md](console/realtime.md) — Optional. Live sandworm, NPC, storm and vehicle positions from the optional MapViewer3D `mvagent`, including the `/api/realtime/*` routes and their limits.
+- [server-custom-settings.md](console/server-custom-settings.md) — Current. `ServerCustomSettings.ini`: where it lives and how the Console's Custom Settings tab manages it.
+- [spice-fields-custom-settings-uat.md](console/spice-fields-custom-settings-uat.md) — Historical record. Manual test plan for PR #228's spice field Custom Settings.
+- [live-map.md](console/live-map.md) — Current. The Live Map panel: partition display-name resolution, the actor/spice/POI marker data model (static archive + live decode + self-learning pool, the registry-driven POI framework), the Layers legend's hide-if-empty and default-settings mechanism, Coriolis seed/layout/countdown resolution, and the WebGL terrain renderer that draws the Deep Desert's own cartography meshes: rock textures and elevation lines; tilt and rotation with a compass, markers projected and hidden behind rock, the sector grid drawn over rock and cliffs, and the shield walls and sand past the map's edge; the shipped assets; and the conditions under which it degrades or falls back to the flat map image.
+
+## Runtime (`runtime/`)
+
+- [CONTAINER-HARDENING.md](runtime/CONTAINER-HARDENING.md) — Historical record. Summary of the container hardening change as merged.
+- [E2E-METRICS-TESTING.md](runtime/E2E-METRICS-TESTING.md) — Current. End-to-end validation procedure for the metrics stack (`runtime/metrics`).
+- [PERFORMANCE-TROUBLESHOOTING.md](runtime/PERFORMANCE-TROUBLESHOOTING.md) — Current. Request and memory-limit timing, native log locations, GC investigation, and evidence for cross-map stalls or story ejections.
+- [MULTI-SERVER-SINGLE-PUBLIC-IP.md](runtime/MULTI-SERVER-SINGLE-PUBLIC-IP.md) — Current. Executive overview and detailed SOP for running multiple isolated battlegroups behind one public IPv4, including full per-instance port profiles, NAT/hairpin requirements, UserEngine configuration, validation, rollback, and the `multi-server-config.py` automation helper.
+
+## Addons
+
+- [addon-item-grants.md](addons/addon-item-grants.md) — Current. The `admin:grant-items` permissioned addon item grant flow.
+- [addon-runtime-api.md](addons/addon-runtime-api.md) — Current. Typed player reads, addon-owned storage, durable rewards, and private messages.
+- [addon-scheduled-jobs.md](addons/addon-scheduled-jobs.md) — Current. Market Bot scheduler and EDA retirement compatibility.
+- [hardware-status.md](addons/hardware-status.md) — Current. Permissioned, core-owned host telemetry for addon dashboards.
+
+## Discord Integrations
+
+Two overlapping doc sets — start with whichever matches your role:
+
+- [discord-integration/README.md](integrations/discord-integration/README.md) — Current, **operator-facing**. Adapter overview, setup, routes, and RBAC.
+  - [admin-guide.md](integrations/discord-integration/admin-guide.md) — Walkthrough for getting the bot running on your server.
+  - [faq.md](integrations/discord-integration/faq.md) — Frequently asked questions.
+  - [troubleshooting.md](integrations/discord-integration/troubleshooting.md) — Common problems and fixes.
+- [api-adapter-contract.md](integrations/discord-control-bot/api-adapter-contract.md) — Current, **developer-facing**. The protected server-side adapter contract. The `/catalog` route is authoritative for live routes.
+- [discord-control-bot/admin-guide.md](integrations/discord-control-bot/admin-guide.md) — Historical record. Admin guide for an early prototype of the companion bot, which is not in this repository.
+  - [setup-guide.md](integrations/discord-control-bot/setup-guide.md) — Historical record. Validating that prototype without a live Discord connection.
+  - [user-guide.md](integrations/discord-control-bot/user-guide.md) — Historical record. That prototype's command reference.
+- [bot/output-architecture.md](bot/output-architecture.md) — Historical record. Output design notes for the companion repository's Arrakis Control Panel bot.
+
+## Security
+
+- [age-secrets.md](security/age-secrets.md) — Current. Optional age encryption at rest for the server-login secrets, and how to migrate to it.
+- [ci-security-checks.md](security/ci-security-checks.md) — Current. What the `security-checks` CI gate scans and how accepted findings are recorded.
+
+The four docs below describe controls that are still in force; they are marked
+historical because they read as point-in-time PR records, not because the
+control itself is stale.
+
+- [addon-provenance.md](security/addon-provenance.md) — Historical record. Community addon discovery and code-signing threat model.
+- [generated-command-auth-token.md](security/generated-command-auth-token.md) — Historical record. Command auth token generation hardening.
+- [login-rate-limit-defense.md](security/login-rate-limit-defense.md) — Historical record. Login rate limiting defense.
+- [pre-augmented-gear-grant.md](security/pre-augmented-gear-grant.md) — Historical record. Security review of the pre-augmented gear grant path — see [PRE-AUGMENTED-GEAR.md](console/PRE-AUGMENTED-GEAR.md) for current reference.
+
+## Incidents
+
+- [INC-2026-07-24-STEAMCMD-CDN-OUTAGE.md](incidents/INC-2026-07-24-STEAMCMD-CDN-OUTAGE.md) — Historical record. Post-incident case study: SteamCMD content-host failure.
+- [INC-2026-08-19-GIVE-FILL-POSITION-INDEX-COLLISION.md](incidents/INC-2026-08-19-GIVE-FILL-POSITION-INDEX-COLLISION.md) — Historical record. Give and Fill writing colliding container position indexes.
+- [INC-2026-08-19-VOLUME-OVERRIDE-DOUBLE-MULTIPLIED.md](incidents/INC-2026-08-19-VOLUME-OVERRIDE-DOUBLE-MULTIPLIED.md) — Historical record. Item volume overrides multiplied twice.
+
+## Design records
+
+Proposals and audits kept for their reasoning. Each one's status line says how
+much of it shipped; none is a description of current behavior.
+
+- [rfc-console-auth.md](rfc-console-auth.md) — Historical record. Layered Console authentication proposal; none of it is implemented here.
+- [rfc-command-discovery.md](rfc-command-discovery.md) — Historical record. Discord command discovery from Core; Phase 1 shipped.
+- [rw-architecture.md](rw-architecture.md) — Historical record. Discord write-command design that was never built.
+- [spice-fields-per-map-scoping-l1-design-2026-09-21.md](design/spice-fields-per-map-scoping-l1-design-2026-09-21.md) — Historical record. Per-map scoping design for spice field settings.
+- [l1-l2-container-health-2026-08-10.md](audit/l1-l2-container-health-2026-08-10.md) — Historical record. Design and implementation audit of the `ops.health.containers` bridge.
+
+## Archive
+
+Frozen PR/issue evidence, kept for history. Not maintained; see the linked
+current doc for anything still accurate today.
+
+- [blueprints-report.md](archive/blueprints-report.md) — Historical record. Feature spec and test report for PR #80 — see [blueprints.md](console/blueprints.md).
+- [PR-EVIDENCE-ADDON-METRICS-SUPPORT.md](archive/PR-EVIDENCE-ADDON-METRICS-SUPPORT.md) — Historical record. PR evidence for the addon metrics stack — see [E2E-METRICS-TESTING.md](runtime/E2E-METRICS-TESTING.md).
+- [R1-METRICS-STACK-IMPLEMENTATION-NOTES.md](archive/R1-METRICS-STACK-IMPLEMENTATION-NOTES.md) — Historical record. Implementation notes for issue #82 — see [E2E-METRICS-TESTING.md](runtime/E2E-METRICS-TESTING.md).
+
+## Other
+
+- [Release Notes](../RELEASE_NOTES.md) — Current. Notes for the latest release.
+- README editions — Current. [English](../README.md), [简体中文](readme/README_zh.md), [繁體中文](readme/README_zh-TW.md), [日本語](readme/README_ja.md), [한국어](readme/README_ko.md), [Türkçe](readme/README_tr.md), [Русский](readme/README_ru.md), [Tiếng Việt](readme/README_vi.md), [ไทย](readme/README_th.md), [Deutsch](readme/README_de.md), [Español](readme/README_es.md), [Français](readme/README_fr.md), [Українська](readme/README_uk.md), [Polski](readme/README_pl.md), [Português (Brasil)](readme/README_pt-BR.md), [العربية](readme/README_ar.md), [فارسی](readme/README_fa.md), [Bahasa Indonesia](readme/README_id.md), [Italiano](readme/README_it.md), [Ελληνικά](readme/README_el.md), [മലയാളം](readme/README_ml.md), [Roman Urdu](readme/README_ur-Latn.md), [Română](readme/README_ro.md): project overview, features, requirements, and installation.
+- [operator-guide.md](operator-guide.md) — Current. End-user/operator guide: Web UI feature tour, readiness and recovery, language settings, bases, backups, updates, community addons, the Public Server Directory, Discord integration, and multi-server hosting. Cross-links the feature docs above rather than duplicating them.

@@ -1,0 +1,865 @@
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { redact } from "./redact.js";
+
+const MAX_CAPTURED_OUTPUT_CHARS = 4 * 1024 * 1024;
+const OUTPUT_TRUNCATED_MARKER = "\n[... earlier output truncated ...]\n";
+
+export const serviceAliases = new Map([
+  ["postgres", "postgres"],
+  ["rmq-admin", "rmq-admin"],
+  ["rmq-game", "rmq-game"],
+  ["text-router", "text-router"],
+  ["tr", "text-router"],
+  ["director", "director"],
+  ["bgd", "director"],
+  ["gateway", "gateway"],
+  ["sgw", "gateway"],
+  ["survival", "survival"],
+  ["survival-1", "survival-1"],
+  ["overmap", "overmap"],
+  ["orchestrator", "orchestrator"],
+  ["autoscaler", "autoscaler"],
+  ["coriolis", "coriolis"]
+]);
+
+const simpleOperations = {
+  status: ["status"],
+  readiness: ["ready"],
+  services: ["ps"],
+  ports: ["ports"],
+  doctor: ["doctor"],
+  networkBindFix: ["network", "fix"],
+  storageCleanupImages: ["storage", "cleanup", "--unused-images"],
+  storageCleanupBuildCache: ["storage", "cleanup", "--build-cache"],
+  start: ["start"],
+  stop: ["stop"],
+  updateCheck: ["update", "check"],
+  updateApply: ["update", "--yes"],
+  updateFixSteamcmd: ["update", "fix-steamcmd"],
+  updateInstallAssets: ["update", "install-assets"],
+  consoleReload: ["console", "reload"],
+  updateAutoStatus: ["update", "auto", "status"],
+  updateAutoDisable: ["update", "auto", "disable"],
+  selfUpdateCheck: ["self-update", "check"],
+  selfUpdateApply: ["self-update", "install", "latest"],
+  backupCreate: ["db", "backup"],
+  backupList: ["db", "list"],
+  backupDeleteAll: ["db", "delete", "--all"],
+  backupAutoStatus: ["db", "auto", "status"],
+  backupSystemCreate: ["db", "backup-system"],
+  backupSystemDeleteAll: ["db", "delete-system", "--all"],
+  backupAutoDisable: ["db", "auto", "disable"],
+  backupSystemAutoStatus: ["db", "auto-system", "status"],
+  init: ["init"],
+  restartScheduleStatus: ["restart-schedule", "status"],
+  restartScheduleDisable: ["restart-schedule", "disable"],
+  ipChangeRestartStatus: ["ip-change-restart", "status"],
+  ipChangeRestartDisable: ["ip-change-restart", "disable"],
+  ipChangeRestartCheckNow: ["ip-change-restart", "check-now"],
+  shutdownProtectionStatus: ["shutdown-protection", "status"],
+  shutdownProtectionDisable: ["shutdown-protection", "disable"],
+  shutdownProtectionRemove: ["shutdown-protection", "remove"],
+  dbStatus: ["database", "status"],
+  servers: ["servers"],
+  mapsList: ["maps", "list"],
+  sietchesList: ["sietches", "list"],
+  deepdesertStatus: ["deepdesert", "layout", "status"],
+  players: ["admin", "players", "--show-full-ids"],
+  adminHistory: ["admin", "history"],
+  adminItemList: ["admin", "item-list"],
+  adminVehicleList: ["admin", "vehicle-list"],
+  experimentalTanksStatus: ["experimental-tanks", "status"],
+  adminSkillModules: ["admin", "skill-modules"]
+};
+
+export function validateServiceName(value) {
+  const raw = String(value || "").trim();
+  if (/^dune-server-[a-z0-9-]+$/i.test(raw)) return raw;
+  const normalized = serviceAliases.get(raw);
+  if (!normalized) {
+    throw new Error(`Unsupported service: ${raw}`);
+  }
+  return normalized;
+}
+
+// Console diagnostics are readable through Logs; this must not widen the
+// service allowlist used by generic stop/restart operations.
+export function validateLogServiceName(value) {
+  const raw = String(value || "").trim();
+  if (raw === "console" || raw === "redblink-dune-docker-console") return "console";
+  return validateServiceName(raw);
+}
+
+export function buildDuneArgs(operation, payload = {}) {
+  if (simpleOperations[operation]) return simpleOperations[operation];
+
+  switch (operation) {
+    case "experimentalTanksApply":
+      if (typeof payload.enabled !== "boolean" || payload.confirmRestart !== true) {
+        throw new Error("Confirm the Hagga restart before changing Experimental Tanks.");
+      }
+      return ["experimental-tanks", "apply", String(payload.enabled)];
+    case "selfUpdateQaApply":
+      return ["self-update", "install-qa", validateCommitSha(payload.sha)];
+    case "restartService":
+      return ["restart", validateServiceName(payload.service)];
+    case "restartServiceStop":
+      return ["stop-service", validateServiceName(payload.service)];
+    case "restartServiceStart":
+      return ["restart", validateServiceName(payload.service)];
+    case "stopGameServersForDbWrites":
+      return ["stop-game-servers-for-db-writes"];
+    case "serverTitle":
+      return ["config", "title", validateServerTitle(payload.title), "--yes"];
+    case "serverConfig":
+      {
+        const args = ["config", "server-settings"];
+        if (payload.title !== undefined) args.push("--title", validateServerTitle(payload.title));
+        if (payload.mode !== undefined) args.push("--mode", validateServerMode(payload.mode));
+        if (args.length === 2) throw new Error("No server configuration changes were provided");
+        args.push("--yes");
+        return args;
+      }
+    case "restartScheduleEnable":
+      return ["restart-schedule", "enable", validateUpdateTime(payload.time || "05:00"), String(validateInteger(payload.notifyMinutes ?? 15, 1, 1440))];
+    case "ipChangeRestartEnable":
+      return ["ip-change-restart", "enable", String(validateInteger(payload.intervalMinutes ?? 5, 1, 1440)), String(validateInteger(payload.notifyMinutes ?? 1, 0, 60))];
+    case "shutdownProtectionEnable":
+      return ["shutdown-protection", "enable"];
+    case "restartAll":
+      return ["restart", "gateway"];
+    case "logs":
+      return ["logs", validateServiceName(payload.service)];
+    case "backupRestore":
+      {
+        const args = ["db", "restore", validateBackupName(payload.backup), "--no-safety-backup"];
+        if (payload.identityMode !== undefined) {
+          if (payload.identityMode === "adopt-backup") args.push("--adopt-backup-battlegroup");
+          else if (payload.identityMode === "keep-current") args.push("--keep-current-battlegroup");
+          else throw new Error("Unsupported backup Battlegroup identity choice");
+        }
+        return args;
+      }
+    case "backupDelete":
+      return ["db", "delete", validateBackupName(payload.backup)];
+    case "backupDeleteSelected":
+      return ["db", "delete", ...validateBackupNames(payload.backups)];
+    case "backupSystemDelete":
+      return ["db", "delete-system", validateBackupName(payload.backup)];
+    case "backupSystemDeleteSelected":
+      return ["db", "delete-system", ...validateBackupNames(payload.backups)];
+    case "backupSystemRestore": {
+      const args = ["db", "restore-system", validateBackupName(payload.backup)];
+      // Dry run unless the caller explicitly applies, so a mis-sent request
+      // previews rather than replaces the host's configuration.
+      if (!payload.apply) args.push("--dry-run");
+      if (payload.identityMode === "adopt-backup") args.push("--adopt-backup-battlegroup");
+      if (payload.identityMode === "keep-current") args.push("--keep-current-battlegroup");
+      if (payload.auditLogMode === "adopt-backup") args.push("--adopt-backup-audit-log");
+      if (payload.auditLogMode === "keep-current") args.push("--keep-current-audit-log");
+      return args;
+    }
+    case "backupAutoEnable":
+      {
+        const args = ["db", "auto", "enable", validateUpdateTime(payload.time || "05:00")];
+        const retentionDays = validateInteger(payload.retentionDays ?? 0, 0, 3650);
+        const intervalHours = validateInteger(payload.intervalHours ?? 24, 1, 168);
+        // Omitted CLI arguments preserve the saved policy, so even the default
+        // values must be explicit when the Console replaces that policy.
+        args.push(String(retentionDays), String(intervalHours));
+        return args;
+      }
+    case "backupSystemAutoEnable":
+    case "backupSystemAutoDisable":
+      // A bare disable ({ enabled: false } from an API client) keeps the saved
+      // policy rather than resetting it to the defaults below.
+      if (operation === "backupSystemAutoDisable" && payload.time == null && payload.intervalHours == null && payload.keep == null) {
+        return ["db", "auto-system", "disable"];
+      }
+      // Otherwise all three explicit: omitted CLI arguments keep the saved
+      // policy, which would drop edits saved while the schedule is off.
+      return [
+        "db",
+        "auto-system",
+        operation === "backupSystemAutoEnable" ? "enable" : "disable",
+        validateUpdateTime(payload.time || "04:30"),
+        String(validateInteger(payload.intervalHours ?? 24, 1, 168)),
+        String(validateInteger(payload.keep ?? 7, 1, 365))
+      ];
+    case "backupAutoRetention":
+      return ["db", "auto", "retention", String(validateInteger(payload.retentionDays, 0, 3650))];
+    case "updateAutoEnable":
+      return [
+        "update",
+        "auto",
+        "enable",
+        String(validateInteger(payload.intervalMinutes ?? 60, 5, 1440)),
+        payload.applyEnabled === false ? "0" : "1",
+        payload.notifyEnabled === false ? "0" : "1",
+        validateMinuteCheckpoints(payload.notifyMinutes ?? "15,10,5,1"),
+        payload.waitUntilEmpty ? "1" : "0",
+        String(validateInteger(payload.maxWaitMinutes ?? 360, 0, 10080)),
+        validateOptionalFlag(payload.updateConsole, "updateConsole"),
+        validateOptionalFlag(payload.manageTanks, "manageTanks")
+      ];
+    case "databaseTables":
+      return ["database", "tables", payload.schema || "dune"];
+    case "databasePreview":
+      return ["database", "preview", validateTableName(payload.table), String(payload.limit || 50), String(payload.offset || 0)];
+    case "databaseQuery":
+      return ["database", "sql", validateSql(payload.query, Boolean(payload.allowDestructive))];
+    case "databaseExport":
+      return ["database", "export", validateSql(payload.query, false)];
+    case "adminGiveItem":
+      return ["admin", "grant-item", validatePlayerId(payload.playerId), validateItemName(payload.itemName), String(validateInteger(payload.quantity ?? 1, 1, 1000000)), String(validateDurability(1)), String(validateItemQuality(payload.quality ?? payload.grade ?? 0))];
+    case "adminGiveItems":
+      return ["admin", "grant-template", validatePlayerId(payload.playerId), validateTemplateName(payload.template || "scout-ornithopter-mk6")];
+    case "adminGiveItemId":
+      return ["admin", "grant-item-id", validatePlayerId(payload.playerId), validateItemId(payload.itemId), String(validateInteger(payload.quantity ?? 1, 1, 1000000)), String(validateDurability(1)), String(validateItemQuality(payload.quality ?? payload.grade ?? 0))];
+    case "adminAddXp":
+      return ["admin", "award-xp", validatePlayerId(payload.playerId), String(validateInteger(payload.amount, 1, 100000000))];
+    case "adminSetSkillPoints":
+      return ["admin", "skill-points", validatePlayerId(payload.playerId), String(validateInteger(payload.points, 0, 100000))];
+    case "adminSetSkillModule":
+      return ["admin", "skill-module", validatePlayerId(payload.playerId), validateSkillModule(payload.module), String(validateInteger(payload.level, 0, 100))];
+    case "adminRefillWater":
+      return ["admin", "refill-water", validatePlayerId(payload.playerId), String(validateInteger(payload.amount ?? 1000000, 1, 1000000000))];
+    case "adminKick":
+      return ["admin", "kick", validatePlayerId(payload.playerId), "--yes", "--force"];
+    case "adminKickAllOnline":
+      return ["admin", "kick", "--all-online", "--yes"];
+    case "adminRepairLoginQueue":
+      return ["admin", "repair-login-queue", validatePlayerId(payload.playerId), "--yes", "--force"];
+    case "adminTeleport":
+      return [
+        "admin",
+        "teleport",
+        validatePlayerId(payload.playerId),
+        String(validateNumber(payload.x, -100000000, 100000000)),
+        String(validateNumber(payload.y, -100000000, 100000000)),
+        String(validateNumber(payload.z, -100000000, 100000000)),
+        String(validateNumber(payload.yaw || 0, -360, 360))
+      ];
+    case "adminSpawnVehicle":
+      return ["admin", "spawn-vehicle", validatePlayerId(payload.playerId), validateVehicleId(payload.vehicleId), validateVehicleTemplate(payload.template), String(validateNumber(payload.offset ?? 1000, 0, 100000))];
+    case "adminCleanInventory":
+      return ["admin", "clean-inventory", validatePlayerId(payload.playerId)];
+    case "adminResetProgression":
+      return ["admin", "reset-progression", validatePlayerId(payload.playerId)];
+    case "adminItemSearch":
+      return ["admin", "item-search", validateSearchQuery(payload.q)];
+    case "adminItemListCategory":
+      return ["admin", "item-list", validateCatalogQuery(payload.category)];
+    case "adminVehicleSearch":
+      return ["admin", "vehicle-list", validateCatalogQuery(payload.q)];
+    case "adminSkillModulesSearch":
+      return ["admin", "skill-modules", validateCatalogQuery(payload.q)];
+    case "adminSpecializationMax":
+      return ["admin", "specialization-max", String(payload.character || ""), "--grant-keystones", "--yes"];
+    case "mapsMode":
+      return payload.map ? ["maps", "mode", validateMapName(payload.map)] : ["maps", "mode"];
+    case "mapsSetMode":
+      return ["maps", "set", validateMapName(payload.map), validateMapMode(payload.mode)];
+    case "mapsApplySettings":
+      return ["true"];
+    case "mapsReconcile":
+      return ["maps", "reconcile"];
+    case "mapsRespawn":
+      // Composite: taskOperations expands this into mapsDespawn + mapsSpawn, so
+      // these argv never run. The validate call is the point -- it lets the route
+      // reject a bad target before a task is created.
+      validateMapOrPartition(payload.target);
+      return ["true"];
+    case "mapsSpawn":
+      return ["spawn", validateMapOrPartition(payload.target)];
+    case "mapsDespawn":
+      return ["despawn", validateMapOrPartition(payload.target), "--force"];
+    case "autoscalerStatus":
+      return ["autoscaler", "status"];
+    case "autoscalerAction":
+      return ["autoscaler", validateAutoscalerAction(payload.action)];
+    case "memoryStatus":
+      return ["memory", "status"];
+    case "memorySwapStatus":
+      return ["memory-swap", "status"];
+    case "memorySet":
+      return ["memory", "set", validateMemoryTarget(memoryTarget(payload)), validateMemoryValue(payload.memory)];
+    case "memorySetNoRestart":
+      return ["memory", "set-no-restart", validateMemoryTarget(memoryTarget(payload)), validateMemoryValue(payload.memory)];
+    case "memoryUnset":
+      return ["memory", "unset", validateMemoryTarget(memoryTarget(payload))];
+    case "memorySwapEnable":
+      return [
+        "memory-swap",
+        "enable",
+        String(validateInteger(payload.perServerGiB ?? 2, 1, 16)),
+        String(validateInteger(payload.poolGiB, 0, 32)),
+        String(validateInteger(payload.swappiness ?? 10, 0, 100))
+      ];
+    case "memorySwapDisable":
+      return ["memory-swap", "disable"];
+    case "sietchesShow":
+      return ["sietches", "show", validateMapName(payload.map)];
+    case "sietchesDimensions":
+      return ["sietches", "dimensions", validateMapName(payload.map), "--active-only"];
+    case "sietchesDimensionIds":
+      return ["sietches", "dimensions", validateMapName(payload.map), "--active-only", "--ids"];
+    case "sietchesSetMax":
+      return ["sietches", "set-max", validateMapName(payload.map), String(validateInteger(payload.count, 1, 64))];
+    case "sietchesSetActive":
+      return ["sietches", "set-active", validateMapName(payload.map), String(validateInteger(payload.count, 1, 64))];
+    case "sietchesSetDisplay":
+      return ["sietches", "set-display", validatePartitionId(payload.partitionId), validateDisplayName(payload.displayName)];
+    case "sietchesSetPassword":
+      return ["sietches", "set-password", validatePartitionId(payload.partitionId), validateSietchPassword(payload.password ?? "")];
+    case "sietchesSetSettings":
+      return ["sietches", "set-settings", validatePartitionId(payload.partitionId), validateDisplayName(payload.displayName), validateSietchPassword(payload.password ?? "")];
+    case "sietchesRestart":
+      return ["sietches", "restart", validatePartitionId(payload.partitionId)];
+    case "sietchesRestartStop":
+      return ["sietches", "stop-partition", validatePartitionId(payload.partitionId)];
+    case "sietchesRestartStart":
+      return ["sietches", "start-partition", validatePartitionId(payload.partitionId)];
+    case "sietchesSync":
+      return ["sietches", "sync"];
+    case "sietchesValidate":
+      return ["sietches", "validate"];
+    case "sietchesReconcile":
+      return ["sietches", "reconcile", validateMapName(payload.map)];
+    case "deepdesertAction":
+      if (payload.instances !== undefined) {
+        const instances = validateInteger(payload.instances, 1, 3);
+        const thirdRole = String(payload.thirdRole || "pve").toLowerCase();
+        if (!["pve", "pvp"].includes(thirdRole)) throw new Error("Third Deep Desert role must be pve or pvp");
+        return ["deepdesert", "layout", "set", String(instances), "--third-role", thirdRole, "--yes", "--force"];
+      }
+      return ["deepdesert", "dual", validateDeepDesertAction(payload.action), "--yes", ...(payload.action === "disable" ? ["--force"] : [])];
+    case "userSettingsEngineValues":
+      return ["usersettings", "engine-values"];
+    case "userSettingsMapEngineValues":
+      return ["usersettings", "map-engine-values", validateMapName(payload.map)];
+    case "userSettingsPartitionEngineValues":
+      return ["usersettings", "partition-engine-values", validateMapName(payload.map), validatePartitionId(payload.partitionId)];
+    case "userSettingsMetadata":
+      return ["usersettings", "metadata"];
+    case "userSettingsProfileRaw":
+      return ["usersettings", "profile-raw"];
+    case "userSettingsProfileWrite":
+      return ["usersettings", "profile-write-b64", encodeTextArg(payload.content || "")];
+    case "userSettingsProfileGameRaw":
+      return ["usersettings", "profile-game-raw"];
+    case "userSettingsClientGameIni":
+      return payload.map ? (payload.partitionId ? ["usersettings", "client-game-ini", validateMapName(payload.map), validatePartitionId(payload.partitionId)] : ["usersettings", "client-game-ini", validateMapName(payload.map)]) : ["usersettings", "client-game-ini"];
+    case "userSettingsClientEngineIni":
+      return payload.map ? (payload.partitionId ? ["usersettings", "client-engine-ini", validateMapName(payload.map), validatePartitionId(payload.partitionId)] : ["usersettings", "client-engine-ini", validateMapName(payload.map)]) : ["usersettings", "client-engine-ini"];
+    case "userSettingsProfileGameWrite":
+      return ["usersettings", "profile-game-write-b64", encodeTextArg(payload.content || "")];
+    case "userSettingsProfileEngineRaw":
+      return ["usersettings", "profile-engine-raw"];
+    case "userSettingsProfileEngineWrite":
+      return ["usersettings", "profile-engine-write-b64", encodeTextArg(payload.content || "")];
+    case "userSettingsMapValues":
+      return ["usersettings", "map-values", validateMapName(payload.map)];
+    case "userSettingsGlobalValues":
+      return ["usersettings", "global-values"];
+    case "userSettingsPartitionValues":
+      return ["usersettings", "partition-values", validateMapName(payload.map), validatePartitionId(payload.partitionId)];
+    case "userSettingsServerCustomValues":
+      return ["usersettings", "server-custom-values", payload.scope === "serverCustomGlobal" ? "global" : payload.scope === "serverCustomPartition" ? "partition" : "map", validateMapName(payload.map || "Survival_1"), payload.partitionId ? validatePartitionId(payload.partitionId) : ""];
+    case "userSettingsSave":
+      return ["usersettings", "bulk-save", validateSettingsScope(payload.scope), validateMapName(payload.map || "Survival_1"), payload.partitionId ? validatePartitionId(payload.partitionId) : "", encodeJsonArg(payload.values || {})];
+    case "userSettingsMigrateCoriolisRegionFields":
+      // region comes only from the deployment's own SERVER_REGION (readSetupConfigValues,
+      // an allowlisted .env read), never from a request -- spawn's argv array means there
+      // is no shell to inject into regardless, and an unmapped/garbage value is a no-op
+      // on the Python side (migrate_coriolis_region_fields looks it up in a fixed dict).
+      return ["usersettings", "migrate-coriolis-region-fields", String(payload.region || "")];
+    case "userSettingsSaveAndRestart":
+      return buildDuneArgs("userSettingsSave", payload);
+    case "userSettingsResetEngineGameplay":
+      return ["usersettings", "reset-engine-gameplay"];
+    case "userSettingsResetMapEngine":
+      return ["usersettings", "reset-map-engine", validateMapName(payload.map)];
+    case "userSettingsResetPartitionEngine":
+      return ["usersettings", "reset-partition-engine", validateMapName(payload.map), validatePartitionId(payload.partitionId)];
+    case "userSettingsResetGlobalGame":
+      return ["usersettings", "reset-global-game"];
+    case "userSettingsResetGame":
+      return payload.partitionId ? ["usersettings", "reset-game", validateMapName(payload.map), validatePartitionId(payload.partitionId)] : ["usersettings", "reset-game", validateMapName(payload.map)];
+    case "userSettingsResetAndRestart":
+      return payload.scope === "engine"
+        ? buildDuneArgs("userSettingsResetEngineGameplay", payload)
+        : payload.scope === "mapEngine"
+          ? buildDuneArgs("userSettingsResetMapEngine", payload)
+          : payload.scope === "partitionEngine"
+            ? buildDuneArgs("userSettingsResetPartitionEngine", payload)
+        : payload.scope === "global"
+          ? buildDuneArgs("userSettingsResetGlobalGame", payload)
+          : buildDuneArgs("userSettingsResetGame", payload);
+    case "userSettingsRawEngine":
+      return buildDuneArgs("userSettingsProfileEngineRaw", payload);
+    case "userSettingsRawGame":
+      return buildDuneArgs("userSettingsProfileGameRaw", payload);
+    case "userSettingsRawEngineWrite":
+      return buildDuneArgs("userSettingsProfileEngineWrite", payload);
+    case "userSettingsRawGameWrite":
+      return buildDuneArgs("userSettingsProfileGameWrite", payload);
+    case "userSettingsRawAndRestart":
+      return payload.scope === "profile" ? buildDuneArgs("userSettingsProfileWrite", payload) : payload.scope === "engine" ? buildDuneArgs("userSettingsRawEngineWrite", payload) : buildDuneArgs("userSettingsRawGameWrite", payload);
+    case "userSettingsResetAll":
+      return ["usersettings", "reset-all"];
+    case "userSettingsMaterializeCurrent":
+      return ["usersettings", "materialize-current"];
+    default:
+      throw new Error(`Unsupported operation: ${operation}`);
+  }
+}
+
+function validateCommitSha(value) {
+  const sha = String(value || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("Invalid QA build identifier.");
+  return sha;
+}
+
+function encodeJsonArg(value) {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64");
+}
+
+function encodeTextArg(value) {
+  return Buffer.from(String(value), "utf8").toString("base64");
+}
+
+function validateSettingsScope(value) {
+  const raw = String(value || "").trim();
+  if (["engine", "mapEngine", "partitionEngine", "global", "map", "partition", "serverCustomGlobal", "serverCustomMap", "serverCustomPartition", "profile"].includes(raw)) return raw;
+  throw new Error(`Unsupported settings scope: ${raw}`);
+}
+
+export function runDune(config, args, options = {}) {
+  if (!existsSync(config.duneScript)) {
+    return Promise.reject(new Error(`Missing dune command: ${config.duneScript}`));
+  }
+
+  let command = config.duneScript;
+  let commandArgs = args;
+  if (args[0] === "usersettings") {
+    command = "python3";
+    commandArgs = [`${config.repoRoot}/runtime/scripts/usersettings.py`, ...args.slice(1)];
+  }
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, commandArgs, {
+      cwd: config.repoRoot,
+      shell: false,
+      detached: true,
+      env: { ...process.env, ...(options.env || {}), DUNE_ADMIN_ASSUME_YES: "1", DUNE_DB_ASSUME_YES: "1", DUNE_MEMORY_ASSUME_YES: "1" }
+    });
+    const timeout = setTimeout(() => killProcessTree(child), options.timeoutMs || config.commandTimeoutMs);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      const text = options.redactOutput === false ? chunk.toString() : redact(chunk.toString());
+      stdout = appendBoundedOutput(stdout, text);
+      options.onLine?.(text, "stdout");
+    });
+    child.stderr.on("data", (chunk) => {
+      const text = options.redactOutput === false ? chunk.toString() : redact(chunk.toString());
+      stderr = appendBoundedOutput(stderr, text);
+      options.onLine?.(text, "stderr");
+    });
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      clearTimeout(timeout);
+      const result = { code, signal, stdout, stderr, args: commandArgs };
+      const allowedExitCodes = options.allowedExitCodes || [0];
+      if (allowedExitCodes.includes(code)) resolve(result);
+      else reject(Object.assign(new Error(`dune ${args.join(" ")} failed with exit ${code}`), result));
+    });
+  });
+}
+
+function killProcessTree(child) {
+  if (!child.pid) return;
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // Process already exited.
+    }
+  }
+}
+
+export function runDockerLogs(service, options = {}) {
+  const normalizedService = validateLogServiceName(service);
+  const useComposeService = normalizedService === "orchestrator";
+  const container = useComposeService ? "orchestrator" : dockerContainerForLogService(normalizedService);
+  const args = useComposeService
+    ? ["compose", "logs", "--tail", String(options.tail || 400)]
+    : ["logs", "--tail", String(options.tail || 400)];
+  if (options.since) args.push("--since", String(options.since));
+  if (options.follow) args.push("-f");
+  args.push(container);
+
+  return new Promise((resolve, reject) => {
+    const spawnImpl = options.spawnImpl || spawn;
+    const child = spawnImpl("docker", args, {
+      shell: false,
+      env: { ...process.env },
+      cwd: useComposeService ? (process.env.DUNE_DOCKER_DIR || process.cwd()) : undefined
+    });
+    const stop = () => child.kill("SIGTERM");
+    const timeout = setTimeout(stop, options.timeoutMs || 30000);
+    const captureOutput = options.captureOutput !== false;
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      const text = redact(chunk.toString());
+      if (captureOutput) stdout = appendBoundedOutput(stdout, text);
+      options.onLine?.(text, "stdout");
+    });
+    child.stderr.on("data", (chunk) => {
+      const text = redact(chunk.toString());
+      if (captureOutput) stderr = appendBoundedOutput(stderr, text);
+      options.onLine?.(text, "stderr");
+    });
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", stop);
+      const result = { code, signal, stdout, stderr, args: ["docker", ...args] };
+      if (code === 0 || signal === "SIGTERM") resolve(result);
+      else reject(Object.assign(new Error(`docker ${args.join(" ")} failed with exit ${code}`), result));
+    });
+    if (options.signal?.aborted) stop();
+    else options.signal?.addEventListener("abort", stop, { once: true });
+  });
+}
+
+// Game servers always write their active session to a DuneSandbox_PIDX*.log
+// file inside the container. That file is more authoritative than `docker
+// logs`: a stopped/started container can retain old stdout while the newly
+// launched game process writes only to Saved/Logs. Keep the lookup script
+// fixed and pass only an allowlisted container plus a numeric tail argument.
+// Select the lines rather than tail the file. The Coriolis block is written
+// once, during startup, so it sits near the *top* of the current session's log
+// and scrolls out of any tail window within hours: on a live farm the log was
+// 24,539 lines with the block at 383-576, while `tail -n 10000` began at 14,438.
+// Because an active log that opens is treated as authoritative, that silently
+// cost the Deep Desert layout -- and with it the rendered terrain -- on any
+// server up more than a few hours.
+//
+// Grepping is cheaper than tailing here too: it returns a handful of lines
+// through `docker exec` instead of the ~4 MB a 10,000-line tail transfers
+// (measured on that farm: 35 ms per call against 40 ms).
+//
+// Matching the log categories rather than the message text keeps this loose;
+// coriolisSeed.js owns the real parsing. `$1` bounds the output, and grep's
+// "no matches" (1) is kept distinct from a genuine read error (2+): an active
+// log that is merely empty is authoritative, an unreadable one must fall back.
+export const CURRENT_GAME_LOG_SCRIPT = [
+  'log_dir=/home/dune/server/DuneSandbox/Saved/Logs',
+  'latest="$(find "$log_dir" -maxdepth 1 -type f -name "DuneSandbox_PIDX*.log" ! -name "*-backup-*" -printf "%T@ %p\\n" 2>/dev/null | sort -nr | head -n 1 | cut -d" " -f2-)"',
+  '[ -n "$latest" ] || exit 3',
+  'matches="$(grep -E "LogCoriolis|LogWorldLayout" "$latest")"; status=$?',
+  '[ "$status" -le 1 ] || exit 4',
+  '[ -z "$matches" ] || echo "$matches" | tail -n "$1"'
+].join("; ");
+
+export function runDockerCurrentGameLog(service, options = {}) {
+  const container = dockerContainerForLogService(service);
+  const requestedTail = Number.parseInt(String(options.tail || 10000), 10);
+  const tail = Number.isFinite(requestedTail) ? Math.max(1, Math.min(100000, requestedTail)) : 10000;
+  const args = ["exec", container, "sh", "-c", CURRENT_GAME_LOG_SCRIPT, "dune-current-game-log", String(tail)];
+
+  return new Promise((resolve, reject) => {
+    const spawnImpl = options.spawnImpl || spawn;
+    const child = spawnImpl("docker", args, { shell: false, env: { ...process.env } });
+    const stop = () => child.kill("SIGTERM");
+    const timeout = setTimeout(stop, options.timeoutMs || 5000);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout = appendBoundedOutput(stdout, redact(chunk.toString())); });
+    child.stderr.on("data", (chunk) => { stderr = appendBoundedOutput(stderr, redact(chunk.toString())); });
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      clearTimeout(timeout);
+      const result = { code, signal, stdout, stderr, args: ["docker", ...args] };
+      if (code === 0) resolve(result);
+      else reject(Object.assign(new Error(`docker exec could not read the current game log from ${container}`), result));
+    });
+  });
+}
+
+export function appendBoundedOutput(current, chunk, maxChars = MAX_CAPTURED_OUTPUT_CHARS) {
+  const next = `${current || ""}${chunk || ""}`;
+  if (next.length <= maxChars) return next;
+  const available = Math.max(0, maxChars - OUTPUT_TRUNCATED_MARKER.length);
+  return `${OUTPUT_TRUNCATED_MARKER}${next.slice(-available)}`;
+}
+
+export function parseVehicleList(stdout = "") {
+  const vehicles = [];
+  let current = null;
+  for (const rawLine of String(stdout).split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const actorMatch = line.match(/^actor:\s*(.+)$/i);
+    if (actorMatch && current) {
+      current.actor = actorMatch[1].trim();
+      continue;
+    }
+    const templatesMatch = line.match(/^templates:\s*(.*)$/i);
+    if (templatesMatch && current) {
+      current.templates = templatesMatch[1].split(",").map((part) => part.trim()).filter(Boolean);
+      continue;
+    }
+    if (/^[A-Za-z][A-Za-z0-9_-]+$/.test(line)) {
+      current = { id: line, name: line, actor: "", templates: [] };
+      vehicles.push(current);
+    }
+  }
+  return vehicles;
+}
+
+export function isDynamicServerService(service) {
+  return /^dune-server-[a-z0-9-]+$/i.test(String(service || ""));
+}
+
+export function dockerContainerForLogService(service) {
+  const raw = String(service || "").trim();
+  const normalized = validateLogServiceName(raw);
+  const containers = new Map([
+    ["postgres", "dune-postgres"],
+    ["rmq-admin", "dune-rmq-admin"],
+    ["rmq-game", "dune-rmq-game"],
+    ["text-router", "dune-text-router"],
+    ["director", "dune-director"],
+    ["gateway", "dune-server-gateway"],
+    ["survival", "dune-server-survival-1"],
+    ["survival-1", "dune-server-survival-1"],
+    ["overmap", "dune-server-overmap"],
+    ["orchestrator", "dune-orchestrator"],
+    ["autoscaler", "dune-autoscaler"],
+    ["coriolis", "dune-coriolis-coordinator"],
+    ["console", "redblink-dune-docker-console"]
+  ]);
+  if (containers.has(normalized)) return containers.get(normalized);
+  if (/^dune-server-[a-z0-9-]+$/i.test(normalized)) return normalized;
+  throw new Error(`Docker log access is not configured for service: ${raw}`);
+}
+
+function validateServerTitle(value) {
+  const raw = String(value || "").trim();
+  if (!raw) throw new Error("Server title cannot be empty");
+  if (raw.length > 80) throw new Error("Server title must be 80 characters or fewer");
+  if (/[\r\n]/.test(raw)) throw new Error("Server title cannot contain line breaks");
+  return raw;
+}
+
+function validateServerMode(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "public" || raw === "local") return raw;
+  throw new Error("Server mode must be public or local");
+}
+
+function validatePlayerId(value) {
+  const raw = String(value || "");
+  if (raw === "*" || /^[A-Za-z0-9_:#.-]{1,128}$/.test(raw)) return raw;
+  throw new Error("Invalid player id");
+}
+
+function validateOptionalFlag(value, label) {
+  if (value === undefined || value === false) return "0";
+  if (value === true) return "1";
+  throw new Error(`${label} must be true or false`);
+}
+
+function validateInteger(value, min, max) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min || n > max) throw new Error(`Expected integer ${min}-${max}`);
+  return n;
+}
+
+function validateMinuteCheckpoints(value) {
+  const raw = Array.isArray(value) ? value : String(value ?? "").split(/[\s,]+/).filter(Boolean);
+  if (!raw.length || raw.length > 12) throw new Error("Expected 1-12 warning times between 1 and 1440 minutes");
+  const values = raw.map((item) => validateInteger(item, 1, 1440));
+  if (new Set(values).size !== values.length || values.some((minutes, index) => index > 0 && minutes >= values[index - 1])) {
+    throw new Error("Warning times must be unique and ordered from largest to smallest");
+  }
+  return values.join(",");
+}
+
+function validateNumber(value, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < min || n > max) throw new Error(`Expected number ${min}-${max}`);
+  return n;
+}
+
+function validateItemName(value) {
+  const raw = String(value || "").trim();
+  if (raw && raw.length <= 200 && !/[\r\n]/.test(raw)) return raw;
+  throw new Error("Invalid item name");
+}
+
+function validateItemId(value) {
+  const raw = String(value || "").trim();
+  if (/^[A-Za-z0-9_./:-]{1,240}$/.test(raw)) return raw;
+  throw new Error("Invalid item id");
+}
+
+function validateDurability(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0 || n > 1) throw new Error("Expected durability 0-1");
+  return n;
+}
+
+function validateItemQuality(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0 || n > 5 || Math.trunc(n) !== n) throw new Error("Expected item grade 0-5");
+  return n;
+}
+
+function validateTemplateName(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "scout-ornithopter-mk6") return raw;
+  throw new Error("Unsupported item bundle template");
+}
+
+function validateSkillModule(value) {
+  const raw = String(value || "").trim();
+  if (/^[A-Za-z0-9_./:-]{1,200}$/.test(raw) || (raw.length > 0 && raw.length <= 120 && !/[\r\n]/.test(raw))) return raw;
+  throw new Error("Invalid skill module");
+}
+
+function validateVehicleId(value) {
+  const raw = String(value || "").trim();
+  if (/^[A-Za-z0-9_./:-]{1,160}$/.test(raw)) return raw;
+  throw new Error("Invalid vehicle id");
+}
+
+function validateVehicleTemplate(value) {
+  const raw = String(value || "").trim();
+  if (/^[A-Za-z0-9_./:-]{1,160}$/.test(raw)) return raw;
+  throw new Error("Invalid vehicle template");
+}
+
+function validateMapName(value) {
+  const raw = String(value || "").trim();
+  if (/^[A-Za-z0-9_:-]{1,80}$/.test(raw)) return raw;
+  throw new Error("Invalid map name");
+}
+
+function validateMapMode(value) {
+  const raw = String(value || "").trim();
+  if (["dynamic", "always-on", "overmap-active", "disabled"].includes(raw)) return raw;
+  throw new Error("Map mode must be dynamic, always-on, overmap-active, or disabled");
+}
+
+function validateMapOrPartition(value) {
+  const raw = String(value || "").trim();
+  if (/^[A-Za-z0-9_:-]{1,80}$/.test(raw)) return raw;
+  throw new Error("Invalid map or partition target");
+}
+
+function validateAutoscalerAction(value) {
+  const raw = String(value || "").trim();
+  if (["status", "start", "stop", "restart", "logs"].includes(raw)) return raw;
+  throw new Error("Unsupported autoscaler action");
+}
+
+function validateMemoryTarget(value) {
+  const raw = String(value || "").trim();
+  if (raw === "default" || /^[A-Za-z0-9_:-]{1,80}$/.test(raw)) return raw;
+  throw new Error("Invalid memory target");
+}
+
+function memoryTarget(payload = {}) {
+  const map = String(payload.map || "");
+  const partitionId = String(payload.partitionId || "").trim();
+  if (partitionId) return `partition:${validatePartitionId(partitionId)}`;
+  return map;
+}
+
+function validateMemoryValue(value) {
+  const raw = String(value || "").trim();
+  if (/^(?:[1-9][0-9]*(?:\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)[mMgG]$/.test(raw)) return raw;
+  throw new Error("Invalid memory value");
+}
+
+function validatePartitionId(value) {
+  return String(validateInteger(value, 1, 1000000));
+}
+
+function validateDisplayName(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/[\r\n\t'|]/.test(raw)) {
+    throw new Error("Invalid Sietch name: apostrophes, pipes, tabs, and line breaks are not supported");
+  }
+  if (raw.length <= 80) return raw;
+  throw new Error("Invalid Sietch name: the name must be 80 characters or fewer");
+}
+
+function validateSietchPassword(value) {
+  const raw = String(value || "");
+  if (raw.length <= 80 && !/[\r\n\t]/.test(raw)) return raw;
+  throw new Error("Invalid sietch password");
+}
+
+function validateDeepDesertAction(value) {
+  const raw = String(value || "").trim();
+  if (["enable", "disable", "bootstrap", "repair"].includes(raw)) return raw;
+  throw new Error("Unsupported Deep Desert action");
+}
+
+function validateUpdateTime(value) {
+  const raw = String(value || "").trim();
+  if (/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(raw)) return raw;
+  throw new Error("Auto update time must be HH:MM");
+}
+
+function validateSearchQuery(value) {
+  const raw = String(value || "").trim();
+  if (raw.length >= 2 && raw.length <= 120 && !/[\r\n]/.test(raw)) return raw;
+  throw new Error("Search query must be 2-120 characters");
+}
+
+function validateCatalogQuery(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (raw.length <= 120 && !/[\r\n]/.test(raw)) return raw;
+  throw new Error("Catalog query is invalid");
+}
+
+function validateTableName(value) {
+  const raw = String(value || "");
+  if (/^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$/.test(raw)) return raw;
+  throw new Error("Invalid table name");
+}
+
+function validateBackupName(value) {
+  const raw = String(value || "");
+  if (/^[A-Za-z0-9._-]+$/.test(raw) && !raw.includes("..")) return raw;
+  throw new Error("Invalid backup name");
+}
+
+function validateBackupNames(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) throw new Error("Select between 1 and 100 backups");
+  return [...new Set(value.map(validateBackupName))];
+}
+
+export function isReadOnlySql(query) {
+  const raw = String(query || "").trim();
+  return /^(select|with|show|explain)\b/i.test(raw) && !/\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|copy\s+.*\s+from)\b/i.test(raw);
+}
+
+function validateSql(query, allowDestructive) {
+  const raw = String(query || "").trim();
+  if (!raw || raw.length > 100000) throw new Error("Invalid SQL query");
+  if (!allowDestructive && !isReadOnlySql(raw)) throw new Error("Only read-only SQL is allowed without destructive confirmation");
+  return raw;
+}

@@ -1,0 +1,169 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { createSharedDeleteBackup, flushBaseRefillQueues } from "../src/services/baseRefillFlush.js";
+
+test("a mixed base and vehicle delete batch shares one safety backup", async () => {
+  let calls = 0;
+  const backup = createSharedDeleteBackup(async () => {
+    calls += 1;
+    await new Promise((resolve) => setImmediate(resolve));
+    return { code: 0 };
+  });
+
+  const [baseResult, vehicleResult] = await Promise.all([backup(), backup()]);
+  assert.equal(calls, 1);
+  assert.deepEqual(baseResult, { code: 0 });
+  assert.equal(vehicleResult, baseResult);
+});
+
+test("map-down refill flush waits for both queues and labels their results", async () => {
+  const completed = [];
+  let releaseWater;
+  const waterBlocked = new Promise((resolve) => { releaseWater = resolve; });
+
+  const pending = flushBaseRefillQueues({
+    flushGenerators: async () => {
+      completed.push("generator");
+      return { flushed: [{ baseId: 11, ok: true }] };
+    },
+    flushWater: async () => {
+      await waterBlocked;
+      completed.push("water");
+      return { flushed: [{ baseId: 22, ok: true }] };
+    }
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(completed, ["generator"]);
+  let settled = false;
+  void pending.then(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "the map-down hook must remain pending while either queue is flushing");
+
+  releaseWater();
+  const result = await pending;
+  assert.deepEqual(completed, ["generator", "water"]);
+  assert.deepEqual(result.failures, []);
+  assert.deepEqual(result.flushed, [
+    { baseId: 11, ok: true, refillType: "generator" },
+    { baseId: 22, ok: true, refillType: "water" }
+  ]);
+});
+
+test("a failed queue does not stop the hook waiting for the other queue", async () => {
+  let waterFinished = false;
+  const result = await flushBaseRefillQueues({
+    flushGenerators: async () => { throw new Error("generator database unavailable"); },
+    flushWater: async () => {
+      await new Promise((resolve) => setImmediate(resolve));
+      waterFinished = true;
+      return { flushed: [{ baseId: 33, ok: true }] };
+    }
+  });
+
+  assert.equal(waterFinished, true);
+  assert.deepEqual(result.flushed, [{ baseId: 33, ok: true, refillType: "water" }]);
+  assert.deepEqual(result.failures, [{ refillType: "generator", error: "generator database unavailable" }]);
+});
+
+test("flushDeletes is optional and additive alongside the two refill queues", async () => {
+  const result = await flushBaseRefillQueues({
+    flushGenerators: async () => ({ flushed: [{ baseId: 1, ok: true }] }),
+    flushWater: async () => ({ flushed: [{ baseId: 2, ok: true }] }),
+    flushDeletes: async () => ({ flushed: [{ baseId: 3, ok: true }] })
+  });
+  assert.deepEqual(result.flushed, [
+    { baseId: 1, ok: true, refillType: "generator" },
+    { baseId: 2, ok: true, refillType: "water" },
+    { baseId: 3, ok: true, refillType: "delete" }
+  ]);
+  assert.deepEqual(result.failures, []);
+});
+
+test("omitting flushDeletes behaves exactly as before this leg existed", async () => {
+  const result = await flushBaseRefillQueues({
+    flushGenerators: async () => ({ flushed: [{ baseId: 1, ok: true }] }),
+    flushWater: async () => ({ flushed: [{ baseId: 2, ok: true }] })
+  });
+  assert.deepEqual(result.flushed, [
+    { baseId: 1, ok: true, refillType: "generator" },
+    { baseId: 2, ok: true, refillType: "water" }
+  ]);
+  assert.deepEqual(result.failures, []);
+});
+
+test("a failed delete flush does not stop the hook waiting for the other queues", async () => {
+  const result = await flushBaseRefillQueues({
+    flushGenerators: async () => ({ flushed: [{ baseId: 1, ok: true }] }),
+    flushWater: async () => ({ flushed: [{ baseId: 2, ok: true }] }),
+    flushDeletes: async () => { throw new Error("delete queue database unavailable"); }
+  });
+  assert.deepEqual(result.flushed, [
+    { baseId: 1, ok: true, refillType: "generator" },
+    { baseId: 2, ok: true, refillType: "water" }
+  ]);
+  assert.deepEqual(result.failures, [{ refillType: "delete", error: "delete queue database unavailable" }]);
+});
+
+test("base permission and vehicle delete queues both flush during the same map-down window", async () => {
+  const result = await flushBaseRefillQueues({
+    flushGenerators: async () => ({ flushed: [] }),
+    flushWater: async () => ({ flushed: [] }),
+    flushChildAccess: async () => ({ flushed: [{ baseId: 4, updated: 2, ok: true }] }),
+    flushVehicleDeletes: async () => ({ flushed: [{ vehicleId: 5, ok: true }] })
+  });
+  assert.deepEqual(result.flushed, [
+    { baseId: 4, updated: 2, ok: true, refillType: "childAccess" },
+    { vehicleId: 5, ok: true, refillType: "vehicle-delete" }
+  ]);
+  assert.deepEqual(result.failures, []);
+});
+
+// A pass that aborts at its mandatory safety backup resolves normally with an
+// empty flushed list. Without surfacing backupFailed the restart reports
+// nothing at all, so the operator sees a clean restart while the queue was
+// never touched -- the silent failure this summary exists to prevent.
+test("a queue that aborted at its safety backup is reported, not silently dropped", async () => {
+  const result = await flushBaseRefillQueues({
+    flushGenerators: async () => ({ flushed: [] }),
+    flushWater: async () => ({ flushed: [] }),
+    flushDeletes: async () => ({ flushed: [], pending: 2, backupFailed: true, error: "backup destination is full" })
+  });
+
+  assert.deepEqual(result.flushed, []);
+  assert.deepEqual(result.failures, [{ refillType: "delete", error: "backup destination is full" }]);
+});
+
+// These failure strings reach the operator's task panel. Driver errors from a
+// map-down flush routinely quote the connection string, which plain redact()
+// does not strip -- only redactDbError() does.
+test("a rejected queue has its connection string stripped before the operator sees it", async () => {
+  const result = await flushBaseRefillQueues({
+    flushGenerators: async () => ({ flushed: [] }),
+    flushWater: async () => {
+      throw new Error("connect ECONNREFUSED postgres://dune:hunter2@127.0.0.1:15432/dune");
+    }
+  });
+
+  const [failure] = result.failures;
+  assert.equal(failure.refillType, "water");
+  assert.doesNotMatch(failure.error, /hunter2/);
+  assert.match(failure.error, /ECONNREFUSED/);
+});
+
+test("a safety-backup failure has its connection string stripped too", async () => {
+  const result = await flushBaseRefillQueues({
+    flushGenerators: async () => ({ flushed: [] }),
+    flushWater: async () => ({ flushed: [] }),
+    flushDeletes: async () => ({
+      flushed: [],
+      backupFailed: true,
+      error: "pg_dump failed: postgres://dune:hunter2@127.0.0.1:15432/dune"
+    })
+  });
+
+  const [failure] = result.failures;
+  assert.equal(failure.refillType, "delete");
+  assert.doesNotMatch(failure.error, /hunter2/);
+  assert.match(failure.error, /pg_dump failed/);
+});

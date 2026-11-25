@@ -1,0 +1,47 @@
+services:
+  orchestrator:
+    build:
+      context: ./orchestrator
+    image: dune-orchestrator:dev
+    container_name: dune-orchestrator
+    restart: unless-stopped
+    network_mode: host
+    group_add:
+      - "${DOCKER_SOCKET_GID:-0}"
+    environment:
+      SERVER_IP: "${SERVER_IP}"
+      SERVER_TITLE: "${SERVER_TITLE}"
+      SERVER_REGION: "${SERVER_REGION}"
+      STEAM_APP_ID: "${STEAM_APP_ID:-4754530}"
+      DUNE_ROOT: "/srv/dune"
+      DUNE_SERVER_DIR: "/srv/dune/server"
+      DUNE_STEAM_DIR: "/srv/dune/steam"
+      DUNE_GENERATED_DIR: "/srv/dune/generated"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - dune-server:/srv/dune/server
+      - dune-steam:/srv/dune/steam
+      - dune-cache:/srv/dune/cache
+      - dune-generated:/srv/dune/generated
+      - dune-work:/work
+    stdin_open: true
+    tty: true
+    command: ["dune", "daemon"]
+    healthcheck:
+      test: ["CMD-SHELL", "docker info >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "${DUNE_DOCKER_LOG_MAX_SIZE:-50m}"
+        max-file: "${DUNE_DOCKER_LOG_MAX_FILES:-3}"
+
+volumes:
+  dune-server:
+  dune-steam:
+  dune-cache:
+  dune-generated:
+  dune-work:

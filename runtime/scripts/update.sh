@@ -3,10 +3,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 ROOT_DIR="$(pwd)"
+HOST_ROOT_DIR="${DUNE_HOST_REPO_ROOT:-$ROOT_DIR}"
 
 [ -f .env ] && . ./.env
-[ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 . runtime/scripts/runtime-env.sh
+. runtime/scripts/steamcmd-signals.sh
 
 SERVER_TITLE="$(resolve_server_title)"
 SERVER_REGION="$(resolve_server_region)"
@@ -15,142 +17,1132 @@ export SERVER_TITLE SERVER_REGION SERVER_IP
 
 APP_ID="${STEAM_APP_ID:-4754530}"
 
-echo "=== Dune update scaffold ==="
-echo "Steam app id: $APP_ID"
-
 cmd="${1:-run}"
 
-AUTO_STATE_FILE="runtime/generated/update-auto.env"
-AUTO_SERVICE_FILE="/etc/systemd/system/dune-awakening-auto-update.service"
-AUTO_TIMER_FILE="/etc/systemd/system/dune-awakening-auto-update.timer"
-AUTO_DEFAULT_TIME="${DUNE_AUTO_UPDATE_TIME:-05:00:00}"
+AUTO_STATE_FILE="${DUNE_AUTO_UPDATE_STATE_FILE:-runtime/generated/update-auto.env}"
+MANUAL_STOP_FILE="runtime/generated/manual-stop.env"
+AUTO_SERVICE_NAME="dune-awakening-auto-update.service"
+AUTO_TIMER_NAME="dune-awakening-auto-update.timer"
+AUTO_SERVICE_FILE="/etc/systemd/system/$AUTO_SERVICE_NAME"
+AUTO_TIMER_FILE="/etc/systemd/system/$AUTO_TIMER_NAME"
+AUTO_DEFAULT_TIME="${DUNE_AUTO_UPDATE_TIME:-05:00}"
+AUTO_DEFAULT_INTERVAL_MINUTES="${DUNE_AUTO_UPDATE_INTERVAL_MINUTES:-60}"
+AUTO_PENDING_FILE="${DUNE_AUTO_UPDATE_PENDING_FILE:-runtime/generated/update-auto-pending.env}"
+AUTO_TANKS_FILE="${DUNE_AUTO_UPDATE_TANKS_FILE:-runtime/generated/update-auto-tanks.env}"
+UPDATE_CHECK_CACHE_FILE="runtime/generated/game-update-check.json"
 
-handle_auto_update() {
-  sub="${1:-status}"
-  time_value="${2:-$AUTO_DEFAULT_TIME}"
+positive_integer_or_default() {
+  local value="$1"
+  local fallback="$2"
+
+  if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+steamcmd_content_log_line_count() {
+  docker compose exec -T orchestrator sh -lc '
+    log=/home/dune/Steam/logs/content_log.txt
+    if [ -f "$log" ]; then
+      wc -l < "$log"
+    else
+      echo 0
+    fi
+  ' 2>/dev/null | tr -d '[:space:]' || true
+}
+
+append_new_steamcmd_content_log() {
+  local previous_lines="$1"
+  local output_file="$2"
+
+  [[ "$previous_lines" =~ ^[0-9]+$ ]] || previous_lines=0
+  docker compose exec -T -e PREVIOUS_LINES="$previous_lines" orchestrator sh -lc '
+    log=/home/dune/Steam/logs/content_log.txt
+    [ -f "$log" ] || exit 0
+    current_lines="$(wc -l < "$log")"
+    if [ "$current_lines" -lt "$PREVIOUS_LINES" ]; then
+      tail -n 160 "$log"
+    elif [ "$current_lines" -gt "$PREVIOUS_LINES" ]; then
+      tail -n "+$((PREVIOUS_LINES + 1))" "$log"
+    fi
+  ' >> "$output_file" 2>/dev/null || true
+}
+
+container_running() {
+  local name="$1"
+  docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null | grep -qx true
+}
+
+dune_stack_has_running_services() {
+  docker ps --format '{{.Names}}' 2>/dev/null \
+    | grep -Eq '^dune-(postgres|rmq-admin|rmq-game|text-router|director|server-gateway|server-|autoscaler)$'
+}
+
+# Narrower than dune_stack_has_running_services on purpose: that one matches
+# dune-postgres, which is legitimately running on a host part-way through a
+# restore. Only a live world server makes swapping game files and image tags
+# unsafe.
+# Mirrors is_world_game_container() in recycle-world-game-servers.sh, which is
+# this repo's authority on the name shape. Besides the two fixed servers the
+# autoscaler spawns dune-server-<map>-<partition> -- dune-server-sh-arrakeen-23
+# and the like -- so matching only overmap and survival-N let install-assets
+# swap game files and image tags under a live world, which is the one thing the
+# refusal below exists to prevent. The gateway is not a world server.
+world_game_servers_running() {
+  local name
+  while IFS= read -r name; do
+    case "$name" in
+      dune-server-gateway)
+        continue
+        ;;
+      dune-server-overmap|dune-server-survival-1)
+        return 0
+        ;;
+      dune-server-*-*)
+        if [[ "$name" =~ -[0-9]+$ ]]; then
+          return 0
+        fi
+        ;;
+    esac
+  done < <(docker ps --format '{{.Names}}' 2>/dev/null)
+  return 1
+}
+
+# Every orchestrator call below goes through `docker compose exec`, and the only
+# thing that starts that container is init.sh -- which exits early on a host with
+# no Funcom token, i.e. exactly the host a system restore is for. A no-op if it
+# is already up.
+ensure_orchestrator() {
+  if docker compose ps --status running --services 2>/dev/null | grep -qx orchestrator; then
+    return 0
+  fi
+  echo "Starting the orchestrator container..."
+  if ! docker compose up -d orchestrator; then
+    echo "Could not start the orchestrator container, which the game-file install runs through." >&2
+    return 1
+  fi
+}
+
+# The tail of the asset phase: map catalogs and obsolete-image cleanup. Neither
+# touches the database -- the catalog scripts read world-template.yaml through
+# the orchestrator, storage.sh is pure docker -- so both belong with the assets,
+# and install-assets runs them by calling this rather than duplicating the block.
+finish_asset_phase() {
+  echo
+  echo "DUNE_GAME_ASSETS_PHASE=Refreshing map catalogs"
+  echo "=== Refresh generated map catalogs ==="
+  runtime/scripts/extract-partition-catalog.sh
+  runtime/scripts/extract-server-catalog.sh
+  echo "Generated map catalogs refreshed."
+
+  if [ "${DUNE_STORAGE_AUTO_CLEANUP:-1}" = "1" ]; then
+    echo
+    echo "=== Remove obsolete Dune game images ==="
+    local storage_args=(cleanup)
+    if [ "${DUNE_STORAGE_PRUNE_BUILD_CACHE:-0}" = "1" ]; then
+      storage_args+=(--build-cache)
+    fi
+    runtime/scripts/storage.sh "${storage_args[@]}" || echo "WARN Obsolete image cleanup did not complete; the update itself remains valid."
+  fi
+}
+
+stop_temporary_postgres() {
+  if [ "${update_started_postgres:-0}" = "1" ] && [ "${postgres_was_running:-0}" != "1" ]; then
+    echo
+    echo "=== Stop temporary Postgres ==="
+    docker rm -f dune-postgres >/dev/null 2>&1 || true
+    echo "Postgres was started only for the update and has been stopped again."
+  fi
+}
+
+cleanup_update_state() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "${stack_was_stopped:-0}" = "1" ]; then
+    stop_temporary_postgres
+  fi
+  exit "$rc"
+}
+
+trap cleanup_update_state EXIT
+
+write_auto_state() {
+  local enabled="$1"
+  local interval_minutes="$2"
+  local apply_enabled="${3:-${DUNE_AUTO_UPDATE_APPLY_ENABLED:-1}}"
+  local notify_enabled="${4:-${DUNE_AUTO_UPDATE_NOTIFY_ENABLED:-1}}"
+  local notify_minutes="${5:-${DUNE_AUTO_UPDATE_NOTIFY_MINUTES:-15,10,5,1}}"
+  local wait_empty="${6:-${DUNE_AUTO_UPDATE_WAIT_EMPTY:-0}}"
+  local max_wait_minutes="${7:-${DUNE_AUTO_UPDATE_MAX_WAIT_MINUTES:-360}}"
+  local timer_installed="${8:-${DUNE_AUTO_UPDATE_TIMER_INSTALLED:-0}}"
+  local update_console="${9:-${DUNE_AUTO_UPDATE_CONSOLE_ENABLED:-0}}"
+  local manage_tanks="${10:-${DUNE_AUTO_UPDATE_MANAGE_TANKS:-0}}"
+  local tmp
 
   mkdir -p runtime/generated
-
-  case "$sub" in
-    enable|on)
-      cat > "$AUTO_STATE_FILE" <<EOF
-DUNE_AUTO_UPDATE_ENABLED=1
-DUNE_AUTO_UPDATE_TIME=$time_value
+  tmp="${AUTO_STATE_FILE}.$$"
+  cat > "$tmp" <<EOF
+DUNE_AUTO_UPDATE_ENABLED=$enabled
+DUNE_AUTO_UPDATE_TIME=${DUNE_AUTO_UPDATE_TIME:-$AUTO_DEFAULT_TIME}
+DUNE_AUTO_UPDATE_INTERVAL_MINUTES=$interval_minutes
+DUNE_AUTO_UPDATE_APPLY_ENABLED=$apply_enabled
+DUNE_AUTO_UPDATE_NOTIFY_ENABLED=$notify_enabled
+DUNE_AUTO_UPDATE_NOTIFY_MINUTES=$notify_minutes
+DUNE_AUTO_UPDATE_WAIT_EMPTY=$wait_empty
+DUNE_AUTO_UPDATE_MAX_WAIT_MINUTES=$max_wait_minutes
+DUNE_AUTO_UPDATE_TIMER_INSTALLED=$timer_installed
+DUNE_AUTO_UPDATE_CONSOLE_ENABLED=$update_console
+DUNE_AUTO_UPDATE_MANAGE_TANKS=$manage_tanks
 EOF
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$AUTO_STATE_FILE"
+}
 
-      if [ "$(id -u)" -ne 0 ] && command -v systemctl >/dev/null 2>&1; then
-        echo "Automatic updates need sudo because they install systemd units under /etc/systemd/system."
-        echo "Run: sudo runtime/scripts/dune update auto enable${time_value:+ $time_value}"
-        return 1
-      fi
+ensure_auto_state_writable() {
+  local state_dir
+  state_dir="$(dirname "$AUTO_STATE_FILE")"
 
-      if ! command -v systemctl >/dev/null 2>&1; then
-        echo "Auto-update preference saved, but systemctl was not found."
-        echo "Saved: $AUTO_STATE_FILE"
-        return 0
-      fi
+  if mkdir -p "$state_dir" 2>/dev/null \
+    && [ -w "$state_dir" ] \
+    && { [ ! -e "$AUTO_STATE_FILE" ] || [ -w "$AUTO_STATE_FILE" ]; }; then
+    return 0
+  fi
 
-      cat > "$AUTO_SERVICE_FILE" <<EOF
+  echo "Host runtime state is not writable; repairing host-managed runtime ownership..."
+  if [ -x runtime/scripts/repair-host-runtime-permissions.sh ] \
+    && runtime/scripts/repair-host-runtime-permissions.sh; then
+    if mkdir -p "$state_dir" 2>/dev/null \
+      && [ -w "$state_dir" ] \
+      && { [ ! -e "$AUTO_STATE_FILE" ] || [ -w "$AUTO_STATE_FILE" ]; }; then
+      echo "Host runtime ownership repaired."
+      return 0
+    fi
+  fi
+
+  echo "Auto-update settings cannot be saved because $state_dir is not writable." >&2
+  echo "Run: runtime/scripts/repair-host-runtime-permissions.sh" >&2
+  return 1
+}
+
+read_auto_state() {
+  DUNE_AUTO_UPDATE_ENABLED=0
+  DUNE_AUTO_UPDATE_TIME="$AUTO_DEFAULT_TIME"
+  DUNE_AUTO_UPDATE_INTERVAL_MINUTES="$AUTO_DEFAULT_INTERVAL_MINUTES"
+  DUNE_AUTO_UPDATE_APPLY_ENABLED=1
+  DUNE_AUTO_UPDATE_NOTIFY_ENABLED=1
+  DUNE_AUTO_UPDATE_NOTIFY_MINUTES=15,10,5,1
+  DUNE_AUTO_UPDATE_WAIT_EMPTY=0
+  DUNE_AUTO_UPDATE_MAX_WAIT_MINUTES=360
+  DUNE_AUTO_UPDATE_TIMER_INSTALLED=""
+  DUNE_AUTO_UPDATE_CONSOLE_ENABLED=0
+  DUNE_AUTO_UPDATE_MANAGE_TANKS=0
+  if [ -f "$AUTO_STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$AUTO_STATE_FILE"
+  fi
+}
+
+require_auto_interval_minutes() {
+  local value="$1"
+  if ! printf '%s' "$value" | grep -Eq '^[0-9]+$' || [ "$value" -lt 5 ] || [ "$value" -gt 1440 ]; then
+    echo "Auto-update check interval must be between 5 and 1440 minutes."
+    exit 2
+  fi
+}
+
+require_bool_flag() {
+  local value="$1"
+  local label="$2"
+  if ! printf '%s' "$value" | grep -Eq '^(0|1)$'; then
+    echo "$label must be 0 or 1."
+    exit 2
+  fi
+}
+
+require_auto_notify_minutes() {
+  local value="$1"
+  local compact normalized
+  compact="$(printf '%s' "$value" | tr -d '[:space:]')"
+  normalized="$(normalize_auto_notify_minutes "$value")" || exit 2
+  if [ "$compact" != "$normalized" ]; then
+    echo "Auto-update warning times must be unique and ordered from largest to smallest, for example 15,10,5,1." >&2
+    exit 2
+  fi
+}
+
+normalize_auto_notify_minutes() {
+  local value="$1"
+  local compact mark
+  local -a marks=()
+  compact="$(printf '%s' "$value" | tr -d '[:space:]')"
+  IFS=',' read -r -a marks <<< "$compact"
+  if [ "${#marks[@]}" -lt 1 ] || [ "${#marks[@]}" -gt 12 ]; then
+    echo "Auto-update warning times must contain 1 to 12 values." >&2
+    return 2
+  fi
+  for mark in "${marks[@]}"; do
+    if ! printf '%s' "$mark" | grep -Eq '^[1-9][0-9]*$' || [ "$mark" -gt 1440 ]; then
+      echo "Each auto-update warning time must be between 1 and 1440 minutes." >&2
+      return 2
+    fi
+  done
+  printf '%s\n' "${marks[@]}" | sort -nr -u | paste -sd, -
+}
+
+require_auto_max_wait_minutes() {
+  local value="$1"
+  if ! printf '%s' "$value" | grep -Eq '^[0-9]+$' || [ "$value" -lt 0 ] || [ "$value" -gt 10080 ]; then
+    echo "Auto-update max wait must be between 0 and 10080 minutes."
+    exit 2
+  fi
+}
+
+can_manage_systemd_units() {
+  [ -d /etc/systemd/system ] && [ -w /etc/systemd/system ]
+}
+
+write_auto_units_to() {
+  local interval_minutes="$1"
+  local systemd_dir="$2"
+  local exec_root="$3"
+
+  mkdir -p "$systemd_dir"
+  cat > "$systemd_dir/$AUTO_SERVICE_NAME" <<EOF
 [Unit]
 Description=Dune Awakening self-host auto update
-Wants=podman.socket
-After=network-online.target podman.socket
+Wants=docker.service
+After=network-online.target docker.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=$ROOT_DIR
-ExecStart=$ROOT_DIR/runtime/scripts/dune update --yes
+WorkingDirectory=$exec_root
+ExecStart=$exec_root/runtime/scripts/update.sh auto run
+TimeoutStartSec=infinity
 EOF
 
-      cat > "$AUTO_TIMER_FILE" <<EOF
+  cat > "$systemd_dir/$AUTO_TIMER_NAME" <<EOF
 [Unit]
 Description=Run Dune Awakening self-host auto update
 
 [Timer]
-OnCalendar=*-*-* $time_value
+# Anchor the first check to enabling the timer, not an old host boot.
+OnActiveSec=5min
+# Count the interval after completion so long update jobs cannot exhaust it.
+OnUnitInactiveSec=${interval_minutes}min
+AccuracySec=1min
 Persistent=true
-RandomizedDelaySec=10m
+Unit=$AUTO_SERVICE_NAME
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+docker_helper_image() {
+  printf '%s' "${DUNE_SYSTEMD_HELPER_IMAGE:-redblink-dune-docker-console:dev}"
+}
+
+can_manage_host_systemd_with_docker() {
+  command -v docker >/dev/null 2>&1 || return 1
+  [ -S /var/run/docker.sock ] || return 1
+  docker image inspect "$(docker_helper_image)" >/dev/null 2>&1 || return 1
+}
+
+install_auto_units_via_docker_host() {
+  local interval_minutes="$1"
+  local image
+  image="$(docker_helper_image)"
+
+  can_manage_host_systemd_with_docker || return 1
+  docker run --rm --user 0:0 --privileged --pid=host --network=host \
+    -e DUNE_AUTO_UPDATE_INTERVAL_MINUTES="$interval_minutes" \
+    -e DUNE_HOST_REPO_ROOT="$HOST_ROOT_DIR" \
+    -v /:/host \
+    --entrypoint bash \
+    "$image" -lc '
+      set -euo pipefail
+      systemd_dir=/host/etc/systemd/system
+      mkdir -p "$systemd_dir"
+      cat > "$systemd_dir/dune-awakening-auto-update.service" <<EOF
+[Unit]
+Description=Dune Awakening self-host auto update
+Wants=docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=${DUNE_HOST_REPO_ROOT}
+ExecStart=${DUNE_HOST_REPO_ROOT}/runtime/scripts/update.sh auto run
+TimeoutStartSec=infinity
+EOF
+      cat > "$systemd_dir/dune-awakening-auto-update.timer" <<EOF
+[Unit]
+Description=Run Dune Awakening self-host auto update
+
+[Timer]
+OnActiveSec=5min
+OnUnitInactiveSec=${DUNE_AUTO_UPDATE_INTERVAL_MINUTES}min
+AccuracySec=1min
+Persistent=true
 Unit=dune-awakening-auto-update.service
 
 [Install]
 WantedBy=timers.target
 EOF
+      chroot /host /bin/systemctl daemon-reload
+      chroot /host /bin/systemctl enable --now dune-awakening-auto-update.timer
+      # Re-arm an already-enabled, elapsed timer without stopping its service.
+      chroot /host /bin/systemctl restart dune-awakening-auto-update.timer
+    '
+}
 
+disable_auto_units_via_docker_host() {
+  local image
+  image="$(docker_helper_image)"
+
+  can_manage_host_systemd_with_docker || return 1
+  docker run --rm --user 0:0 --privileged --pid=host --network=host \
+    -v /:/host \
+    --entrypoint bash \
+    "$image" -lc '
+      set -euo pipefail
+      chroot /host /bin/systemctl disable --now dune-awakening-auto-update.timer >/dev/null 2>&1 || true
+      chroot /host /bin/systemctl stop dune-awakening-auto-update.service >/dev/null 2>&1 || true
+      rm -f /host/etc/systemd/system/dune-awakening-auto-update.service /host/etc/systemd/system/dune-awakening-auto-update.timer
+      chroot /host /bin/systemctl daemon-reload
+      chroot /host /bin/systemctl reset-failed dune-awakening-auto-update.service >/dev/null 2>&1 || true
+    '
+}
+
+show_auto_timer_status_via_docker() {
+  local image
+  image="$(docker_helper_image)"
+
+  can_manage_host_systemd_with_docker || return 1
+  docker run --rm --user 0:0 --privileged --pid=host --network=host \
+    -e DUNE_AUTO_UPDATE_ENABLED="${DUNE_AUTO_UPDATE_ENABLED:-0}" \
+    -e DUNE_AUTO_UPDATE_INTERVAL_MINUTES="${DUNE_AUTO_UPDATE_INTERVAL_MINUTES:-$AUTO_DEFAULT_INTERVAL_MINUTES}" \
+    -e DUNE_AUTO_UPDATE_APPLY_ENABLED="${DUNE_AUTO_UPDATE_APPLY_ENABLED:-1}" \
+    -e DUNE_AUTO_UPDATE_NOTIFY_ENABLED="${DUNE_AUTO_UPDATE_NOTIFY_ENABLED:-1}" \
+    -e DUNE_AUTO_UPDATE_NOTIFY_MINUTES="${DUNE_AUTO_UPDATE_NOTIFY_MINUTES:-15,10,5,1}" \
+    -e DUNE_AUTO_UPDATE_WAIT_EMPTY="${DUNE_AUTO_UPDATE_WAIT_EMPTY:-0}" \
+    -e DUNE_AUTO_UPDATE_MAX_WAIT_MINUTES="${DUNE_AUTO_UPDATE_MAX_WAIT_MINUTES:-360}" \
+    -e DUNE_HOST_REPO_ROOT="$HOST_ROOT_DIR" \
+    -v /:/host \
+    --entrypoint bash \
+    "$image" -lc '
+      set -euo pipefail
+      load_state="$(chroot /host /bin/systemctl show dune-awakening-auto-update.timer --property=LoadState --value 2>/dev/null || true)"
+      if [ -n "$load_state" ] && [ "$load_state" != "not-found" ]; then
+        timer_active="$(chroot /host /bin/systemctl is-active dune-awakening-auto-update.timer 2>/dev/null || true)"
+        if [ "$timer_active" = "active" ]; then
+          echo "Systemd timer: active"
+          timer_sub_state="$(chroot /host /bin/systemctl show dune-awakening-auto-update.timer --property=SubState --value 2>/dev/null || true)"
+          service_active="$(chroot /host /bin/systemctl show dune-awakening-auto-update.service --property=ActiveState --value 2>/dev/null || true)"
+          case "$timer_sub_state:$service_active" in
+            elapsed:inactive|elapsed:failed)
+              echo "WARN Auto-update timer has no future check scheduled. Save Auto Game Updates again to repair it."
+              ;;
+          esac
+        else
+          echo "Systemd timer: inactive"
+        fi
+        working_directory="$(chroot /host /bin/systemctl show dune-awakening-auto-update.service --property=WorkingDirectory --value 2>/dev/null || true)"
+        exec_start="$(chroot /host /bin/systemctl show dune-awakening-auto-update.service --property=ExecStart --value 2>/dev/null || true)"
+        if [ "$timer_active" = "active" ] && [ "$DUNE_AUTO_UPDATE_ENABLED" != "1" ]; then
+          echo "WARN Auto-update timer is active while auto updates are disabled in this checkout."
+        fi
+        if [ -z "$working_directory" ] || [ "$working_directory" != "$DUNE_HOST_REPO_ROOT" ]; then
+          echo "WARN Auto-update service uses WorkingDirectory=${working_directory:-unset}; expected $DUNE_HOST_REPO_ROOT."
+        elif [ ! -d "/host$working_directory" ]; then
+          echo "WARN Auto-update service WorkingDirectory does not exist: $working_directory."
+        fi
+        case "$exec_start" in
+          *"$DUNE_HOST_REPO_ROOT/runtime/scripts/update.sh"*"auto run"*) ;;
+          *"$DUNE_HOST_REPO_ROOT/runtime/scripts/dune"*"update --yes"*)
+            echo "WARN Auto-update service uses the legacy update command from the current checkout."
+            echo "     Repair: dune update auto enable $DUNE_AUTO_UPDATE_INTERVAL_MINUTES $DUNE_AUTO_UPDATE_APPLY_ENABLED $DUNE_AUTO_UPDATE_NOTIFY_ENABLED $DUNE_AUTO_UPDATE_NOTIFY_MINUTES $DUNE_AUTO_UPDATE_WAIT_EMPTY $DUNE_AUTO_UPDATE_MAX_WAIT_MINUTES"
+            ;;
+          *"$DUNE_HOST_REPO_ROOT/"*)
+            echo "WARN Auto-update service does not use the current policy runner: $DUNE_HOST_REPO_ROOT/runtime/scripts/update.sh auto run."
+            ;;
+          *) echo "WARN Auto-update service ExecStart points outside the current checkout: $DUNE_HOST_REPO_ROOT." ;;
+        esac
+        chroot /host /bin/systemctl list-timers --all dune-awakening-auto-update.timer --no-pager || true
+      else
+        echo "Systemd timer: not installed"
+      fi
+    '
+}
+
+show_auto_timer_status() {
+  local load_state timer_active timer_sub_state service_active working_directory exec_start
+
+  load_state="$(systemctl show "$AUTO_TIMER_NAME" --property=LoadState --value 2>/dev/null || true)"
+  if [ -z "$load_state" ] || [ "$load_state" = "not-found" ]; then
+    echo "Systemd timer: not installed"
+    return 0
+  fi
+
+  timer_active="$(systemctl is-active "$AUTO_TIMER_NAME" 2>/dev/null || true)"
+  if [ "$timer_active" = "active" ]; then
+    echo "Systemd timer: active"
+    timer_sub_state="$(systemctl show "$AUTO_TIMER_NAME" --property=SubState --value 2>/dev/null || true)"
+    service_active="$(systemctl show "$AUTO_SERVICE_NAME" --property=ActiveState --value 2>/dev/null || true)"
+    case "$timer_sub_state:$service_active" in
+      elapsed:inactive|elapsed:failed)
+        echo "WARN Auto-update timer has no future check scheduled. Save Auto Game Updates again to repair it."
+        ;;
+    esac
+  else
+    echo "Systemd timer: inactive"
+  fi
+
+  working_directory="$(systemctl show "$AUTO_SERVICE_NAME" --property=WorkingDirectory --value 2>/dev/null || true)"
+  exec_start="$(systemctl show "$AUTO_SERVICE_NAME" --property=ExecStart --value 2>/dev/null || true)"
+  if [ "$timer_active" = "active" ] && [ "${DUNE_AUTO_UPDATE_ENABLED:-0}" != "1" ]; then
+    echo "WARN Auto-update timer is active while auto updates are disabled in this checkout."
+  fi
+  if [ -z "$working_directory" ] || [ "$working_directory" != "$HOST_ROOT_DIR" ]; then
+    echo "WARN Auto-update service uses WorkingDirectory=${working_directory:-unset}; expected $HOST_ROOT_DIR."
+  elif [ ! -d "$working_directory" ]; then
+    echo "WARN Auto-update service WorkingDirectory does not exist: $working_directory."
+  fi
+  case "$exec_start" in
+    *"$HOST_ROOT_DIR/runtime/scripts/update.sh"*"auto run"*) ;;
+    *"$HOST_ROOT_DIR/runtime/scripts/dune"*"update --yes"*)
+      echo "WARN Auto-update service uses the legacy update command from the current checkout."
+      echo "     Repair: dune update auto enable ${DUNE_AUTO_UPDATE_INTERVAL_MINUTES:-$AUTO_DEFAULT_INTERVAL_MINUTES} ${DUNE_AUTO_UPDATE_APPLY_ENABLED:-1} ${DUNE_AUTO_UPDATE_NOTIFY_ENABLED:-1} ${DUNE_AUTO_UPDATE_NOTIFY_MINUTES:-15,10,5,1} ${DUNE_AUTO_UPDATE_WAIT_EMPTY:-0} ${DUNE_AUTO_UPDATE_MAX_WAIT_MINUTES:-360}"
+      ;;
+    *"$HOST_ROOT_DIR/"*)
+      echo "WARN Auto-update service does not use the current policy runner: $HOST_ROOT_DIR/runtime/scripts/update.sh auto run."
+      ;;
+    *) echo "WARN Auto-update service ExecStart points outside the current checkout: $HOST_ROOT_DIR." ;;
+  esac
+  systemctl list-timers --all "$AUTO_TIMER_NAME" --no-pager || true
+}
+
+handle_auto_update() {
+  sub="${1:-status}"
+  interval_minutes="${2:-$AUTO_DEFAULT_INTERVAL_MINUTES}"
+  apply_enabled="${3:-1}"
+  notify_enabled="${4:-1}"
+  notify_minutes="${5:-15,10,5,1}"
+  wait_empty="${6:-0}"
+  max_wait_minutes="${7:-360}"
+  update_console="${8:-0}"
+  manage_tanks="${9:-0}"
+
+  case "$sub" in
+    enable|on)
+      if printf '%s' "$interval_minutes" | grep -Eq '^([01][0-9]|2[0-3]):[0-5][0-9]$'; then
+        interval_minutes="$AUTO_DEFAULT_INTERVAL_MINUTES"
+      fi
+      require_auto_interval_minutes "$interval_minutes"
+      require_bool_flag "$apply_enabled" "Apply update"
+      require_bool_flag "$notify_enabled" "Notify players"
+      require_auto_notify_minutes "$notify_minutes"
+      notify_minutes="$(normalize_auto_notify_minutes "$notify_minutes")"
+      require_bool_flag "$wait_empty" "Wait until empty"
+      require_auto_max_wait_minutes "$max_wait_minutes"
+      require_bool_flag "$update_console" "Update Dune Docker Console"
+      require_bool_flag "$manage_tanks" "Manage Regis Tanks"
+      ensure_auto_state_writable
+
+      if ! command -v systemctl >/dev/null 2>&1; then
+        if install_auto_units_via_docker_host "$interval_minutes"; then
+          write_auto_state 1 "$interval_minutes" "$apply_enabled" "$notify_enabled" "$notify_minutes" "$wait_empty" "$max_wait_minutes" 1 "$update_console" "$manage_tanks"
+          echo "Auto updates enabled."
+          echo "Check interval: every $interval_minutes minutes"
+          echo "Timer: $AUTO_TIMER_NAME"
+          return 0
+        else
+          write_auto_state 1 "$interval_minutes" "$apply_enabled" "$notify_enabled" "$notify_minutes" "$wait_empty" "$max_wait_minutes" 0 "$update_console" "$manage_tanks"
+          echo "Auto-update preference saved, but systemctl was not found and the host timer could not be installed through Docker."
+          echo "Saved: $AUTO_STATE_FILE"
+          echo "To install the timer, run this command with sudo/root:"
+          echo "  runtime/scripts/update.sh auto enable $interval_minutes $apply_enabled $notify_enabled $notify_minutes $wait_empty $max_wait_minutes $update_console $manage_tanks"
+          return 1
+        fi
+      fi
+
+      if ! can_manage_systemd_units; then
+        if install_auto_units_via_docker_host "$interval_minutes"; then
+          write_auto_state 1 "$interval_minutes" "$apply_enabled" "$notify_enabled" "$notify_minutes" "$wait_empty" "$max_wait_minutes" 1 "$update_console" "$manage_tanks"
+          echo "Auto updates enabled."
+          echo "Check interval: every $interval_minutes minutes"
+          echo "Timer: $AUTO_TIMER_NAME"
+          return 0
+        else
+          write_auto_state 1 "$interval_minutes" "$apply_enabled" "$notify_enabled" "$notify_minutes" "$wait_empty" "$max_wait_minutes" 0 "$update_console" "$manage_tanks"
+          echo "Auto-update preference saved, but this user cannot install systemd units."
+          echo "Saved: $AUTO_STATE_FILE"
+          echo "To install the timer, run this command with sudo/root:"
+          echo "  runtime/scripts/update.sh auto enable $interval_minutes $apply_enabled $notify_enabled $notify_minutes $wait_empty $max_wait_minutes $update_console $manage_tanks"
+          return 1
+        fi
+      fi
+
+      write_auto_units_to "$interval_minutes" "/etc/systemd/system" "$HOST_ROOT_DIR"
       systemctl daemon-reload
-      systemctl enable --now dune-awakening-auto-update.timer
+      systemctl enable --now "$AUTO_TIMER_NAME"
+      write_auto_state 1 "$interval_minutes" "$apply_enabled" "$notify_enabled" "$notify_minutes" "$wait_empty" "$max_wait_minutes" 1 "$update_console" "$manage_tanks"
+      # enable --now does not re-arm an already-active elapsed timer. Restart
+      # only the timer: a countdown or installation already running is kept.
+      systemctl restart "$AUTO_TIMER_NAME"
 
       echo "Auto updates enabled."
-      echo "Daily time: $time_value"
-      echo "Timer: dune-awakening-auto-update.timer"
+      echo "Check interval: every $interval_minutes minutes"
+      echo "Timer: $AUTO_TIMER_NAME"
       ;;
 
     disable|off)
-      cat > "$AUTO_STATE_FILE" <<EOF
-DUNE_AUTO_UPDATE_ENABLED=0
-DUNE_AUTO_UPDATE_TIME=$time_value
-EOF
-
-      if command -v systemctl >/dev/null 2>&1; then
-        systemctl disable --now dune-awakening-auto-update.timer >/dev/null 2>&1 || true
+      read_auto_state
+      ensure_auto_state_writable
+      if command -v systemctl >/dev/null 2>&1 && can_manage_systemd_units; then
+        systemctl disable --now "$AUTO_TIMER_NAME" >/dev/null 2>&1 || true
+        systemctl stop "$AUTO_SERVICE_NAME" >/dev/null 2>&1 || true
         rm -f "$AUTO_SERVICE_FILE" "$AUTO_TIMER_FILE"
         systemctl daemon-reload
+        systemctl reset-failed "$AUTO_SERVICE_NAME" >/dev/null 2>&1 || true
+        write_auto_state 0 "${DUNE_AUTO_UPDATE_INTERVAL_MINUTES:-$interval_minutes}" "${DUNE_AUTO_UPDATE_APPLY_ENABLED:-1}" "${DUNE_AUTO_UPDATE_NOTIFY_ENABLED:-1}" "${DUNE_AUTO_UPDATE_NOTIFY_MINUTES:-15,10,5,1}" "${DUNE_AUTO_UPDATE_WAIT_EMPTY:-0}" "${DUNE_AUTO_UPDATE_MAX_WAIT_MINUTES:-360}" 0
+      elif can_manage_host_systemd_with_docker; then
+        disable_auto_units_via_docker_host
+        write_auto_state 0 "${DUNE_AUTO_UPDATE_INTERVAL_MINUTES:-$interval_minutes}" "${DUNE_AUTO_UPDATE_APPLY_ENABLED:-1}" "${DUNE_AUTO_UPDATE_NOTIFY_ENABLED:-1}" "${DUNE_AUTO_UPDATE_NOTIFY_MINUTES:-15,10,5,1}" "${DUNE_AUTO_UPDATE_WAIT_EMPTY:-0}" "${DUNE_AUTO_UPDATE_MAX_WAIT_MINUTES:-360}" 0
+      else
+        echo "Auto updates could not be disabled because the host timer cannot be inspected or managed from this environment."
+        return 1
       fi
 
       echo "Auto updates disabled."
       ;;
 
     status)
-      DUNE_AUTO_UPDATE_ENABLED=0
-      DUNE_AUTO_UPDATE_TIME="$AUTO_DEFAULT_TIME"
-
-      if [ -f "$AUTO_STATE_FILE" ]; then
-        # shellcheck disable=SC1090
-        . "$AUTO_STATE_FILE"
-      fi
+      read_auto_state
 
       echo "Auto updates enabled: $DUNE_AUTO_UPDATE_ENABLED"
-      echo "Auto update time:      $DUNE_AUTO_UPDATE_TIME"
+      echo "Check interval minutes: ${DUNE_AUTO_UPDATE_INTERVAL_MINUTES:-$AUTO_DEFAULT_INTERVAL_MINUTES}"
+      echo "Apply updates:        ${DUNE_AUTO_UPDATE_APPLY_ENABLED:-1}"
+      echo "Notify players:       ${DUNE_AUTO_UPDATE_NOTIFY_ENABLED:-1}"
+      echo "Notify minutes:       ${DUNE_AUTO_UPDATE_NOTIFY_MINUTES:-15,10,5,1}"
+      echo "Wait until empty:     ${DUNE_AUTO_UPDATE_WAIT_EMPTY:-0}"
+      echo "Max wait minutes:     ${DUNE_AUTO_UPDATE_MAX_WAIT_MINUTES:-360}"
+      echo "Update Console:       ${DUNE_AUTO_UPDATE_CONSOLE_ENABLED:-0}"
+      echo "Manage Regis Tanks:   ${DUNE_AUTO_UPDATE_MANAGE_TANKS:-0}"
+      if [ -f "$AUTO_TANKS_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$AUTO_TANKS_FILE"
+        echo "Regis Tanks restore:  pending (disabled for game build ${DUNE_AUTO_TANKS_BUILD:-unknown}, waiting for a Dune Docker update after ${DUNE_AUTO_TANKS_BASE_VERSION:-unknown})"
+      fi
+      if [ -f "$AUTO_PENDING_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$AUTO_PENDING_FILE"
+        echo "Pending build:        ${DUNE_AUTO_UPDATE_PENDING_BUILD:-unknown}"
+        echo "Pending since:        ${DUNE_AUTO_UPDATE_PENDING_SINCE:-unknown}"
+      fi
 
       if command -v systemctl >/dev/null 2>&1; then
         echo
-        if systemctl list-unit-files dune-awakening-auto-update.timer --no-legend --no-pager 2>/dev/null | grep -q '^dune-awakening-auto-update.timer'; then
-          timer_enabled="$(systemctl is-enabled dune-awakening-auto-update.timer 2>/dev/null || true)"
-          [ -n "$timer_enabled" ] && echo "Systemd timer: $timer_enabled"
-          systemctl list-timers --all dune-awakening-auto-update.timer --no-pager || true
-        else
-          echo "Systemd timer: not installed"
-        fi
+        show_auto_timer_status
+      else
+        echo
+        show_auto_timer_status_via_docker || {
+          echo "Systemd timer: unable to inspect"
+          if [ "${DUNE_AUTO_UPDATE_TIMER_INSTALLED:-}" = "1" ]; then
+            echo "WARN Saved state says an auto-update timer was installed, but the host unit could not be verified."
+          fi
+        }
       fi
+      ;;
+
+    run)
+      run_auto_update_policy
       ;;
 
     *)
       echo "Unknown auto-update command: $sub"
       echo "Usage:"
-      echo "  dune update auto enable"
-      echo "  dune update auto enable HH:MM:SS"
+      echo "  dune update auto enable [interval-minutes] [apply 0|1] [notify 0|1] [warning-times-csv] [wait-empty 0|1] [max-wait-minutes] [update-console 0|1] [manage-regis-tanks 0|1]"
       echo "  dune update auto disable"
       echo "  dune update auto status"
+      echo "  dune update auto run"
       return 2
       ;;
   esac
 }
 
+online_player_count() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres || {
+    echo 0
+    return 0
+  }
+
+  docker exec dune-postgres psql -U dune -d dune -Atc "
+    select greatest(
+      coalesce((select sum(coalesce(connected_players, 0)) from dune.farm_state where coalesce(alive, false)), 0),
+      coalesce((select count(*) from dune.player_state where coalesce(online_status::text, '') = 'Online'), 0)
+    );
+  " 2>/dev/null | tr -d '[:space:]' || echo 0
+}
+
+write_auto_pending() {
+  local build="$1"
+  local first_seen="$2"
+  local sent_checkpoints="${3:-}"
+  local tmp
+
+  mkdir -p runtime/generated
+  tmp="${AUTO_PENDING_FILE}.$$"
+  cat >"$tmp" <<EOF
+DUNE_AUTO_UPDATE_PENDING_BUILD=$build
+DUNE_AUTO_UPDATE_PENDING_SINCE=$first_seen
+DUNE_AUTO_UPDATE_PENDING_SENT=$sent_checkpoints
+EOF
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$AUTO_PENDING_FILE"
+}
+
+checkpoint_was_sent() {
+  local sent="${1:-}"
+  local checkpoint="$2"
+  case ",$sent," in
+    *",$checkpoint,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Runs a restart-style notification countdown for an available game update.
+# The deadline is anchored to first_seen so an interrupted systemd job resumes
+# the same countdown instead of restarting it. If several checkpoints elapsed
+# while the host was down, only the nearest warning is broadcast; the older
+# missed marks are recorded as sent so players are not spammed on recovery.
+run_auto_update_notification_countdown() {
+  local build="$1"
+  local first_seen="$2"
+  local sent_checkpoints="${3:-}"
+  local checkpoints deadline now remaining checkpoint threshold next_sleep due_checkpoint
+  local -a marks=()
+
+  checkpoints="$(normalize_auto_notify_minutes "${DUNE_AUTO_UPDATE_NOTIFY_MINUTES:-15,10,5,1}")"
+  IFS=',' read -r -a marks <<< "$checkpoints"
+  deadline="$((first_seen + marks[0] * 60))"
+
+  while true; do
+    now="$(date +%s)"
+    remaining="$((deadline - now))"
+    due_checkpoint=""
+
+    for checkpoint in "${marks[@]}"; do
+      if [ "$remaining" -le "$((checkpoint * 60))" ] && ! checkpoint_was_sent "$sent_checkpoints" "$checkpoint"; then
+        due_checkpoint="$checkpoint"
+        sent_checkpoints="${sent_checkpoints:+$sent_checkpoints,}$checkpoint"
+      fi
+    done
+
+    if [ -n "$due_checkpoint" ]; then
+      sent_checkpoints="$(normalize_auto_notify_minutes "$sent_checkpoints")"
+      runtime/scripts/dune admin broadcast-restart-warning "$due_checkpoint" || true
+      write_auto_pending "$build" "$first_seen" "$sent_checkpoints"
+      echo "Automatic game update warning sent at $due_checkpoint minute(s) remaining."
+    fi
+
+    [ "$remaining" -gt 0 ] || break
+    next_sleep="$remaining"
+    for checkpoint in "${marks[@]}"; do
+      checkpoint_was_sent "$sent_checkpoints" "$checkpoint" && continue
+      threshold="$((deadline - checkpoint * 60))"
+      if [ "$threshold" -gt "$now" ] && [ "$((threshold - now))" -lt "$next_sleep" ]; then
+        next_sleep="$((threshold - now))"
+      fi
+    done
+    echo "Waiting $next_sleep second(s) until the next automatic game update warning or restart."
+    sleep "$next_sleep"
+  done
+
+  AUTO_UPDATE_SENT_CHECKPOINTS="$sent_checkpoints"
+}
+
+# --- Regis Tanks and Dune Docker Console steps of the automatic update ---------
+#
+# The Tank patch is verified per game build and shipped with the Dune Docker
+# release, so a game update can only be applied with Tanks off, and Tanks can
+# only come back once the installed Dune Docker release supports the new build.
+# AUTO_TANKS_FILE records that Tanks were switched off by the updater and which
+# Console version was installed at that moment; Tanks are switched on again only
+# after a different (newer) version is installed. The file survives restarts of
+# the updater and of the Console, so each timer run can continue where the last
+# one stopped.
+
+auto_console_version() {
+  [ -f VERSION ] && tr -d '[:space:]' < VERSION || echo unknown
+}
+
+auto_console_version_newer() {
+  local previous="$1" current="$2"
+  [[ "$previous" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ "$current" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [ "$previous" != "$current" ] && [ "$(printf '%s\n%s\n' "$previous" "$current" | sort -V | tail -n1)" = "$current" ]
+}
+
+auto_tanks_json_field() {
+  python3 -c 'import json, sys
+try:
+    value = json.loads(sys.argv[1]).get(sys.argv[2])
+except Exception:
+    sys.exit(3)
+print("" if value is None else str(value).lower() if isinstance(value, bool) else value)' "$1" "$2"
+}
+
+# 0 = enabled, 1 = disabled, 2 = unknown
+auto_tanks_state() {
+  local json
+  json="$(runtime/scripts/experimental-tanks.sh status 2>/dev/null)" || return 2
+  python3 -c 'import json, sys
+try:
+    state = json.loads(sys.argv[1])
+    if (type(state.get("enabled")) is not bool
+        or state.get("applying") is not False
+        or state.get("error") != ""):
+        sys.exit(2)
+    sys.exit(0 if state["enabled"] else 1)
+except (ValueError, AttributeError):
+    sys.exit(2)' "$json"
+}
+
+# Switches Tanks off and only reports success once the settings say so.
+auto_tanks_disable_confirmed() {
+  local rc=0
+  runtime/scripts/experimental-tanks.sh apply false || return 1
+  auto_tanks_state || rc=$?
+  [ "$rc" -eq 1 ]
+}
+
+auto_tanks_write_pending() {
+  local build="$1" base_version="$2" tmp
+  tmp="${AUTO_TANKS_FILE}.$$"
+  mkdir -p "$(dirname "$AUTO_TANKS_FILE")"
+  {
+    echo "DUNE_AUTO_TANKS_BUILD=$build"
+    echo "DUNE_AUTO_TANKS_BASE_VERSION=$base_version"
+    echo "DUNE_AUTO_TANKS_SINCE=$(date +%s)"
+  } > "$tmp"
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$AUTO_TANKS_FILE"
+}
+
+auto_tanks_console_install_pending() {
+  grep -qx 'DUNE_AUTO_TANKS_CONSOLE_INSTALL_PENDING=1' "$AUTO_TANKS_FILE" 2>/dev/null
+}
+
+auto_tanks_set_console_install_pending() {
+  [ -f "$AUTO_TANKS_FILE" ] || return 0
+  local tmp="${AUTO_TANKS_FILE}.$$"
+  sed '/^DUNE_AUTO_TANKS_CONSOLE_INSTALL_PENDING=/d' "$AUTO_TANKS_FILE" > "$tmp"
+  printf 'DUNE_AUTO_TANKS_CONSOLE_INSTALL_PENDING=%s\n' "$1" >> "$tmp"
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$AUTO_TANKS_FILE"
+}
+
+# 0 = Console was updated, 1 = nothing to do, 2 = check or install failed
+auto_console_update_step() {
+  [ "${DUNE_AUTO_UPDATE_CONSOLE_ENABLED:-0}" = "1" ] || return 1
+  local rc
+  set +e
+  runtime/scripts/self-update.sh check
+  rc=$?
+  set -e
+  case "$rc" in
+    100) ;;
+    0)
+      # A failed install can already have replaced VERSION before the Console
+      # rebuild fails. Finish that install rather than treating it as deployed.
+      if ! auto_tanks_console_install_pending; then
+        echo "Dune Docker Console is up to date."
+        return 1
+      fi
+      ;;
+    *) echo "Dune Docker Console update check failed with exit code: $rc"; return 2 ;;
+  esac
+  echo "A Dune Docker Console update from RedBlink is available. Installing it."
+  auto_tanks_set_console_install_pending 1
+  set +e
+  runtime/scripts/self-update.sh install latest
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    echo "Dune Docker Console update failed with exit code: $rc"
+    return 2
+  fi
+  auto_tanks_set_console_install_pending 0
+  return 0
+}
+
+# Continues an update that switched Tanks off. Safe to call on every run.
+# "no-game-update" means the caller just saw that no game update is waiting; if
+# the game build is still the one Tanks were switched off for, nothing changed
+# (the update failed or was undone) and Tanks can simply be switched on again.
+auto_tanks_followup() {
+  local no_game_update="${1:-}"
+  [ -f "$AUTO_TANKS_FILE" ] || return 0
+  [ "${DUNE_AUTO_UPDATE_MANAGE_TANKS:-0}" = "1" ] || return 0
+
+  local DUNE_AUTO_TANKS_BUILD="" DUNE_AUTO_TANKS_BASE_VERSION="" state_rc=0 current_version json
+  # Keep the other sourced fields local even though decisions use the helpers.
+  # shellcheck disable=SC2034
+  local DUNE_AUTO_TANKS_SINCE="" DUNE_AUTO_TANKS_CONSOLE_INSTALL_PENDING=""
+  # shellcheck disable=SC1090
+  . "$AUTO_TANKS_FILE"
+
+  auto_tanks_state || state_rc=$?
+  if [ "$state_rc" -eq 0 ]; then
+    echo "Regis Tanks were enabled again by an operator; nothing left to restore."
+    rm -f "$AUTO_TANKS_FILE"
+    return 0
+  fi
+  [ "$state_rc" -eq 1 ] || {
+    echo "Regis Tanks state could not be read; trying again on the next run."
+    return 0
+  }
+
+  json="$(runtime/scripts/experimental-tanks.sh status 2>/dev/null)" || json=""
+  current_version="$(auto_console_version)"
+  if [ "$no_game_update" = "no-game-update" ] \
+    && [ -n "$DUNE_AUTO_TANKS_BUILD" ] \
+    && [ "$(auto_tanks_json_field "$json" build 2>/dev/null)" = "$DUNE_AUTO_TANKS_BUILD" ]; then
+    echo "The game build did not change since Regis Tanks were switched off; switching them on again."
+    auto_tanks_restore
+    return 0
+  fi
+  if auto_tanks_console_install_pending || ! auto_console_version_newer "$DUNE_AUTO_TANKS_BASE_VERSION" "$current_version"; then
+    local console_rc=0
+    auto_console_update_step || console_rc=$?
+    [ "$console_rc" -ne 2 ] || return 2
+    current_version="$(auto_console_version)"
+  fi
+  if auto_tanks_console_install_pending; then
+    echo "Regis Tanks stay disabled: the Console update has not completed successfully."
+    return 0
+  fi
+  if ! auto_console_version_newer "$DUNE_AUTO_TANKS_BASE_VERSION" "$current_version"; then
+    echo "Regis Tanks stay disabled: no Dune Docker update from RedBlink is installed since the game update."
+    return 0
+  fi
+
+  json="$(runtime/scripts/experimental-tanks.sh status 2>/dev/null)" || json=""
+  if [ "$(auto_tanks_json_field "$json" supported 2>/dev/null)" != "true" ]; then
+    echo "Regis Tanks stay disabled: Dune Docker $current_version has no Tank patch for game build $(auto_tanks_json_field "$json" build 2>/dev/null || echo unknown) yet."
+    # Wait for the next release rather than re-checking the same one.
+    auto_tanks_write_pending "$DUNE_AUTO_TANKS_BUILD" "$current_version"
+    return 0
+  fi
+
+  echo "Dune Docker $current_version supports the new game build. Enabling Regis Tanks again."
+  auto_tanks_restore
+  return 0
+}
+
+auto_tanks_restore() {
+  if runtime/scripts/experimental-tanks.sh apply true && auto_tanks_state; then
+    rm -f "$AUTO_TANKS_FILE"
+    echo "Regis Tanks are enabled again."
+    return 0
+  fi
+  echo "Regis Tanks could not be enabled again; trying on the next run."
+  return 0
+}
+
+run_auto_update_policy() {
+  read_auto_state
+  [ "${DUNE_AUTO_UPDATE_ENABLED:-0}" = "1" ] || {
+    echo "Auto updates are disabled."
+    return 0
+  }
+
+  local check_log check_rc remote_build now first_seen sent_checkpoints players age_seconds max_wait_seconds tanks_rc console_rc=0
+  check_log="$(mktemp)"
+  set +e
+  "${DUNE_AUTO_UPDATE_SELF:-$0}" check >"$check_log" 2>&1
+  check_rc=$?
+  set -e
+  cat "$check_log"
+
+  case "$check_rc" in
+    0)
+      rm -f "$AUTO_PENDING_FILE" "$check_log"
+      echo "No auto-update action needed."
+      # No game update waits: finish a previous update's Tank restore, if any.
+      auto_tanks_followup no-game-update
+      return 0
+      ;;
+    100)
+      ;;
+    *)
+      rm -f "$check_log"
+      echo "Auto update check failed with exit code: $check_rc"
+      return "$check_rc"
+      ;;
+  esac
+
+  if [ "${DUNE_AUTO_UPDATE_APPLY_ENABLED:-1}" != "1" ]; then
+    rm -f "$check_log"
+    echo "Update is available, but automatic apply is disabled."
+    return 0
+  fi
+
+  remote_build="$(awk -F: '/Remote build:/ { gsub(/^[[:space:]]+/, "", $2); print $2; exit }' "$check_log")"
+  remote_build="${remote_build:-unknown}"
+  rm -f "$check_log"
+  # Without Tank management the update cannot run while Tanks are enabled, so
+  # stop before players are warned about a restart that would not happen.
+  if [ -f runtime/generated/experimental-tanks.json ] && [ "${DUNE_AUTO_UPDATE_MANAGE_TANKS:-0}" != "1" ]; then
+    runtime/scripts/experimental-tanks.sh update-guard
+  fi
+
+  now="$(date +%s)"
+  first_seen="$now"
+  sent_checkpoints=""
+  if [ -f "$AUTO_PENDING_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$AUTO_PENDING_FILE"
+    if [ "${DUNE_AUTO_UPDATE_PENDING_BUILD:-}" = "$remote_build" ]; then
+      first_seen="${DUNE_AUTO_UPDATE_PENDING_SINCE:-$now}"
+      sent_checkpoints="${DUNE_AUTO_UPDATE_PENDING_SENT:-}"
+      # A pending file written by an older release only records whether its
+      # one warning fired. Treat every configured checkpoint as handled so an
+      # upgrade never replays a fresh countdown for an already-pending update.
+      if [ -z "$sent_checkpoints" ] && [ "${DUNE_AUTO_UPDATE_PENDING_NOTIFIED:-0}" = "1" ]; then
+        sent_checkpoints="$(normalize_auto_notify_minutes "${DUNE_AUTO_UPDATE_NOTIFY_MINUTES:-15,10,5,1}")"
+      fi
+    fi
+  fi
+
+  write_auto_pending "$remote_build" "$first_seen" "$sent_checkpoints"
+  if [ "${DUNE_AUTO_UPDATE_NOTIFY_ENABLED:-1}" = "1" ]; then
+    run_auto_update_notification_countdown "$remote_build" "$first_seen" "$sent_checkpoints"
+    sent_checkpoints="${AUTO_UPDATE_SENT_CHECKPOINTS:-$sent_checkpoints}"
+  fi
+
+  if [ "${DUNE_AUTO_UPDATE_WAIT_EMPTY:-0}" = "1" ]; then
+    players="$(online_player_count)"
+    players="${players:-0}"
+    max_wait_seconds="$((${DUNE_AUTO_UPDATE_MAX_WAIT_MINUTES:-360} * 60))"
+    now="$(date +%s)"
+    age_seconds="$((now - first_seen))"
+    if [ "$players" -gt 0 ] 2>/dev/null && { [ "$max_wait_seconds" -eq 0 ] || [ "$age_seconds" -lt "$max_wait_seconds" ]; }; then
+      echo "Update is pending, but $players player(s) are online. Waiting for the server to empty."
+      return 0
+    fi
+    if [ "$players" -gt 0 ] 2>/dev/null; then
+      echo "Max wait reached with $players player(s) online; applying update now."
+    else
+      echo "Server is empty; applying pending update."
+    fi
+  fi
+
+  if [ -f runtime/generated/experimental-tanks.json ]; then
+    if [ "${DUNE_AUTO_UPDATE_MANAGE_TANKS:-0}" = "1" ]; then
+      tanks_rc=0
+      auto_tanks_state || tanks_rc=$?
+      if [ "$tanks_rc" -eq 0 ]; then
+        echo "Regis Tanks are enabled. Disabling them before the game update."
+        auto_tanks_write_pending "$(auto_tanks_json_field "$(runtime/scripts/experimental-tanks.sh status 2>/dev/null)" build 2>/dev/null || echo unknown)" "$(auto_console_version)"
+        if ! auto_tanks_disable_confirmed; then
+          if auto_tanks_state; then rm -f "$AUTO_TANKS_FILE"; fi
+          echo "Regis Tanks could not be disabled. The game update was not started."
+          return 1
+        fi
+        echo "Regis Tanks are disabled."
+      elif [ "$tanks_rc" -ne 1 ]; then
+        echo "Regis Tanks state could not be read. The game update was not started."
+        return 1
+      fi
+    fi
+  fi
+
+  "${DUNE_AUTO_UPDATE_SELF:-$0}" --yes
+  rm -f "$AUTO_PENDING_FILE"
+
+  auto_console_update_step || console_rc=$?
+  [ "$console_rc" -ne 2 ] || return 2
+  auto_tanks_followup
+}
+
 if [ "$cmd" = "auto" ]; then
-  handle_auto_update "${2:-status}" "${3:-$AUTO_DEFAULT_TIME}"
+  handle_auto_update "${2:-status}" "${3:-$AUTO_DEFAULT_INTERVAL_MINUTES}" "${4:-1}" "${5:-1}" "${6:-15,10,5,1}" "${7:-0}" "${8:-360}" "${9:-0}" "${10:-0}"
   exit $?
 fi
+
+if [ "$cmd" = "fix-steamcmd" ]; then
+  docker compose exec -T -e APP_ID="$APP_ID" orchestrator bash -lc '
+set -euo pipefail
+APP_ID="${APP_ID:-4754530}"
+MANIFEST="/srv/dune/server/steamapps/appmanifest_${APP_ID}.acf"
+if [ -f "$MANIFEST" ]; then
+  rm -f "$MANIFEST"
+  echo "SteamCMD app manifest removed. It will be regenerated on the next game update."
+else
+  echo "SteamCMD app manifest was already absent. The next game update will generate it."
+fi
+'
+  exit $?
+fi
+
+if [ "$cmd" = "fix-install-dir" ]; then
+  docker compose exec -T -u root orchestrator sh -lc '
+set -eu
+mkdir -p /srv/dune/server /srv/dune/steam /srv/dune/cache /srv/dune/generated /home/dune/.steam
+chown -R dune:dune /srv/dune /home/dune
+runuser -u dune -- sh -lc "
+  touch /srv/dune/server/.dune-write-test &&
+  rm -f /srv/dune/server/.dune-write-test &&
+  touch /srv/dune/steam/.dune-write-test &&
+  rm -f /srv/dune/steam/.dune-write-test
+"
+df -h /srv/dune/server /srv/dune/steam /srv/dune/cache
+echo "Dune install directories are writable."
+'
+  exit $?
+fi
+
+fix_steamcmd_manifest() {
+  docker compose exec -T -e APP_ID="$APP_ID" orchestrator bash -lc '
+set -euo pipefail
+APP_ID="${APP_ID:-4754530}"
+MANIFEST="/srv/dune/server/steamapps/appmanifest_${APP_ID}.acf"
+if [ -f "$MANIFEST" ]; then
+  rm -f "$MANIFEST"
+  echo "SteamCMD app manifest removed. It will be regenerated on the next game update attempt."
+else
+  echo "SteamCMD app manifest was already absent. The next game update attempt will generate it."
+fi
+'
+}
 
 if [ "$cmd" = "check" ] || [ "$cmd" = "status" ]; then
   echo
   echo "=== Check Steam for available update ==="
 
-  engine exec -e APP_ID="$APP_ID" dune-orchestrator bash -lc '
+  steam_check_attempt=1
+  # A status check must stay responsive. Actual installs retain the more
+  # patient content-host retry policy below, but making an operator wait five
+  # minutes just to learn that Steam is unreachable is counterproductive.
+  steam_check_max_attempts="$(positive_integer_or_default "${DUNE_STEAMCMD_CHECK_MAX_ATTEMPTS:-2}" 2)"
+  steam_check_retry_sleep="$(positive_integer_or_default "${DUNE_STEAMCMD_CHECK_RETRY_SLEEP:-5}" 5)"
+  steam_check_timeout="$(positive_integer_or_default "${DUNE_STEAMCMD_CHECK_TIMEOUT_SECONDS:-45}" 45)"
+
+  while [ "$steam_check_attempt" -le "$steam_check_max_attempts" ]; do
+    steam_check_log="$(mktemp)"
+    steam_check_content_lines="$(steamcmd_content_log_line_count)"
+    set +e
+    docker compose exec -T -e APP_ID="$APP_ID" -e STEAM_CHECK_TIMEOUT_SECONDS="$steam_check_timeout" orchestrator bash -lc '
 set -euo pipefail
 
 STEAMCMD_SH=/srv/dune/steam/steamcmd.sh
 STEAMCMD_BIN=/srv/dune/steam/linux32/steamcmd
 INSTALL_DIR=/srv/dune/server
 APP_ID="${APP_ID:-4754530}"
+STEAM_CHECK_TIMEOUT_SECONDS="${STEAM_CHECK_TIMEOUT_SECONDS:-45}"
 APPINFO="/tmp/dune-appinfo-${APP_ID}.txt"
 MANIFEST="${INSTALL_DIR}/steamapps/appmanifest_${APP_ID}.acf"
 
@@ -166,12 +1158,15 @@ fi
 echo "Steam app id: $APP_ID"
 echo "Install dir:  $INSTALL_DIR"
 
-"$STEAMCMD" \
+set +e
+timeout --signal=TERM --kill-after=5s "${STEAM_CHECK_TIMEOUT_SECONDS}s" "$STEAMCMD" \
   +@sSteamCmdForcePlatformType linux \
   +login anonymous \
   +app_info_update 1 \
   +app_info_print "$APP_ID" \
   +quit > "$APPINFO" 2>&1
+steamcmd_rc=$?
+set -e
 
 remote_build="$(
   awk '\''
@@ -197,11 +1192,26 @@ if [ -z "$remote_build" ]; then
   )"
 fi
 
+if [ "$steamcmd_rc" -ne 0 ]; then
+  if { [ "$steamcmd_rc" -eq 124 ] || [ "$steamcmd_rc" -eq 137 ]; } && [ -n "$remote_build" ]; then
+    echo "SteamCMD returned complete build metadata before its shutdown timed out; continuing with that result."
+  elif [ "$steamcmd_rc" -eq 124 ] || [ "$steamcmd_rc" -eq 137 ]; then
+    echo "SteamCMD metadata check timed out after ${STEAM_CHECK_TIMEOUT_SECONDS}s."
+    echo "SteamCMD could not retrieve the current app information."
+    tail -n 80 "$APPINFO" || true
+    exit 75
+  else
+    echo "SteamCMD could not retrieve the current app information."
+    tail -n 80 "$APPINFO" || true
+    exit 75
+  fi
+fi
+
 if [ -z "$remote_build" ]; then
   echo "Could not parse remote build id from SteamCMD output."
   echo "Last SteamCMD output:"
   tail -n 80 "$APPINFO" || true
-  exit 2
+  exit 75
 fi
 
 local_build="none"
@@ -228,12 +1238,65 @@ fi
 
 echo "Update available."
 exit 100
-'
+' 2>&1 | tee "$steam_check_log"
+    steam_check_rc=${PIPESTATUS[0]}
+    set -e
 
-  exit $?
+    if [ "$steam_check_rc" -eq 0 ] || [ "$steam_check_rc" -eq 100 ]; then
+      rm -f "$steam_check_log"
+      exit "$steam_check_rc"
+    fi
+
+    append_new_steamcmd_content_log "$steam_check_content_lines" "$steam_check_log"
+
+    # EX_TEMPFAIL is private to the metadata subprocess: empty responses,
+    # Steam failures and timeouts can all recover on the next attempt. Keep
+    # setup/container failures fatal and preserve public check exit codes.
+    if [ "$steam_check_rc" -ne 75 ] && ! steamcmd_log_has_content_host_failure "$steam_check_log"; then
+      rm -f "$steam_check_log"
+      exit "$steam_check_rc"
+    fi
+
+    steam_check_dns_host="$(steamcmd_dns_host_from_log "$steam_check_log")"
+    steam_check_source_priority="$(steamcmd_source_priority_from_log "$steam_check_log")"
+    steam_check_interface_count="$(steamcmd_download_interface_count "$steam_check_log")"
+    steam_check_was_dns=0
+    steamcmd_log_has_dns_failure "$steam_check_log" && steam_check_was_dns=1
+    rm -f "$steam_check_log"
+    echo
+    if [ "$steam_check_rc" -eq 75 ]; then
+      echo "Steam did not return usable app information."
+    elif [ "$steam_check_was_dns" = "1" ] && [ -n "$steam_check_dns_host" ]; then
+      echo "Steam selected a content host that DNS cannot currently resolve: $steam_check_dns_host"
+    elif [ "$steam_check_was_dns" = "1" ]; then
+      echo "Steam selected a content host that DNS cannot currently resolve."
+    elif [ -n "$steam_check_dns_host" ]; then
+      echo "Steam could not download from its selected content host: $steam_check_dns_host"
+    else
+      echo "Steam could not download from its selected content host."
+    fi
+    [ -z "$steam_check_source_priority" ] || echo "Steam source priority class: $steam_check_source_priority"
+    [ "$steam_check_interface_count" -eq 0 ] || echo "Steam download interfaces created: $steam_check_interface_count"
+
+    if [ "$steam_check_attempt" -ge "$steam_check_max_attempts" ]; then
+      echo "Steam update check failed after $steam_check_max_attempts attempts. No local game files were changed."
+      echo "Retry later; Steam may select a different content host on the next request."
+      exit 2
+    fi
+
+    steam_check_delay=$((steam_check_retry_sleep * steam_check_attempt))
+    [ "$steam_check_delay" -le 120 ] || steam_check_delay=120
+    echo "Retrying the Steam update check in ${steam_check_delay}s..."
+    sleep "$steam_check_delay"
+    steam_check_attempt=$((steam_check_attempt + 1))
+  done
+
+  exit 2
 fi
 
 skip_preflight=0
+assets_only=0
+assets_force=0
 
 if [ "$cmd" = "--yes" ] || [ "$cmd" = "-y" ]; then
   assume_yes=1
@@ -242,6 +1305,21 @@ elif [ "$cmd" = "install" ] || [ "$cmd" = "bootstrap" ]; then
   assume_yes=1
   skip_preflight=1
   cmd="install"
+elif [ "$cmd" = "install-assets" ]; then
+  # Game files and images only: everything from the SteamCMD download through
+  # detect-image-tags, and nothing that touches the database. This is what a
+  # host needs before a system restore, which brings its own database and must
+  # not have one migrated or reseeded underneath it first.
+  #
+  # cmd="install" deliberately: it reuses the existing `$cmd != install` guard
+  # that skips the pre-update database backup, so assets-only does not run
+  # db.sh either. assets_only then subtracts the remaining database phases.
+  assume_yes=1
+  skip_preflight=1
+  assets_only=1
+  cmd="install"
+  [ "${2:-}" != "--force" ] || assets_force=1
+  [ "${DUNE_ASSETS_ALLOW_RUNNING:-0}" != "1" ] || assets_force=1
 else
   assume_yes=0
 fi
@@ -253,10 +1331,33 @@ if [ "$cmd" != "run" ] && [ "$cmd" != "apply" ] && [ "$cmd" != "install" ]; then
   echo "  dune update check"
   echo "  dune update --yes"
   echo "  dune update install"
+  echo "  dune update install-assets [--force]"
+  echo "  dune update fix-steamcmd"
+  echo "  dune update fix-install-dir"
   echo "  dune update auto enable"
   echo "  dune update auto disable"
   echo "  dune update auto status"
   exit 2
+fi
+
+# Own the same lifecycle lock as startup, shutdown and automatic recovery for
+if [ -f runtime/generated/experimental-tanks.json ]; then
+  runtime/scripts/experimental-tanks.sh update-guard
+fi
+
+# Own the same lifecycle lock as startup, shutdown and automatic recovery for
+# the entire update, including its final startup. Stopping the Autoscaler alone
+# does not stop recovery already running in the Coriolis Coordinator.
+if [ "${DUNE_BATTLEGROUP_LIFECYCLE_LOCK_HELD:-0}" != "1" ]; then
+  lifecycle_lock="${DUNE_BATTLEGROUP_LIFECYCLE_LOCK_FILE:-runtime/generated/battlegroup-lifecycle.lock}"
+  mkdir -p "$(dirname "$lifecycle_lock")"
+  if flock -n -E 75 -o "$lifecycle_lock" env DUNE_BATTLEGROUP_LIFECYCLE_LOCK_HELD=1 "$0" "$@"; then
+    exit 0
+  else
+    rc=$?
+    [ "$rc" -ne 75 ] || echo "Another Battlegroup operation is running. Wait for it to finish, then retry the game update. No update files were changed." >&2
+    exit "$rc"
+  fi
 fi
 
 if [ "$skip_preflight" = "1" ]; then
@@ -302,54 +1403,189 @@ if [ "$assume_yes" != "1" ]; then
   esac
 fi
 
+postgres_was_running=0
+update_started_postgres=0
+stack_was_stopped=0
+
+if container_running dune-postgres; then
+  postgres_was_running=1
+fi
+
+if [ -f "$MANUAL_STOP_FILE" ] || ! dune_stack_has_running_services; then
+  stack_was_stopped=1
+fi
+
+if [ "$assets_only" = "1" ] && [ "$assets_force" != "1" ] && world_game_servers_running; then
+  echo
+  echo "Game servers are running."
+  echo "install-assets downloads new game files and loads new image tags without stopping"
+  echo "them, which leaves the autoscaler spawning from a tag the running world does not"
+  echo "match. It skips the stop/pause steps precisely because it must not touch the"
+  echo "database, so it cannot stop them for you."
+  echo
+  echo "Use the full update instead:  dune update --yes"
+  echo "Or override deliberately:     dune update install-assets --force"
+  exit 3
+fi
+
 echo
-echo "=== Check Podman volume free space ==="
-engine exec \
+if [ "$assets_only" = "1" ]; then
+  ensure_orchestrator || exit 1
+fi
+
+echo "=== Check Docker volume free space ==="
+docker compose exec -T \
   -e DUNE_MIN_FREE_GB="${DUNE_MIN_FREE_GB:-25}" \
   -e DUNE_SKIP_DISK_CHECK="${DUNE_SKIP_DISK_CHECK:-}" \
-  dune-orchestrator dune preflight
+  orchestrator dune preflight
+
+if [ "$cmd" != "install" ]; then
+  if [ "$postgres_was_running" != "1" ]; then
+    echo
+    echo "=== Start Postgres for update backup ==="
+    runtime/scripts/start-postgres.sh
+    update_started_postgres=1
+  fi
+
+  echo
+  echo "=== Create pre-update database backup ==="
+  DB_BACKUP_ORIGIN=pre-update runtime/scripts/db.sh backup
+fi
+
+# Skipped for assets-only. recycle-world-game-servers.sh stop-all is a database
+# write -- it runs `update dune.world_partition set server_id = null` and
+# `delete from dune.farm_state` for each container it removes, guarded only by
+# "is dune-postgres running", which it is on a host part-way through a restore.
+# The autoscaler pause writes no SQL, but it is a stack mutation nobody asked
+# for, and the guard above means there is nothing to pause anyway.
+if [ "$assets_only" != "1" ]; then
+  echo
+  echo "=== Pause autoscaler before update ==="
+  runtime/scripts/autoscaler-control.sh stop || true
+
+  echo
+  echo "=== Stop game servers before update ==="
+  runtime/scripts/recycle-world-game-servers.sh stop-all
+fi
 
 echo
-echo "=== Stop game servers before update ==="
-runtime/scripts/recycle-world-game-servers.sh stop-all
-
-echo
+# Phase markers, same convention as DUNE_GAME_ASSETS_LOAD/_SIZE: the console
+# shows the install as one step, and without these the SteamCMD phase reports
+# nothing for as long as it runs -- which reads as a hang.
+echo "DUNE_GAME_ASSETS_PHASE=Downloading game files"
 echo "=== Download/update server files with SteamCMD ==="
 
 steam_attempt=1
-steam_max_attempts="${DUNE_STEAMCMD_MAX_ATTEMPTS:-3}"
-steam_retry_sleep="${DUNE_STEAMCMD_RETRY_SLEEP:-20}"
+steam_max_attempts="$(positive_integer_or_default "${DUNE_STEAMCMD_MAX_ATTEMPTS:-3}" 3)"
+steam_content_max_attempts="$(positive_integer_or_default "${DUNE_STEAMCMD_CONTENT_MAX_ATTEMPTS:-6}" 6)"
+steam_attempt_limit="$steam_max_attempts"
+steam_retry_sleep="$(positive_integer_or_default "${DUNE_STEAMCMD_RETRY_SLEEP:-20}" 20)"
 steam_ok=0
+steam_manifest_fix_applied=0
+steam_manifest_hint=0
+steam_install_dir_hint=0
+steam_dns_hint=0
+steam_content_host_hint=0
+steam_dns_host=""
 
-while [ "$steam_attempt" -le "$steam_max_attempts" ]; do
+while [ "$steam_attempt" -le "$steam_attempt_limit" ]; do
   echo
-  echo "SteamCMD install attempt $steam_attempt/$steam_max_attempts..."
+  echo "SteamCMD install attempt $steam_attempt/$steam_attempt_limit..."
 
+  steam_log="$(mktemp)"
+  steam_attempt_dns=0
+  steam_attempt_content_host=0
+  steam_content_lines="$(steamcmd_content_log_line_count)"
+  steam_started="$(date +%s)"
   set +e
-  engine exec -e APP_ID="$APP_ID" dune-orchestrator dune download
+  docker compose exec -T -e APP_ID="$APP_ID" orchestrator dune download 2>&1 | tee "$steam_log"
   steam_rc=$?
   set -e
+  echo "SteamCMD attempt $steam_attempt finished in $(( $(date +%s) - steam_started ))s (exit $steam_rc)."
 
   if [ "$steam_rc" -eq 0 ]; then
     steam_ok=1
+    # Kept on success too, not just on failure. SteamCMD writes its logs under
+    # $HOME inside the orchestrator, which is not a volume, so a container
+    # recreate destroys them -- and the orchestrator is recreated routinely.
+    # Without this, a slow or stalled download cannot be diagnosed afterwards:
+    # its timestamps are the only record of when the work actually finished.
+    : > runtime/generated/steamcmd-last-download.log 2>/dev/null || true
+    append_new_steamcmd_content_log "$steam_content_lines" runtime/generated/steamcmd-last-download.log
+    rm -f "$steam_log"
     break
   fi
 
+  append_new_steamcmd_content_log "$steam_content_lines" "$steam_log"
+
   echo
-  if [ "$steam_attempt" -eq 1 ]; then
-    echo "SteamCMD first-run bootstrap did not complete the app install on this attempt."
-    echo "This can happen while SteamCMD updates and restarts itself."
-  else
-    echo "SteamCMD failed with exit code $steam_rc."
+  if steamcmd_log_has_install_storage_failure "$steam_log"; then
+    steam_install_dir_hint=1
   fi
 
-  if [ "$steam_attempt" -lt "$steam_max_attempts" ]; then
+  if steamcmd_log_has_manifest_access_denied "$steam_log"; then
+    steam_manifest_hint=1
+  fi
+
+  if steamcmd_log_has_dns_failure "$steam_log"; then
+    steam_attempt_dns=1
+    steam_dns_hint=1
+  fi
+  if steamcmd_log_has_content_host_failure "$steam_log"; then
+    steam_attempt_content_host=1
+    steam_content_host_hint=1
+    detected_dns_host="$(steamcmd_dns_host_from_log "$steam_log")"
+    [ -z "$detected_dns_host" ] || steam_dns_host="$detected_dns_host"
+    if [ "$steam_attempt_limit" -lt "$steam_content_max_attempts" ]; then
+      steam_attempt_limit="$steam_content_max_attempts"
+    fi
+    steam_source_priority="$(steamcmd_source_priority_from_log "$steam_log")"
+    steam_interface_count="$(steamcmd_download_interface_count "$steam_log")"
+    if [ "$steam_attempt_dns" = "1" ] && [ -n "$steam_dns_host" ]; then
+      echo "Steam selected a content host that DNS cannot currently resolve: $steam_dns_host"
+    elif [ "$steam_attempt_dns" = "1" ]; then
+      echo "Steam selected a content host that DNS cannot currently resolve."
+    elif [ -n "$steam_dns_host" ]; then
+      echo "Steam could not download from its selected content host: $steam_dns_host"
+    else
+      echo "Steam could not download from its selected content host."
+    fi
+    [ -z "$steam_source_priority" ] || echo "Steam source priority class: $steam_source_priority"
+    [ "$steam_interface_count" -eq 0 ] || echo "Steam download interfaces created: $steam_interface_count"
+    echo "This is a Steam content-host failure, not an install-directory failure."
+  fi
+
+  if [ "$steam_manifest_fix_applied" = "0" ] \
+    && steamcmd_log_needs_manifest_repair "$steam_log"; then
+    steam_manifest_hint=1
+    echo "Steam rejected the local app/depot manifest metadata."
+    echo "Applying the automatic SteamCMD fix now, then retrying the update."
+    fix_steamcmd_manifest
+    steam_manifest_fix_applied=1
+  elif [ "$steam_attempt_content_host" = "1" ]; then
+    :
+  else
     if [ "$steam_attempt" -eq 1 ]; then
+      echo "SteamCMD first-run bootstrap did not complete the app install on this attempt."
+      echo "This can happen while SteamCMD updates and restarts itself."
+    else
+      echo "SteamCMD failed with exit code $steam_rc."
+    fi
+  fi
+  rm -f "$steam_log"
+
+  if [ "$steam_attempt" -lt "$steam_attempt_limit" ]; then
+    steam_delay="$steam_retry_sleep"
+    if [ "$steam_attempt_content_host" = "1" ]; then
+      steam_delay=$((steam_retry_sleep * steam_attempt))
+      [ "$steam_delay" -le 120 ] || steam_delay=120
+    fi
+    if [ "$steam_attempt" -eq 1 ] && [ "$steam_attempt_content_host" != "1" ]; then
       echo "Retrying app install in ${steam_retry_sleep}s..."
     else
-      echo "Retrying in ${steam_retry_sleep}s..."
+      echo "Retrying in ${steam_delay}s..."
     fi
-    sleep "$steam_retry_sleep"
+    sleep "$steam_delay"
   fi
 
   steam_attempt=$((steam_attempt + 1))
@@ -357,16 +1593,51 @@ done
 
 if [ "$steam_ok" != "1" ]; then
   echo
-  echo "SteamCMD failed after $steam_max_attempts attempts."
-  echo
-  echo "Most common fresh-install causes:"
-  echo "  - Podman storage has too little free disk space."
-  echo "  - Steam temporarily rejected the anonymous depot request."
-  echo "  - SteamCMD cache/metadata is stale after a Steam-side app change."
+  echo "SteamCMD failed after $steam_attempt_limit attempts."
+  if [ "$steam_manifest_hint" = "1" ]; then
+    echo
+    if [ "$steam_manifest_fix_applied" = "1" ]; then
+      echo "Steam rejected stale app/depot manifest metadata, and the updater applied the safe manifest repair automatically."
+      echo "Steam still did not complete the install after regenerating its metadata."
+    else
+      echo "Steam rejected the local app/depot manifest metadata."
+      echo "Repair it safely with: runtime/scripts/dune update fix-steamcmd"
+    fi
+  fi
+  if [ "$steam_content_host_hint" = "1" ]; then
+    echo
+    if [ "$steam_dns_hint" = "1" ] && [ -n "$steam_dns_host" ]; then
+      echo "Steam repeatedly selected an unresolved content host: $steam_dns_host"
+    elif [ -n "$steam_dns_host" ]; then
+      echo "Steam repeatedly failed to download from this content host: $steam_dns_host"
+    else
+      echo "Steam repeatedly failed to download from its assigned content hosts."
+    fi
+    if [ "$steam_manifest_fix_applied" != "1" ]; then
+      echo "The updater did not delete the app manifest or modify database/player data for this content-host failure."
+    fi
+    echo "Retry later; Steam may select a different content host on the next update request."
+  fi
+  if [ "$steam_install_dir_hint" = "1" ]; then
+    echo
+    echo "The SteamCMD output points to an install directory, permission, or disk-space problem."
+    echo "The Dune server files are installed inside the orchestrator at:"
+    echo "  /srv/dune/server"
+    echo
+    echo "Recommended repair:"
+    echo "  docker exec -u root dune-orchestrator sh -lc 'chown -R dune:dune /srv/dune /home/dune'"
+    echo "  docker exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache"
+  fi
+  if [ "$steam_manifest_hint" != "1" ] \
+    && [ "$steam_content_host_hint" != "1" ] \
+    && [ "$steam_install_dir_hint" != "1" ]; then
+    echo
+    echo "SteamCMD did not provide a recognized failure reason."
+  fi
   echo
   echo "Useful checks:"
-  echo "  podman exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache"
-  echo "  podman exec dune-orchestrator tail -n 80 /home/dune/Steam/logs/stderr.txt"
+  echo "  docker exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache"
+  echo "  docker exec dune-orchestrator tail -n 80 /home/dune/Steam/logs/stderr.txt"
   echo
   echo "You can retry safely with:"
   echo "  runtime/scripts/update.sh install"
@@ -374,22 +1645,61 @@ if [ "$steam_ok" != "1" ]; then
 fi
 
 echo
+echo "DUNE_GAME_ASSETS_PHASE=Loading images"
 echo "=== Load updated Funcom image tarballs ==="
-engine exec dune-orchestrator bash -lc '
+# `docker load` redraws its progress with carriage returns, which strips to
+# nothing, and this is the longest phase of an install. Count the tarballs so
+# the console has something to show.
+docker compose exec -T orchestrator bash -lc '
 set -euo pipefail
-find /srv/dune/server/images -type f \( -name "*.tar" -o -name "*.tar.gz" -o -name "*.tgz" \) | sort | while read -r tar; do
-  echo ">>> podman load -i $tar"
-  podman load -i "$tar"
+# A variable purely so tests/update-install-assets-test.sh can run this loop for
+# real; the orchestrator never sets it.
+images_dir="${DUNE_ASSET_IMAGES_DIR:-/srv/dune/server/images}"
+mapfile -t tarballs < <(find "$images_dir" -type f \( -name "*.tar" -o -name "*.tar.gz" -o -name "*.tgz" \) | sort)
+[ "${#tarballs[@]}" -gt 0 ] || { echo "No downloaded game image archives found; update cannot continue." >&2; exit 1; }
+loaded=0
+for tar in "${tarballs[@]}"; do
+  loaded=$((loaded + 1))
+  echo "DUNE_GAME_ASSETS_LOAD=${loaded}/${#tarballs[@]} $(basename "$tar")"
+  echo ">>> docker load -i $tar"
+  docker load -i "$tar"
 done
 '
 
+# The images live only inside the orchestrator and SteamCMD's content log carries
+# no totals, so this is the one place that can measure them. A marker rather than
+# prose, matching DUNE_GAME_ASSETS_MISSING, so the console is not parsing English.
+asset_size="$(docker compose exec -T orchestrator sh -lc 'du -sh /srv/dune/server/images 2>/dev/null | cut -f1' 2>/dev/null | tr -d '[:space:]' || true)"
+if [ -n "$asset_size" ]; then
+  echo "DUNE_GAME_ASSETS_SIZE=${asset_size}"
+fi
+
 echo
+echo "DUNE_GAME_ASSETS_PHASE=Detecting image tags"
 echo "=== Detect loaded image tags ==="
-runtime/scripts/detect-image-tags.sh
+runtime/scripts/detect-image-tags.sh --from-bundle
 
 echo
 echo "=== Current tags ==="
 cat runtime/generated/image-tags.env
+
+# Assets-only stops here, by leaving rather than by a condition wrapped around
+# everything below. Every database phase -- the Postgres start, update-db.sh,
+# spice-field overrides, and the world-partition wipe and reseed -- is then
+# unreachable as a fact of control flow, not as a predicate a later edit can
+# get subtly wrong.
+if [ "$assets_only" = "1" ]; then
+  finish_asset_phase
+  # The installed build may have changed, and this exit is taken before the
+  # cache clear at the end of the script -- so without it a CLI install-assets
+  # would leave the Web Console showing the pre-install check result for the
+  # life of the durable cache. The console's own task path invalidates it too.
+  rm -f "$UPDATE_CHECK_CACHE_FILE"
+  echo
+  echo "Game files and images are installed. No database work was performed."
+  echo "Restore a system backup now, or run 'dune init' to set this host up fresh."
+  exit 0
+fi
 
 echo
 if [ "$cmd" = "install" ]; then
@@ -400,6 +1710,10 @@ fi
 
 echo "=== Run database update/migration ==="
 runtime/scripts/update-db.sh
+
+echo
+echo "=== Reapply persisted Spice Field overrides ==="
+runtime/scripts/spicefield-overrides.sh apply
 
 if [ "$cmd" = "install" ]; then
   echo
@@ -421,15 +1735,15 @@ if [ "$cmd" = "install" ]; then
   fi
 
   echo "Applying $partition_count world partitions..."
-  engine exec -i dune-postgres psql -U dune -d dune < "$partition_sql"
+  docker exec -i dune-postgres psql -U dune -d dune < "$partition_sql"
 
   echo
   echo "=== Verify world partitions ==="
-  engine exec dune-postgres psql -U dune -d dune -c "
+  docker exec dune-postgres psql -U dune -d dune -c "
 select count(*) as world_partition_rows from world_partition;
 "
 
-  actual_count="$(engine exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" | tr -d '[:space:]')"
+  actual_count="$(docker exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" | tr -d '[:space:]')"
 
   if [ "${actual_count:-0}" -le 0 ]; then
     echo "world_partition is still empty after applying generated SQL."
@@ -439,18 +1753,43 @@ select count(*) as world_partition_rows from world_partition;
   echo "World partitions ready: $actual_count rows"
 fi
 
+finish_asset_phase
+
+# Outside finish_asset_phase, which install-assets also calls: this writes to the
+# database, and install-assets must not. It reads the partition catalog that
+# finish_asset_phase regenerates, so it has to follow the call rather than
+# precede it.
 echo
-echo "=== Refresh generated map catalogs ==="
-runtime/scripts/extract-partition-catalog.sh
-runtime/scripts/extract-server-catalog.sh
+echo "=== Reconcile official world partitions ==="
+runtime/scripts/reconcile-world-partitions.sh
+
+# The installed build has changed. Do not let a scheduled/CLI update leave the
+# Web Console showing the pre-update result from its durable cache.
+rm -f "$UPDATE_CHECK_CACHE_FILE"
 
 echo
 if [ "$cmd" = "install" ]; then
   echo "Install/bootstrap step finished."
   echo "The caller can now start the Dune stack."
+elif [ "$stack_was_stopped" = "1" ]; then
+  echo "Update finished."
+  echo
+  echo "The battlegroup was stopped before the update, so it will remain stopped."
+  stop_temporary_postgres
 else
   echo "Update finished."
   echo
   echo "Restarting Dune stack..."
-  runtime/scripts/start-all.sh
+  history_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  history_started_epoch="$(date +%s)"
+  restart_result=Succeeded
+  restart_rc=0
+  runtime/scripts/start-all.sh || { restart_rc=$?; restart_result=Failed; }
+  history_finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Record the real lifecycle branch, not merely a successful download/task.
+  # This covers Console, CLI and automatic updates without duplicate entries.
+  runtime/scripts/restart-history.sh record battlegroup Battlegroup "Game Update" \
+    "Game update" "$restart_result" "$history_started" "$history_finished" \
+    "$(( $(date +%s) - history_started_epoch ))" || echo "WARN Game update restart history could not be recorded." >&2
+  [ "$restart_rc" -eq 0 ] || exit "$restart_rc"
 fi

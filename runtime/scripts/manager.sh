@@ -151,7 +151,7 @@ runtime_catalogs_available() {
 }
 
 battlegroup_services_running() {
-  engine ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^(dune-rmq-admin|dune-rmq-game|dune-text-router|dune-director|dune-server-gateway|dune-server-survival-1|dune-server-overmap)$'
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^(dune-rmq-admin|dune-rmq-game|dune-text-router|dune-director|dune-server-gateway|dune-server-survival-1|dune-server-overmap)$'
 }
 
 show_runtime_files_status() {
@@ -202,52 +202,6 @@ repair_runtime_files() {
     echo
     "$DUNE" start
   fi
-}
-
-choose_stack_release_to_install() {
-  local rows=() row tag published name
-  local labels=()
-  local tags=()
-  local choice
-
-  set +e
-  mapfile -t rows < <("$DUNE" self-update list 2>/dev/null)
-  local rc=$?
-  set -e
-
-  if [ "$rc" -ne 0 ] || [ "${#rows[@]}" -eq 0 ]; then
-    echo "Could not fetch stack releases from GitHub."
-    echo "Make sure the detected GitHub repo is correct and that published releases exist."
-    echo "If GitHub API rate limiting is the issue, set DUNE_SELF_UPDATE_TOKEN."
-    return 1
-  fi
-
-  for row in "${rows[@]}"; do
-    IFS=$'	' read -r tag published name <<< "$row"
-    [ -n "${tag:-}" ] || continue
-    tags+=("$tag")
-    if [ -n "${name:-}" ]; then
-      labels+=("${tag}  ${published:-unknown}  ${name}")
-    else
-      labels+=("${tag}  ${published:-unknown}")
-    fi
-  done
-
-  [ "${#tags[@]}" -gt 0 ] || {
-    echo "No published stack releases were returned."
-    return 1
-  }
-
-  labels+=("Back")
-  menu_or_back "Restore Stack Release" "${labels[@]}" || return 1
-  choice="$MENU_CHOICE"
-
-  if [ "$choice" -gt "${#tags[@]}" ]; then
-    return 1
-  fi
-
-  CHOSEN_STACK_RELEASE_TAG="${tags[$((choice - 1))]}"
-  return 0
 }
 
 read_choice() {
@@ -582,7 +536,7 @@ set_env_value() {
     }
   ' .env > "$tmp"
   mv "$tmp" .env
-  chmod 600 .env
+  chmod 644 .env
 }
 
 is_ipv4() {
@@ -730,28 +684,22 @@ EOF
 }
 
 persist_runtime_identity_snapshot() {
-  local battlegroup_id server_title server_region server_ip existing_battlegroup_id
+  local battlegroup_id server_title server_region server_ip
 
-  battlegroup_id="$(resolve_battlegroup_id 2>/dev/null || true)"
+  if ! runtime/scripts/battlegroup-identity.sh ensure; then
+    echo "Cannot save the runtime identity snapshot until the Battlegroup ID is repaired." >&2
+    return 1
+  fi
+  battlegroup_id="$(resolve_battlegroup_id)"
   server_title="$(resolve_server_title 2>/dev/null || true)"
   server_region="$(resolve_server_region 2>/dev/null || true)"
   server_ip="$(resolve_server_ip 2>/dev/null || true)"
-  existing_battlegroup_id="$(config_value runtime/generated/battlegroup.env BATTLEGROUP_ID 2>/dev/null || true)"
-
-  if { [ -z "$battlegroup_id" ] || [ "$battlegroup_id" = "unknown" ] || [ "$battlegroup_id" = "dune-docker" ]; } \
-    && [ -n "$existing_battlegroup_id" ] \
-    && [ "$existing_battlegroup_id" != "unknown" ] \
-    && [ "$existing_battlegroup_id" != "dune-docker" ]; then
-    battlegroup_id="$existing_battlegroup_id"
-  fi
 
   mkdir -p runtime/generated
-  {
-    printf 'BATTLEGROUP_ID=%q\n' "${battlegroup_id:-dune-docker}"
-    printf 'SERVER_TITLE=%q\n' "${server_title:-My Dune Server}"
-    printf 'SERVER_REGION=%q\n' "${server_region:-Europe}"
-    printf 'SERVER_IP=%q\n' "${server_ip:-auto}"
-  } > runtime/generated/battlegroup.env
+  set_env_file_value runtime/generated/battlegroup.env BATTLEGROUP_ID "$battlegroup_id" 664
+  set_env_file_value runtime/generated/battlegroup.env SERVER_TITLE "${server_title:-My Dune Server}" 664 quoted
+  set_env_file_value runtime/generated/battlegroup.env SERVER_REGION "${server_region:-Europe}" 664 quoted
+  set_env_file_value runtime/generated/battlegroup.env SERVER_IP "${server_ip:-auto}" 664
 }
 
 show_config_summary() {
@@ -822,12 +770,12 @@ show_world_partition_count() {
   echo
   echo "=== World Partition Count ==="
 
-  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
     echo "dune-postgres is not running."
     return
   fi
 
-  engine exec dune-postgres psql -U dune -d dune -c "select count(*) as world_partition_rows from world_partition;"
+  docker exec dune-postgres psql -U dune -d dune -c "select count(*) as world_partition_rows from world_partition;"
 }
 
 show_current_memory_usage() {
@@ -842,7 +790,7 @@ show_current_memory_usage() {
   local label
   local dim
 
-  mapfile -t containers < <(engine ps --format '{{.Names}}' 2>/dev/null | grep '^dune-server-' || true)
+  mapfile -t containers < <(docker ps --format '{{.Names}}' 2>/dev/null | grep '^dune-server-' || true)
 
   echo
   echo "=== Current Memory Usage ==="
@@ -855,7 +803,7 @@ show_current_memory_usage() {
   printf "%-24s %-12s %-12s %s\n" "MAP" "PARTITION" "MEMORY" "CONTAINER"
 
   for container in "${containers[@]}"; do
-    stats_line="$(engine stats --no-stream --format '{{.Name}}\t{{.MemUsage}}' "$container" 2>/dev/null | head -n1 || true)"
+    stats_line="$(docker stats --no-stream --format '{{.Name}}\t{{.MemUsage}}' "$container" 2>/dev/null | head -n1 || true)"
     [ -n "$stats_line" ] || continue
 
     name="${stats_line%%$'\t'*}"
@@ -875,8 +823,8 @@ show_current_memory_usage() {
       *)
         if [[ "$name" =~ -([0-9]+)$ ]]; then
           partition_id="${BASH_REMATCH[1]}"
-          if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
-            db_row="$(engine exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "select map,coalesce(label,''),coalesce(dimension_index::text,'') from dune.world_partition where partition_id = ${partition_id} limit 1;" 2>/dev/null || true)"
+          if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+            db_row="$(docker exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "select map,coalesce(label,''),coalesce(dimension_index::text,'') from dune.world_partition where partition_id = ${partition_id} limit 1;" 2>/dev/null || true)"
             if [ -n "$db_row" ]; then
               IFS=$'\t' read -r map label dim <<< "$db_row"
               if [ -n "$label" ]; then
@@ -916,7 +864,7 @@ follow_dune_logs() {
 }
 
 show_header() {
-  echo "Dune Awakening Self-Host Podman Manager"
+  echo "Dune Awakening Self-Host Docker Manager"
   echo "======================================="
   echo
   echo "Choose a category. Direct CLI commands like 'dune ready' still work normally."
@@ -1592,10 +1540,7 @@ edit_userengine_menu() {
         ;;
       6)
         edit_userengine_category_menu "UserEngine Progression / Economy" \
-          "global_xp_multiplier|Global XP Multiplier|float" \
-          "global_fame_multiplier|Global Fame Multiplier|float" \
-          "global_progression_speed_multiplier|Global Progression Speed Multiplier|float" \
-          "guild_creation_cost|Guild Creation Cost|int" \
+          "guild_settings_creation_cost|Guild Creation Cost|int" \
           "sell_order_price_percentage_fee|Sell Order Price Percentage Fee|float" \
           "spice_tax_amount|Spice Tax Amount|float" \
           "spice_tax_interval|Spice Tax Interval|int"
@@ -1603,8 +1548,6 @@ edit_userengine_menu() {
       7)
         edit_userengine_category_menu "UserEngine Harvesting / Crafting" \
           "global_harvest_amount_multiplier|Global Harvest Amount Multiplier|float" \
-          "global_harvest_health_multiplier|Global Harvest Health Multiplier|float" \
-          "cutteray_hem_multiplier_per_node_tier_table|Cutteray Hem Multiplier Per Node Tier Table|float" \
           "minimum_augmentable_item_quality|Minimum Augmentable Item Quality|int" \
           "item_durability_loss_multiplier|Item Durability Loss Multiplier|float" \
           "item_deterioration_rate|Item Deterioration Rate|float"
@@ -1613,7 +1556,6 @@ edit_userengine_menu() {
         edit_userengine_category_menu "UserEngine Survival / Combat" \
           "water_consumption_rate|Water Consumption Rate|float" \
           "water_consumption_in_storm_multiplier|Water Consumption In Storm Multiplier|float" \
-          "global_damage_to_npcs_multiplier|Global Damage To NPCs Multiplier|float" \
           "global_damage_to_players_multiplier|Global Damage To Players Multiplier|float" \
           "global_health_multiplier|Global Health Multiplier|float" \
           "global_building_damage_multiplier|Global Building Damage Multiplier|float" \
@@ -1627,8 +1569,9 @@ edit_userengine_menu() {
         edit_userengine_category_menu "UserEngine World / Guilds / Vehicles" \
           "cycle_duration_in_days|Cycle Duration In Days|int" \
           "db_wipe_enabled|DB Wipe Enabled|bool" \
-          "max_guild_members_allowed|Max Guild Members Allowed|int" \
-          "max_guilds_allowed|Max Guilds Allowed|int" \
+          "guild_settings_max_guild_members_allowed|Max Guild Members Allowed|int" \
+          "guild_settings_max_guilds_allowed|Max Guilds Allowed|int" \
+          "guild_settings_max_pending_invites|Max Pending Guild Invites|int" \
           "max_permissions_per_actor|Max Permissions Per Actor|int" \
           "vehicle_quicksand_damage|Vehicle Quicksand Damage|float"
         ;;
@@ -1688,6 +1631,12 @@ edit_usergame_menu() {
       2)
         edit_usergame_category_menu "$map" "$partition_id" "UserGame Storms / Building: $title_suffix" \
           "coriolis_auto_spawn_enabled|Coriolis Storm Enabled|bool" \
+          "coriolis_cycle_start_year|Coriolis Cycle Start Year|int" \
+          "coriolis_cycle_start_month|Coriolis Cycle Start Month|int" \
+          "coriolis_cycle_start_day|Coriolis Cycle Start Day|int" \
+          "coriolis_cycle_start_hour|Coriolis Cycle Start Hour|int" \
+          "coriolis_cycle_start_minute|Coriolis Cycle Start Minute|int" \
+          "coriolis_cycle_start_seed_index|Coriolis Cycle Start Seed Index|int" \
           "storm_cycle_duration|Storm Cycle Duration|int" \
           "storm_duration|Storm Duration|int" \
           "storm_warning_duration|Storm Warning Duration|int" \
@@ -1699,10 +1648,7 @@ edit_usergame_menu() {
         ;;
       3)
         edit_usergame_category_menu "$map" "$partition_id" "UserGame Progression / Economy: $title_suffix" \
-          "global_xp_multiplier|Global XP Multiplier|float" \
-          "global_fame_multiplier|Global Fame Multiplier|float" \
-          "global_progression_speed_multiplier|Global Progression Speed Multiplier|float" \
-          "guild_creation_cost|Guild Creation Cost|int" \
+          "guild_settings_creation_cost|Guild Creation Cost|int" \
           "sell_order_price_percentage_fee|Sell Order Price Percentage Fee|float" \
           "spice_tax_amount|Spice Tax Amount|float" \
           "spice_tax_interval|Spice Tax Interval|int"
@@ -1710,8 +1656,6 @@ edit_usergame_menu() {
       4)
         edit_usergame_category_menu "$map" "$partition_id" "UserGame Harvesting / Crafting: $title_suffix" \
           "global_harvest_amount_multiplier|Global Harvest Amount Multiplier|float" \
-          "global_harvest_health_multiplier|Global Harvest Health Multiplier|float" \
-          "cutteray_hem_multiplier_per_node_tier_table|Cutteray Hem Multiplier Per Node Tier Table|float" \
           "minimum_augmentable_item_quality|Minimum Augmentable Item Quality|int" \
           "item_durability_loss_multiplier|Item Durability Loss Multiplier|float" \
           "item_deterioration_rate|Item Deterioration Rate|float"
@@ -1720,7 +1664,6 @@ edit_usergame_menu() {
         edit_usergame_category_menu "$map" "$partition_id" "UserGame Survival / Combat: $title_suffix" \
           "water_consumption_rate|Water Consumption Rate|float" \
           "water_consumption_in_storm_multiplier|Water Consumption In Storm Multiplier|float" \
-          "global_damage_to_npcs_multiplier|Global Damage To NPCs Multiplier|float" \
           "global_damage_to_players_multiplier|Global Damage To Players Multiplier|float" \
           "global_health_multiplier|Global Health Multiplier|float" \
           "global_building_damage_multiplier|Global Building Damage Multiplier|float" \
@@ -1734,8 +1677,9 @@ edit_usergame_menu() {
         edit_usergame_category_menu "$map" "$partition_id" "UserGame World / Guilds / Vehicles: $title_suffix" \
           "cycle_duration_in_days|Cycle Duration In Days|int" \
           "db_wipe_enabled|DB Wipe Enabled|bool" \
-          "max_guild_members_allowed|Max Guild Members Allowed|int" \
-          "max_guilds_allowed|Max Guilds Allowed|int" \
+          "guild_settings_max_guild_members_allowed|Max Guild Members Allowed|int" \
+          "guild_settings_max_guilds_allowed|Max Guilds Allowed|int" \
+          "guild_settings_max_pending_invites|Max Pending Guild Invites|int" \
           "max_permissions_per_actor|Max Permissions Per Actor|int" \
           "vehicle_quicksand_damage|Vehicle Quicksand Damage|float"
         ;;
@@ -1819,7 +1763,7 @@ restart_partition_if_requested() {
       ;;
   esac
 
-  engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$container" || return
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$container" || return
 
   echo
   echo "The relevant map must restart for this change to apply."
@@ -2496,7 +2440,7 @@ PY
 }
 
 admin_online_player_rows() {
-  engine exec dune-postgres psql -U dune -d dune -At -F $'\t' -c "
+  docker exec dune-postgres psql -U dune -d dune -At -F $'\t' -c "
     select
       coalesce(nullif(a.\"user\", ''), nullif(a.funcom_id, '')) as fls_id,
       ps.account_id,
@@ -2522,7 +2466,7 @@ admin_online_player_rows() {
 }
 
 admin_known_player_rows() {
-  engine exec dune-postgres psql -U dune -d dune -At -F $'\t' -c "
+  docker exec dune-postgres psql -U dune -d dune -At -F $'\t' -c "
     select
       coalesce(nullif(a.\"user\", ''), nullif(a.funcom_id, '')) as fls_id,
       ps.account_id,
@@ -2541,6 +2485,36 @@ admin_known_player_rows() {
   " 2>/dev/null || true
 }
 
+admin_specialization_online_player_rows() {
+  docker exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "
+    select
+      coalesce(ps.player_pawn_id, a.id) as actor_id,
+      coalesce(nullif(ps.character_name, ''), '<unknown>') as character_name,
+      ps.account_id,
+      coalesce(ps.online_status::text, '') as online_status,
+      coalesce(fs.map, wp.map, '') as map,
+      coalesce(ps.server_id, '') as server_id
+    from dune.player_state ps
+    left join dune.actors a on a.id = ps.player_pawn_id
+    left join dune.farm_state fs on fs.server_id = ps.server_id
+    left join dune.world_partition wp on wp.partition_id = ps.previous_server_partition_id
+    where coalesce(ps.player_pawn_id, a.id) is not null
+      and (a.id is null or a.class ilike '%PlayerCharacter%')
+      and (
+        ps.online_status <> 'Offline'
+        or (
+          ps.reconnect_grace_period_end is not null
+          and ps.reconnect_grace_period_end > (current_timestamp at time zone 'UTC')
+        )
+        or (
+          ps.last_avatar_activity is not null
+          and ps.last_avatar_activity > (current_timestamp - interval '5 minutes')
+        )
+      )
+    order by character_name, actor_id;
+  " 2>/dev/null || true
+}
+
 admin_choose_player() {
   local rows=()
   local choice row fls_id account_id character_name online_status map_name server_id manual_id
@@ -2548,7 +2522,7 @@ admin_choose_player() {
 
   ADMIN_SELECTION_CANCELLED=0
 
-  if ! engine inspect -f '{{.State.Running}}' dune-postgres 2>/dev/null | grep -qx 'true'; then
+  if ! docker inspect -f '{{.State.Running}}' dune-postgres 2>/dev/null | grep -qx 'true'; then
     error_msg "Postgres container is not running, so online players cannot be listed."
     prompt_text "Enter Player FLS ID manually, * for all online players, or 0 to go back:" manual_id || return 1
     manual_id="$(sanitize_numeric_prompt_value "$manual_id")"
@@ -2778,6 +2752,7 @@ admin_tools_menu() {
       "Spawn Vehicle" \
       "Clean Inventory" \
       "Reset Progression" \
+      "Grant Specialization XP" \
       "Command History" \
       "Back" || return
     choice="$MENU_CHOICE"
@@ -2794,8 +2769,9 @@ admin_tools_menu() {
       9) admin_run_flow admin_spawn_vehicle_flow ;;
       10) admin_run_flow admin_destructive_flow "Clean Inventory" clean-inventory ;;
       11) admin_run_flow admin_destructive_flow "Reset Progression" reset-progression ;;
-      12) admin_run_flow run_cmd "$DUNE" admin history ;;
-      13) return ;;
+      12) admin_run_flow admin_specialization_xp_flow ;;
+      13) admin_run_flow run_cmd "$DUNE" admin history ;;
+      14) return ;;
     esac
   done
 }
@@ -2912,6 +2888,166 @@ admin_skill_module_flow() {
   echo
   if confirm "Publish skill level update"; then
     run_cmd env DUNE_ADMIN_ASSUME_YES=1 "$DUNE" admin skill-module "$player_id" "$module" "$level"
+  else
+    echo "Cancelled."
+  fi
+}
+
+admin_specialization_xp_flow() {
+  local character choice track level xp grant_keystones dry_run unlock_faction actor_id account_id online_status map_name server_id row args=()
+  local tracks=("Crafting" "Gathering" "Exploration" "Combat" "Sabotage")
+  local rows=() i
+
+  if ! docker inspect -f '{{.State.Running}}' dune-postgres 2>/dev/null | grep -qx 'true'; then
+    error_msg "Postgres container is not running, so online players cannot be listed."
+    return 1
+  fi
+
+  mapfile -t rows < <(admin_specialization_online_player_rows)
+  if [ "${#rows[@]}" -eq 0 ]; then
+    echo "No online players with a resolvable PlayerCharacter pawn were found."
+    return 1
+  fi
+
+  echo
+  echo "Select Online Player"
+  echo "===================="
+  echo
+  for i in "${!rows[@]}"; do
+    IFS=$'\t' read -r actor_id character account_id online_status map_name server_id <<< "${rows[$i]}"
+    printf '%s) %s\n' "$((i + 1))" "$character"
+    printf '   actor id: %s\n' "$actor_id"
+    printf '   local account id: %s\n' "$account_id"
+    printf '   status: %s\n' "${online_status:-unknown}"
+    [ -z "${map_name:-}" ] || printf '   map: %s\n' "$map_name"
+    [ -z "${server_id:-}" ] || printf '   server: %s\n' "$server_id"
+    echo
+  done
+  echo "0) Back"
+  echo
+
+  prompt_text "Player Number:" choice || return
+  choice="$(sanitize_numeric_prompt_value "$choice")"
+  if [ "$choice" = "0" ]; then
+    ACTION_CANCELLED=1
+    return 0
+  fi
+  if ! printf '%s' "$choice" | grep -Eq '^[1-9][0-9]*$' || [ "$choice" -gt "${#rows[@]}" ]; then
+    error_msg "Invalid player selection."
+    return 1
+  fi
+
+  row="${rows[$((choice - 1))]}"
+  IFS=$'\t' read -r actor_id character account_id online_status map_name server_id <<< "$row"
+  [ -n "${actor_id:-}" ] || { error_msg "Selected player has no pawn actor id."; return 1; }
+
+  echo
+  echo "Specialization Track"
+  echo "===================="
+  echo
+  echo "1) All tracks"
+  local i
+  for i in "${!tracks[@]}"; do
+    printf '%s) %s\n' "$((i + 2))" "${tracks[$i]}"
+  done
+  echo "0) Back"
+  echo
+  prompt_text "Track Selection [1]:" choice allow-empty || return
+  choice="$(sanitize_numeric_prompt_value "${choice:-1}")"
+  choice="${choice:-1}"
+  if [ "$choice" = "0" ]; then
+    ACTION_CANCELLED=1
+    return 0
+  fi
+  if [ "$choice" = "1" ]; then
+    args+=(--all)
+    track="All tracks"
+  elif printf '%s' "$choice" | grep -Eq '^[2-6]$'; then
+    track="${tracks[$((choice - 2))]}"
+    args+=(--track "$track")
+  else
+    error_msg "Invalid track selection."
+    return 1
+  fi
+
+  prompt_text "Level [100]:" level allow-empty || return
+  level="$(sanitize_numeric_prompt_value "${level:-100}")"
+  level="${level:-100}"
+  if ! printf '%s' "$level" | grep -Eq '^[0-9]+$' || [ "$level" -gt 100 ]; then
+    error_msg "Level must be an integer between 0 and 100."
+    return 1
+  fi
+
+  prompt_text "XP amount [44182]:" xp allow-empty || return
+  xp="$(sanitize_numeric_prompt_value "${xp:-44182}")"
+  xp="${xp:-44182}"
+  if ! printf '%s' "$xp" | grep -Eq '^[0-9]+$'; then
+    error_msg "XP amount must be a non-negative integer."
+    return 1
+  fi
+
+  if confirm "Grant all specialization keystones too"; then
+    grant_keystones=1
+    args+=(--grant-keystones)
+  else
+    grant_keystones=0
+  fi
+
+  echo
+  echo "Faction Unlock"
+  echo "=============="
+  echo
+  echo "Specialization may require the faction journey to be unlocked."
+  echo "1) Do not change faction"
+  echo "2) Unlock Atreides"
+  echo "3) Unlock Harkonnen"
+  echo "0) Back"
+  echo
+  prompt_text "Faction Selection [1]:" choice allow-empty || return
+  choice="$(sanitize_numeric_prompt_value "${choice:-1}")"
+  choice="${choice:-1}"
+  case "$choice" in
+    0)
+      ACTION_CANCELLED=1
+      return 0
+      ;;
+    1)
+      unlock_faction=""
+      ;;
+    2)
+      unlock_faction="Atreides"
+      args+=(--unlock-faction "$unlock_faction")
+      ;;
+    3)
+      unlock_faction="Harkonnen"
+      args+=(--unlock-faction "$unlock_faction")
+      ;;
+    *)
+      error_msg "Invalid faction selection."
+      return 1
+      ;;
+  esac
+
+  if confirm "Dry run only"; then
+    dry_run=1
+    args+=(--dry-run)
+  else
+    dry_run=0
+  fi
+
+  echo
+  echo "Apply specialization database update?"
+  echo "  Player: $character"
+  echo "  Actor id: $actor_id"
+  echo "  Track: $track"
+  echo "  Level: $level"
+  echo "  XP amount: $xp"
+  echo "  Grant keystones: $([ "$grant_keystones" = "1" ] && echo yes || echo no)"
+  echo "  Unlock faction journey: ${unlock_faction:-no}"
+  echo "  Dry run: $([ "$dry_run" = "1" ] && echo yes || echo no)"
+  echo
+  if confirm "Continue with specialization update"; then
+    run_cmd env DUNE_ADMIN_ASSUME_YES=1 "$DUNE" admin specialization-xp "$character" "${args[@]}" --level "$level" --xp "$xp" --actor-id "$actor_id"
   else
     echo "Cancelled."
   fi
@@ -3040,7 +3176,7 @@ admin_kick_player_flow() {
   ADMIN_SELECTED_PLAYER_LABEL=""
 
   ADMIN_SELECTION_CANCELLED=0
-  if ! engine inspect -f '{{.State.Running}}' dune-postgres 2>/dev/null | grep -qx 'true'; then
+  if ! docker inspect -f '{{.State.Running}}' dune-postgres 2>/dev/null | grep -qx 'true'; then
     error_msg "Postgres container is not running, so online players cannot be listed."
     echo "Kick normally requires an online player. Start the stack or use the CLI with a known FLS id."
     return 1
@@ -3125,7 +3261,7 @@ main_menu() {
   local choice
   while true; do
     set +e
-    select_menu "Dune Awakening Self-Host Podman Manager" \
+    select_menu "Dune Awakening Self-Host Docker Manager" \
       "Battlegroup Overview" \
       "Battlegroup Settings" \
       "Sietches" \
@@ -3179,7 +3315,7 @@ battlegroup_overview_menu() {
 }
 
 battlegroup_settings_menu() {
-  local choice restart_hours
+  local choice scheduled_restart_time
   while true; do
     menu_or_back "Battlegroup Settings" \
       "Change Name" \
@@ -3252,17 +3388,17 @@ battlegroup_settings_menu() {
           case "$choice" in
             1) run_cmd "$DUNE" restart-schedule status; pause ;;
             2)
-              scheduled_restart_hours=""
+              scheduled_restart_time=""
               echo
-              prompt_text "Restart Every How Many Hours:" scheduled_restart_hours || { pause; continue; }
-              scheduled_restart_hours="$(sanitize_numeric_prompt_value "$scheduled_restart_hours")"
-              if ! printf '%s' "$scheduled_restart_hours" | grep -Eq '^[1-9][0-9]*$'; then
-                error_msg "Hours must be a positive integer."
+              prompt_text "Daily Restart Time (HH:MM):" scheduled_restart_time || { pause; continue; }
+              scheduled_restart_time="$(trim "$scheduled_restart_time")"
+              if ! printf '%s' "$scheduled_restart_time" | grep -Eq '^([01][0-9]|2[0-3]):[0-5][0-9]$'; then
+                error_msg "Restart time must be HH:MM in 24-hour local server time."
                 pause
                 continue
               fi
-              if confirm "Enable scheduled restart every $scheduled_restart_hours hour(s)?"; then
-                run_cmd sudo "$DUNE" restart-schedule enable "$scheduled_restart_hours"
+              if confirm "Enable scheduled restart daily at $scheduled_restart_time?"; then
+                run_cmd sudo "$DUNE" restart-schedule enable "$scheduled_restart_time"
               else
                 echo "Cancelled."
               fi
@@ -3346,29 +3482,22 @@ configure_maps_menu() {
     map="${maps[$((choice - 1))]}"
     mode="$("$DUNE" maps mode "$map" | awk '{print $2}')"
     while true; do
-      if [ "$mode" = "always-on" ]; then
-        menu_or_back "$map" \
-          "Change To Dynamic" \
-          "Show Running Partitions" \
-          "Back" || break
-        sub="$MENU_CHOICE"
-        case "$sub" in
-          1) run_cmd "$DUNE" maps set "$map" dynamic; pause; break ;;
-          2) run_cmd "$DUNE" sietches dimensions "$map"; pause ;;
-          3) break ;;
-        esac
-      else
-        menu_or_back "$map" \
-          "Change To Always On" \
-          "Show Running Partitions" \
-          "Back" || break
-        sub="$MENU_CHOICE"
-        case "$sub" in
-          1) run_cmd "$DUNE" maps set "$map" always-on; pause; break ;;
-          2) run_cmd "$DUNE" sietches dimensions "$map"; pause ;;
-          3) break ;;
-        esac
-      fi
+      menu_or_back "$map" \
+        "Change To Dynamic" \
+        "Change To Always On" \
+        "Change To Overmap Active" \
+        "Change To Disabled" \
+        "Show Running Partitions" \
+        "Back" || break
+      sub="$MENU_CHOICE"
+      case "$sub" in
+        1) run_cmd "$DUNE" maps set "$map" dynamic; pause; break ;;
+        2) run_cmd "$DUNE" maps set "$map" always-on; pause; break ;;
+        3) run_cmd "$DUNE" maps set "$map" overmap-active; pause; break ;;
+        4) run_cmd "$DUNE" maps set "$map" disabled; pause; break ;;
+        5) run_cmd "$DUNE" sietches dimensions "$map"; pause ;;
+        6) break ;;
+      esac
     done
   done
 }
@@ -3479,14 +3608,16 @@ automatic_database_backups_menu() {
     case "$choice" in
       1)
         echo
-        prompt_text "Backup Interval In Hours:" backup_hours || { pause; continue; }
+        prompt_text "Daily Backup Time (HH:MM):" backup_time || { pause; continue; }
         prompt_text "Keep Backups For How Many Days? Leave Blank For No Automatic Cleanup:" retention_days allow-empty || { pause; continue; }
-        if [ -z "$backup_hours" ]; then
-          echo "Backup interval is required."
+        if [ -z "$backup_time" ]; then
+          echo "Backup time is required."
+        elif ! printf '%s' "$backup_time" | grep -Eq '^([01][0-9]|2[0-3]):[0-5][0-9]$'; then
+          echo "Backup time must be HH:MM in 24-hour local server time."
         elif [ -n "$retention_days" ]; then
-          run_cmd sudo "$DUNE" db auto enable "$backup_hours" "$retention_days"
+          run_cmd sudo "$DUNE" db auto enable "$backup_time" "$retention_days"
         else
-          run_cmd sudo "$DUNE" db auto enable "$backup_hours"
+          run_cmd sudo "$DUNE" db auto enable "$backup_time"
         fi
         pause
         ;;
@@ -3799,7 +3930,6 @@ updates_menu() {
       "Runtime Files Status" \
       "Repair Runtime Files" \
       "Check Stack Update" \
-      "Restore Previous Stack" \
       "Check Game Server Update" \
       "Automatic Updates" \
       "Back" || return
@@ -3836,20 +3966,6 @@ updates_menu() {
         ;;
       5)
         echo
-        if choose_stack_release_to_install; then
-          echo
-          if confirm "Install stack release '$CHOSEN_STACK_RELEASE_TAG' now?"; then
-            run_cmd "$DUNE" self-update install "$CHOSEN_STACK_RELEASE_TAG"
-          else
-            echo "Cancelled."
-          fi
-        else
-          echo "Cancelled."
-        fi
-        pause
-        ;;
-      6)
-        echo
         set +e
         "$DUNE" update check
         rc=$?
@@ -3865,8 +3981,8 @@ updates_menu() {
         fi
         pause
         ;;
-      7) automatic_updates_menu ;;
-      8) return ;;
+      6) automatic_updates_menu ;;
+      7) return ;;
     esac
   done
 }
@@ -3928,7 +4044,7 @@ advanced_menu() {
     choice="$MENU_CHOICE"
 
     case "$choice" in
-      1) run_cmd engine exec -it dune-orchestrator bash; pause ;;
+      1) run_cmd docker compose exec orchestrator bash; pause ;;
       2) run_cmd "$DUNE" doctor; pause ;;
       3) run_cmd runtime/scripts/db-manager.sh; pause ;;
       4) return ;;

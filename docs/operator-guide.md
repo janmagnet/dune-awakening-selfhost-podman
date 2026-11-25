@@ -1,0 +1,533 @@
+# Operator Guide
+
+**Status:** Current | **Last Updated:** November 2026
+
+This is the end-user (server operator) guide to running a Dune: Awakening
+server with this project. It assumes you have already completed
+installation — see the root [`README.md`](../README.md) for the one-line
+installer command and the Requirements/Ports tables. This guide picks up
+after that: what the Web UI lets you do, and where to go for detail on
+each feature.
+
+This document links to the existing, current feature documentation rather
+than duplicating it — where a linked page and this guide ever disagree,
+the linked page is authoritative for that feature.
+
+For an engineering-level architecture reference (how the pieces fit
+together in code), see
+[`docs/architecture/SYSTEM-OVERVIEW.md`](architecture/SYSTEM-OVERVIEW.md)
+instead of this guide.
+
+---
+
+## 1. Signing in
+
+After installation, the installer prints the Web UI's URL and a
+generated admin password. This single shared password logs you in as the
+`owner` tier — the highest privilege level. See
+[`docs/console-iam.md`](console-iam.md) if you plan to configure
+additional roles/policies rather than sharing the owner password.
+
+**Lost or forgot the password?** It is persisted at
+`runtime/secrets/admin-web-password.txt` on the host — read it directly
+from there (e.g. `cat runtime/secrets/admin-web-password.txt`) rather than
+re-running the installer, which will not restore an original password
+once it has been changed via the Settings page's Login Password section.
+
+**Do not expose the Web UI port (`8088` by default) to untrusted users.**
+Only forward it to trusted administrators — see the root README's Ports
+table.
+
+**Configuration reference.** Every supported `.env` setting (bind host and
+port, database pool and timeouts, retention, update and refill tuning) is
+documented, grouped by feature, in the commented
+[`.env.example`](../.env.example). The installer also honours
+`ADMIN_BIND_PORT=<port>` to choose the Web UI port at install time, and the
+port can later be changed from Settings → Web Console Port.
+
+---
+
+## 2. Web UI feature tour
+
+[Take the Console for a spin](https://try.dunedocker.app/) with sample data,
+without installing anything. The list below introduces each major panel and
+links to its feature documentation. A "—" in the
+Further reading column means the panel is self-explanatory from the Web
+UI itself and has no separate written doc yet — file a documentation
+issue if you get stuck on one of those.
+
+| Panel | What it's for | Further reading |
+|---|---|---|
+| Home | Battlegroup state, Readiness & Health rows, Game Servers, Restart History | §2.1 below |
+| Server Control | Start/stop/restart the server and individual services | [`docs/console/restart-queue.md`](console/restart-queue.md) |
+| Backups | Database, encrypted system, and base backups | §4 below, [`docs/console/database-backups.md`](console/database-backups.md) |
+| Database | Schema/table browsing, SQL preview/export | — |
+| Updates | Game updates, Console (Dune Docker) updates, automatic-update configuration; a **QA Tester Login** button in the page title is for project testers and is not needed for normal operation | §5 below |
+| Logs | Service and container logs | — |
+| Settings | Public listing profile and directory claim, Server Startup, Web Console Port, Login Password, Encrypted API Access, API Keys, Experimental Features (Regis Tanks) | §7 below, [`docs/console/encrypted-api.md`](console/encrypted-api.md), [`docs/console/api-keys.md`](console/api-keys.md) |
+| Maps | Per-map mode configuration (dynamic / always-on / disabled) and settings | — |
+| Players | Player management, kick/ban, inventory actions. A player's Bases and Vehicles tabs list owned items by default; the Permission dropdown (Owner / Co-owner / All levels) widens or narrows them | [`docs/console/API-REFERENCE.md`](console/API-REFERENCE.md) (Players section) |
+| Guilds | Guild list, members, promote/demote and delete | [`docs/console/API-REFERENCE.md`](console/API-REFERENCE.md) |
+| Bases | Power, Water, Inventory, Sub-Fief Permissions, Base Permissions and Land Claim tabs (expand a base row) | [`docs/console/base-inventory.md`](console/base-inventory.md), [`docs/console/base-permissions.md`](console/base-permissions.md), [`docs/console/base-child-permissions.md`](console/base-child-permissions.md), [`docs/console/base-deletion.md`](console/base-deletion.md) |
+| Vehicles | Vehicle list, permissions, storage and deletion | [`docs/console/vehicle-permissions.md`](console/vehicle-permissions.md), [`docs/console/vehicle-storage.md`](console/vehicle-storage.md), [`docs/console/vehicle-deletion.md`](console/vehicle-deletion.md) |
+| Exchange | CHOAM market listings (All / Player / Bot), transactions, and the Market Bot (NPC market seeding and buyback) | [`docs/console/exchange.md`](console/exchange.md) |
+| Live Map | Real-time map/player activity view | [`docs/console/live-map.md`](console/live-map.md), [Realtime Data API](console/API-REFERENCE.md#realtime-data) |
+| Landsraad | The in-game faction/political system | — |
+| Admin Tools | GM/admin toolbox: item grants, XP/skill grants, teleport, broadcasts, scheduled map messages, scheduled restarts | [`docs/console/restart-queue.md`](console/restart-queue.md) |
+| Care Package | Scheduled/manual player reward grants | — |
+| Addons | Browse, install, enable, update and remove Community Addons | §6 below |
+| Language (header globe button) | Console language picker and translation-correction form | §2.2 below |
+
+The sidebar groups these as Server Operations (Home through Settings), Arrakis
+Management (Maps through Care Package) and Community (Addons). Two further
+pages, Services and Storage, exist but have no sidebar entry.
+
+### 2.1 Home: readiness, health and restart history
+
+Home shows the state of the Battlegroup and five **Readiness & Health** rows:
+Database, Messaging, Battlegroup Services, Game Servers and Funcom/FLS. Each row
+has a status and expands to the readings behind it (which containers, ports and
+partitions were checked), so a warning can be traced to a specific service.
+Readings are dated, and a reading older than 90 seconds is treated as stale
+rather than shown as current. Readiness reflects whether the Battlegroup can
+accept players, not only whether containers are running.
+
+**Restart History** is a collapsible panel on Home. It lists completed
+restarts with their time, type (Battlegroup, Map or Service), target, source
+(for example Console, Scheduled, Game Update or Automatic), reason, duration and result (Succeeded or
+Failed), and can be filtered by type. Records are kept in
+`runtime/generated/restart-history.jsonl`, trimmed to the most recent 500
+entries once the file passes 2 MB.
+
+**Stalled game-server recovery.** The Autoscaler watches the Director's view of
+server capacity. If maps stop reporting usable capacity, it first republishes
+the Director state, which is safe with players online. If fresh capacity reports
+taken after that repair still show zero, it asks the Coriolis coordinator for a
+coordinated game-farm restart, which replaces every world map. That restart is
+never run while a player is connected or while the player count cannot be
+confirmed; it is retried automatically once the Battlegroup is empty. Every
+such restart is recorded in Restart History as Source "Automatic", Reason
+"Stalled Game Server Recovery", with a Succeeded or Failed result. A Failed
+entry means the restart did not complete and needs your attention: check
+Server Control and the Autoscaler logs.
+
+### 2.2 Console language and translations
+
+The globe button in the page header opens **Console Language**, a searchable
+list of the languages the Console is translated into. Your choice applies to
+this browser. Only the Console's own interface text is translated; live values
+such as player names, map names and server data are never changed or sent to a
+translation provider, and only repository-reviewed interface phrases can be
+translated at all.
+
+Translations that the project's maintainers have reviewed are authoritative
+and are never overwritten by machine translation. If a phrase reads wrongly,
+use **Suggest a Translation Fix** at the bottom of the picker: choose the
+language, find the text by its current translation or its English source,
+enter the correction (keep placeholders such as `{count0}` unchanged), and
+optionally add a name for credits. Corrections are reviewed before they are
+included in a future project update.
+
+Owners can optionally extend coverage. A DeepL API key can be stored for
+machine translation of languages that are not yet complete; it is saved
+encrypted (AES-256-GCM) on the host and is submitted through the Console's
+i18n API rather than set in `.env`. Peer language sync, which exchanges
+language packs with other Dune Docker installations over an encrypted channel,
+is off by default and requires an explicit opt-in plus a per-installation
+enrollment key. See the Localization (i18n) section of
+[`docs/console/API-REFERENCE.md`](console/API-REFERENCE.md#localization-i18n)
+for the routes.
+
+---
+
+## 3. Bases: power, storage, permissions, and deletion
+
+Expanding a base row in the Bases panel gives you these tabs (plus a Land
+Claim Editor not covered here):
+
+- **Power** — refill generators, wind turbines, and windtrap filters up to a per-device-type cap
+  ([`docs/console/generator-refill-caps.md`](console/generator-refill-caps.md),
+  [`docs/console/generator-fuel-burn-rates.md`](console/generator-fuel-burn-rates.md)).
+  Windtrap filters keep the tier currently in use (first accepted tier in inventory, else the burning tier, else the default).
+  Refills are queued and applied on the next safe window — they do not
+  necessarily take effect the instant you click.
+- **Water** — restores stored water only, for cisterns and windtraps. Same refill mechanism as Power, queued to the next safe window.
+- **Inventory** — a read-only snapshot of everything stored at the base,
+  with the ability to open a container and delete individual items. See
+  [`docs/console/base-inventory.md`](console/base-inventory.md) for what
+  counts as "storage" and the stopped-map safety boundary for deletions.
+- **Sub-Fief Permissions** — edit who owns the base and who it's shared
+  with. Unlike generator refills, permission changes apply to a running
+  map immediately, with no restart required. See
+  [`docs/console/base-permissions.md`](console/base-permissions.md).
+- **Base Permissions** — a separate list of every individual piece (door,
+  device) on the base with its own access level, with the ability to set
+  any of them to a specific level; pieces that deviate from the base's
+  Sub-Fief default are highlighted. Unlike Sub-Fief Permissions above,
+  these do **not** apply to a running map: the game never picks up a
+  per-piece access level change while the map is up, so a save against a
+  live map is queued and written at that map's next restart. See
+  [`docs/console/base-child-permissions.md`](console/base-child-permissions.md).
+
+**Auto-refill** is opt-in per base, enabled from the Power tab (generators, wind turbines, and windtraps)
+and the Water tab (water storage). An enrolled base is scanned on a fixed
+interval and queued for a refill when its lowest device falls below a
+threshold; the refill itself goes through the same queue as a manual one, so
+it applies at the next safe window rather than immediately. Windtraps are
+scanned with the generators but against their own threshold: a windtrap holds
+only 5 filters, so it reads in 20% steps, and one windtrap below its threshold
+queues a refill for the whole base, generators included. Bases already
+enrolled before windtraps were added are covered automatically — there is no
+separate opt-in. The two
+subsystems are independent — separate enrollment lists, separate schedules —
+so enrolling a base in one does not enroll it in the other.
+
+Both are tuned from one place: the **gear icon** to the left of Refresh at the
+top of the Bases panel. It opens a settings overlay with a threshold and a scan
+interval for each subsystem. Changes apply without restarting the console, and
+are stored console-side in `runtime/generated/auto-refill-settings.json` — no
+game data is touched.
+
+| Setting | Default | Range |
+|---|---:|---|
+| Generators — queue a refill below | 50 | 1-99 % |
+| Windtraps — queue a refill below | 40 (1 filter left) | 1-99 % |
+| Generators — check every | 24 | 1-168 h |
+| Water — queue a refill below | 50 | 1-99 % |
+| Water — check every | 24 | 1-168 h |
+
+Each field has a **Reset**, which clears the console override and falls back to
+the environment variable (`ADMIN_AUTO_REFILL_THRESHOLD_PERCENT`,
+`ADMIN_AUTO_REFILL_WINDTRAP_THRESHOLD_PERCENT`, `ADMIN_AUTO_REFILL_INTERVAL_HOURS`, `ADMIN_AUTO_REFILL_WATER_THRESHOLD_PERCENT`,
+`ADMIN_AUTO_REFILL_WATER_INTERVAL_HOURS`) if one is set, or the default above.
+The precedence is settings page, then environment variable, then default. An
+unparseable environment variable falls back to the default rather than failing
+startup; an out-of-range one is clamped to the nearest bound. A blank one reads
+as unset — though on the standard Docker deployment `docker-compose.web.yml`
+substitutes its own default for a variable that is blank or missing, so a blank
+never reaches the console there.
+
+Two timing details worth knowing. **A shortened interval pulls the next scan
+in**; a lengthened one applies only after the currently scheduled scan runs.
+And **a changed threshold is used by the next scan**, not immediately — at a
+168-hour interval that can be a week away.
+
+Saving these settings is a separate permission (`bases:write-config`) from the
+per-base on/off toggle (`bases:mutate`), so an operator can be allowed to enroll
+bases without being allowed to retune the policy for all of them. The shipped
+Owner and Admin roles have both.
+
+A base that stays low after three consecutive queued refills is marked stalled
+and stops being retried (audited as `bases.auto-refill-stalled` /
+`bases.auto-refill-water-stalled`); a healthy scan clears that. A base that no
+longer exists is un-enrolled automatically.
+
+**Deleting a base** is a separate, row-level action (trash icon) — it is
+permanent and irreversible. The console shows a danger-styled confirmation
+dialog you must click through, and automatically takes a full database
+backup before running the delete. See
+[`docs/console/base-deletion.md`](console/base-deletion.md) for exactly
+what "the base" means for this operation and why a pending delete freezes
+other mutations on that base.
+
+**A base can also disappear from the panel because of the game's own
+"pick up base" mechanic**, not because the console deleted anything. A
+picked-up base is excluded from the Bases panel and every mutation route
+on it (delete, refill, permissions, custodian, auto-refill) returns an
+error until the player redeploys it in-game; reads (inventory viewing,
+water level, blueprint export) still work. See
+[`docs/console/base-backups.md`](console/base-backups.md) — despite the
+similar name, this is unrelated to the database Backups page described
+next.
+
+---
+
+## 4. Backups
+
+Three different things share the word "backup" in this project — know which
+one you need:
+
+1. **Database backups** (the Backups page) — a real backup/restore of the
+   whole Postgres database. **If you restore a backup into a deployment
+   whose Battlegroup ID differs from the backup's**, the console requires
+   you to explicitly choose **Adopt Backup ID** (moving the same server to
+   new hardware) or **Keep Current ID** (importing data into a different
+   server — characters tied to the backup's ID may not appear in-game).
+   An unattended restore with mismatched IDs fails safely before touching
+   the database unless one of these is supplied. See
+   [`docs/console/database-backups.md`](console/database-backups.md) for
+   the full decision matrix and the `dune db restore` CLI equivalents.
+2. **System backups** (the Backups page, *System Backups (Encrypted)*) — the
+   database **plus** everything the console generates: `.env`,
+   `runtime/generated/`, and every file in `runtime/secrets/` (the Funcom
+   token, the admin password, RMQ credentials, sietch join password, IAM
+   policies). One GPG AES-256-encrypted archive, point-in-time by
+   construction. This is what moves a server to new hardware without
+   re-entering every setting by hand. **There is no way to recover one
+   without the passphrase you set**, so store it somewhere durable and
+   separate from the archive. Create, download, import and restore are all
+   on that page, with `dune db backup-system` / `restore-system` as the CLI
+   equivalents. Restore previews before it applies, and asks what to do
+   about Battlegroup identity and the admin audit log. See
+   [`docs/console/database-backups.md`](console/database-backups.md).
+   **Automatic System Backups** on the same page runs them on a timer: the
+   Owner saves a passphrase once (it can't be read back), then sets a time,
+   an interval and how many scheduled archives to keep. See
+   [scheduled system backups](console/database-backups.md#scheduled-system-backups).
+3. **The in-game "pick up base" mechanic** — not a console feature at all;
+   see §3 above and
+   [`docs/console/base-backups.md`](console/base-backups.md).
+
+---
+
+## 5. Updates
+
+There are two independent update mechanisms, both driven from the CLI or
+the Web UI's Updates panel — do not confuse them:
+
+- **`dune update`** — updates the **game server** itself (the SteamCMD
+  content Funcom ships). Subcommands: `check`, `install`,
+  `install-assets`, `fix-steamcmd`, `fix-install-dir`, and an unattended
+  option,
+  `dune update auto enable [interval-minutes] ...` / `disable` /
+  `status`, backed by a systemd timer whose first check runs 5 minutes after
+  the timer is enabled (not after boot) and then repeats on a rolling interval
+  counted from the end of each run (default: every 60 minutes,
+  configurable via the first argument to `auto enable`). A successful Web
+  Console check is cached for 30 minutes and survives Console restarts;
+  **Refresh Game Check** always requests a live result. Read-only checks use
+  two short, bounded Steam attempts by default, while actual installations
+  retain the longer content-host retry policy needed for downloads.
+  `dune update install-assets` is the same download without any database
+  work: it installs the game files and images and stops there. That is what
+  a brand-new host needs before it can restore a system backup, since the
+  Funcom database image is not pullable and only exists once the game files
+  are installed. The Updates page's **Install Game Files** button runs the
+  same thing. Plain `dune update install`, by contrast, also migrates the
+  database and reseeds world partitions.
+  The two last arguments of `auto enable` are `update-console` and
+  `manage-regis-tanks` (`0` or `1`, both default to `0`):
+  `dune update auto enable 60 1 1 15,10,5,1 0 360 1 1`. With
+  `manage-regis-tanks`, an automatic game update first switches Experimental
+  Tanks off and waits until that is confirmed, and only then updates the game
+  files; without it, an update is blocked while Tanks are enabled. With
+  `update-console`, the updater then looks for a newer Dune Docker release from
+  RedBlink and installs it. Tanks are switched on again only once a newer
+  release is installed and supports the new game build (or once the game build
+  turns out to be unchanged); until then they stay off, and `dune update auto
+  status` shows the pending restore.
+- **`dune self-update`** (alias `dune stack-update`) — updates **this
+  repository/stack itself** (fetching a new GitHub release of
+  `dune-awakening-selfhost-docker`). Subcommands: `check`, `list`,
+  `install [latest|<tag>]`. On its own it is a manual,
+  operator-triggered action; to install new Dune Docker releases automatically,
+  enable `update-console` in `dune update auto enable` (above). The Updates page
+  has matching Game Update and Console Update sections.
+
+---
+
+## 6. Community Addons
+
+The root README describes the capability: "Community Addons provide
+optional tools that can be installed and managed from the Web UI. Addons
+declare their permissions before installation, and updates preserve their
+settings and require approval for any new permissions." Addon developers
+can start from the
+[Official Addon Template](https://github.com/Red-Blink/dune-docker-addon-template).
+
+An addon can only ever request a permission from a fixed, platform-defined
+list (things like read-only player/database access, granting items,
+restarting the server, or sending broadcasts) — it cannot invent new
+capabilities. An addon only receives the permissions you confirm, and an
+addon update that adds a new permission request asks for your confirmation
+again before it can use it.
+
+### Using the Addons page
+
+Open **Addons** in the sidebar (Community group). The page lists the community
+catalog plus any locally installed addon in a table with the columns Addon,
+Version, Permissions, Status and Actions, and a summary of how many addons are
+in each lifecycle state.
+
+- **Install** shows a confirmation that lists every permission the addon
+  requests. Confirming downloads the archive, verifies it, and installs it
+  **disabled**; the confirmation grants the listed permissions.
+- **Enabled / Disabled** switch (Status column) starts or stops an installed
+  addon. Once enabled, the **Sub-Menu** switch pins it into the sidebar.
+- **Update** appears when the catalog has a newer version. If the update
+  requests additional permissions, the confirmation names them, and confirming
+  approves that extra access.
+- **Uninstall** (trash icon) removes the addon.
+
+Each addon has a lifecycle state, shown in the Status column in place of
+"Available" when it is not active: **Deprecated** (installable, may stop
+receiving updates), **Unsupported** (no longer supported by its maintainer),
+**Removed** (taken out of the catalog) and **Blocked** (blocked for safety). Unsupported, Removed and Blocked
+addons cannot be installed or updated, and a Blocked addon cannot be enabled
+or opened; hovering the disabled button shows the reason.
+
+The developer-facing side of the addon contract (manifest format,
+permission list, provenance/integrity checks) is documented in
+[`docs/addons/addon-item-grants.md`](addons/addon-item-grants.md),
+[`docs/addons/addon-scheduled-jobs.md`](addons/addon-scheduled-jobs.md),
+[`docs/addons/hardware-status.md`](addons/hardware-status.md), and
+[`docs/security/addon-provenance.md`](security/addon-provenance.md).
+
+---
+
+## 7. Public Server Directory (DuneDocker.app)
+
+[DuneDocker.app](https://dunedocker.app/) is an optional public listing
+service. From the **Console Settings page** you can:
+
+- Claim your server's listing to verify ownership.
+- Manage your public profile and Discord invite link.
+- Enable or disable the public listing at any time.
+
+Direct personalized latency uses UDP `32000-32015`. Permit or forward that
+range through both the host firewall and any internet-to-DMZ edge firewall or
+NAT device. This is optional: installations that leave it closed remain listed
+and use the Dune Docker relay for latency measurements.
+
+Local and LAN-only servers are never listed. By default, installations
+contribute only an anonymous server count (never server names, addresses,
+players, or settings) to the directory even if you don't claim a listing;
+this anonymous count can also be disabled separately in Settings. There is
+no dedicated deep-dive document for this feature beyond the root
+[`README.md`](../README.md)'s "Public Server Directory" section and this
+summary — treat those two as the complete current documentation for it.
+
+---
+
+## 8. Discord integration
+
+The Discord adapter is the supported integration. A separate early prototype
+doc set still exists under the "Discord" name — use the right one:
+
+- **The Discord adapter** (current, operator-facing) — lets you connect a
+  companion Discord bot,
+  [`yacketrj/dune-awakening-selfhost-discordbot`](https://github.com/yacketrj/dune-awakening-selfhost-discordbot),
+  for server monitoring; its slash commands are organized into 6 groups
+  (`core`, `server`, `data`, `ops`, `admin`, `infra`) — see the linked
+  README below for the current, authoritative command list and count. The
+  adapter is disabled by default, read-mostly (its only writes are player-link
+  bookkeeping and the opt-in `/broadcast`, which stays disabled on the stock
+  `docker-compose.web.yml`), bearer-token protected, and role-gated. Start with
+  [`docs/integrations/discord-integration/README.md`](integrations/discord-integration/README.md);
+  the guided, screenshot-illustrated walkthrough is
+  [`docs/integrations/discord-integration/admin-guide.md`](integrations/discord-integration/admin-guide.md);
+  common problems are in
+  [`docs/integrations/discord-integration/troubleshooting.md`](integrations/discord-integration/troubleshooting.md)
+  and [`docs/integrations/discord-integration/faq.md`](integrations/discord-integration/faq.md).
+- **The `discord-control-bot` prototype docs** — **historical**. They describe
+  an early prototype of the companion bot, which is not in this repository, and
+  are not maintained. Do not follow them for setup; they remain only for
+  context ([`docs/integrations/discord-control-bot/admin-guide.md`](integrations/discord-control-bot/admin-guide.md)).
+
+---
+
+## 9. Running multiple servers behind one public IP
+
+If you want to run more than one independent battlegroup (e.g. separate
+production and test servers) sharing a single public IPv4 address, this
+requires one isolated VM per battlegroup (each with its own Docker daemon
+and a fully distinct set of host ports) plus matching router/NAT rules.
+This is a real, supported, but advanced configuration with a dedicated
+automation helper:
+
+```sh
+python3 runtime/scripts/multi-server-config.py plan --instances 3
+```
+
+See [`docs/runtime/MULTI-SERVER-SINGLE-PUBLIC-IP.md`](runtime/MULTI-SERVER-SINGLE-PUBLIC-IP.md)
+for the full port-profile tables, the non-negotiable no-port-overlap rule,
+and the `plan` / `apply` / `verify` workflow. Do not attempt this by
+manually editing `.env` port variables without reading that document first
+— the port-overlap constraints are stricter than normal OS socket rules.
+
+---
+
+## 9b. Logs after a restart or crash
+
+When a game server container is removed by the stack, it takes its `docker logs` with it. Before that happens, the stack now records who asked and keeps the container's output and the game's logs. Removals that are covered: a Sietch or map restart (`dune sietches restart`), a despawn (including the autoscaler's), `dune stop`, a recycle of the world servers, a database stop or restore (which stops the game servers first), and a start that replaces an existing game server container. Not covered: the gateway, director and RabbitMQ containers, `docker compose down`, a manual `docker rm`, and a host reboot. A server that crashes and is restarted by Docker keeps its console output, because Docker does not delete it on a restart.
+
+| What | Where |
+|---|---|
+| Who or what removed the container, and how it ended | `runtime/generated/container-lifecycle.log`, one tab-separated line per removal: time, reason, container, state (`exit`, `oom`, start and finish time, restart count), who (`user`, plus `ssh` source address, `sudo_user` and `source` when set), calling process chain |
+| The container's console output | `runtime/generated/logs/containers/<container>-<UTC time>.log.gz` (read it with `zcat` or `zless`) |
+| The game's rotated logs, and the run that just ended | `runtime/generated/logs/archive/<server>/` (`*-backup-*.log.gz` and `*-final-<UTC time>.log.gz`) |
+
+The `reason` column says which path removed the container: `despawn-server`, `stop-server-survival-1`, `stop-server-overmap`, `recycle-world-game-servers`, `db-stop-dependents` or `start-replace`.
+
+Root-run maintenance assigns private records to the installation owner so subsequent Console operations can keep saving logs. Existing permissions on the shared `runtime/generated/` directory are preserved.
+
+**Treat these files as sensitive.** Console output and game logs contain player names and addresses, and the game echoes its own command line into them. The stack masks the value of anything named like a password, token, secret or API key before saving, and writes the files owner-only (files `0600`, directories `0700`). Masking is best effort: it cannot recognise every format, so do not share these files or include them in a support bundle without looking at them first.
+
+**What this is not.** The lifecycle log is a local, best-effort record, not a tamper-evident audit trail. The requester fields come from the environment (`SSH_CONNECTION`, `SUDO_USER`, `DUNE_REQUEST_SOURCE`) and can be empty or set by the caller. The game's own rotated logs are archived at each removal, so a log the game rotates and deletes during one very long run, with no removal in between, can be missed.
+
+**Upgrading.** The feature is on by default and needs no action. After the first removal on an updated install you will find the new files under `runtime/generated/`. A removal now takes a few seconds longer while the output is saved (at most 30 seconds for the container output and 60 seconds per game log before it gives up). To turn it off, set the switches below.
+
+Settings in `.env` (all optional; a value that is not a positive number falls back to the default):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DUNE_KEEP_CONTAINER_LOGS` | `1` | `0` stops saving container output |
+| `DUNE_KEPT_CONTAINER_LOGS` | `10` | saved outputs kept per container |
+| `DUNE_KEPT_CONTAINER_LOGS_TOTAL` | `100` | saved outputs kept across all containers |
+| `DUNE_ARCHIVE_GAME_LOGS` | `1` | `0` stops archiving game logs |
+| `DUNE_GAME_LOG_ARCHIVE_DAYS` | `30` | days an archived game log is kept |
+| `DUNE_GAME_LOG_ARCHIVE_MAX_FILES` | `60` | archived files kept per server |
+| `DUNE_CONTAINER_LOG_TIMEOUT` | `30` | seconds to wait for `docker logs` |
+| `DUNE_ARCHIVE_TIMEOUT` | `60` | seconds allowed per archived game log |
+| `DUNE_REQUEST_SOURCE` | unset | free text recorded as the requester, for scripts that call `dune` |
+
+Disk use is bounded by the counts above (compressed, a container output is a few MB and a game log about 10 MB); the lifecycle log is trimmed to its newest 2000 lines once it passes 1 MiB. If saving fails, the stop still goes ahead and only the record is lost.
+
+## 9c. Safe dynamic-instance cleanup
+
+`dune despawn <map|partition|container>` checks player presence before stopping
+anything. It combines the native connection count with active player, pawn and
+reconnect/activity records, then checks recent gameplay or travel in the instance
+log. A zero Director player count alone does not establish that a story is empty.
+If a check fails or cannot be completed, the command refuses. A map-wide request
+checks all selected containers before removing the first one, then checks each
+again immediately before removal. Players can still arrive after a check; arrange
+maintenance with players when stopping instances manually.
+
+`--force` explicitly bypasses the player and Always On map guards for dynamic
+instances. It can disconnect players and end their story run. It cannot remove
+unrelated containers or the primary Survival/Overmap servers. The Console's
+existing **Force Despawn** confirmation has the same meaning. The Autoscaler's
+internal `--idle-confirmed` hint skips only the extra recent-log wait after its
+own idle policy; live database presence checks still apply.
+
+For single-party maps with dedicated scaling, the Autoscaler keeps one ready,
+empty spare while another instance is occupied. If all assigned instances are
+occupied, it requests one spare through normal allocation. Configured dimension
+caps and host-memory admission still apply; a warming instance counts as spare
+capacity. Extra empty instances and the last spare after everyone leaves follow
+the normal idle policy. Fresh-process activities still retire after each run.
+This capacity policy does not prove that the native Director will route every
+story travel correctly; routing reports still need matching request/refusal and
+destination-readiness evidence.
+
+## 9d. Investigating pauses and garbage collection
+
+See [Performance troubleshooting](runtime/PERFORMANCE-TROUBLESHOOTING.md) for
+Console request and memory-limit timing, the locations of server logs, and the
+evidence needed to distinguish native game pauses from stack activity.
+
+## 10. Getting help
+
+- [Official Website](https://dunedocker.app/) — project info, FAQ, server directory.
+- [Discord Community](https://discord.gg/duneawakeningdocker) — support and discussion.
+- [`docs/README.md`](README.md) — the full documentation index, including
+  every feature/security/incident document referenced above.
+- GitHub Issues on this repository — bug reports and documentation gaps.
+
+---
+
+## Related documents
+
+- [`docs/architecture/SYSTEM-OVERVIEW.md`](architecture/SYSTEM-OVERVIEW.md) — engineering architecture reference.
+- [`docs/README.md`](README.md) — full documentation index.

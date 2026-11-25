@@ -3,10 +3,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+# shellcheck source=runtime/scripts/lib/postgres.sh
+source runtime/scripts/lib/postgres.sh
+
 usage() {
   cat <<'EOF'
 Usage:
-  dune spawn <map-name|partition-id>
+  dune spawn <map-name|partition-id> [--force]
 
 Examples:
   dune spawn DeepDesert_1
@@ -25,15 +28,25 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ $# -lt 1 ]; then
 fi
 
 TARGET="$1"
+FORCE=0
+if [ "${2:-}" = "--force" ]; then
+  FORCE=1
+elif [ -n "${2:-}" ]; then
+  usage
+  exit 2
+fi
 
 [ -f .env ] && . ./.env
-[ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
-[ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+[ -r runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+source runtime/scripts/host-paths.sh
 source runtime/scripts/runtime-env.sh
 source runtime/scripts/image-tags.sh
+source runtime/scripts/sietch-login-password-args.sh
+source runtime/scripts/fake-k8s-serviceaccount.sh
+# shellcheck source=runtime/scripts/lib/game-container.sh
+source runtime/scripts/lib/game-container.sh
 
-WORLD_IMAGE_TAG="$(resolve_world_image_tag)"
-IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server:${WORLD_IMAGE_TAG}"
 
 TOKEN_FILE="runtime/secrets/funcom-token.txt"
 RMQ_SECRET_FILE="runtime/secrets/rmq-http-token-auth-secret.txt"
@@ -58,22 +71,28 @@ SERVER_TITLE="$(resolve_server_title)"
 SERVER_REGION="$(resolve_server_region)"
 SERVER_IP="$(resolve_server_ip)"
 BATTLEGROUP_ID="$(resolve_battlegroup_id)"
+DUNE_DB_PASSWORD="${DUNE_DB_PASSWORD:-dune}"
 CLIENT_PORT_BASE="$(resolve_client_port_base)"
 IGW_PORT_BASE="$(resolve_igw_port_base)"
+POSTGRES_PORT="$(resolve_postgres_port)"
+RMQ_ADMIN_PORT="$(resolve_rmq_admin_port)"
+RMQ_GAME_PORT="$(resolve_rmq_game_port)"
+DIRECTOR_PORT="$(resolve_director_port)"
 MULTIHOME_IP="$(resolve_bind_ip)"
+RMQ_GAME_HOST="$(resolve_rmq_game_host)"
+RMQ_ADMIN_HOST="$(resolve_rmq_admin_host)"
+mapfile -t GAME_EXTERNAL_ADDRESS_ENV < <(game_external_address_override_env_args)
+validate_game_external_address_override_env_args "${GAME_EXTERNAL_ADDRESS_ENV[@]}"
 PORT_RESERVATION_FILE="runtime/generated/spawn-port-reservations.tsv"
 PORT_LOCK_FILE="runtime/generated/spawn-port-reservations.lock"
 SPAWN_SUCCESS=0
 PORTS_RESERVED=0
+PORT_RESERVATIONS_CLEANED=0
 
-if ! engine ps --format '{{.Names}}' | grep -qx dune-postgres; then
+if ! docker ps --format '{{.Names}}' | grep -qx dune-postgres; then
   echo "dune-postgres is not running."
   exit 1
 fi
-
-psql_value() {
-  engine exec dune-postgres psql -U postgres -d dune -Atc "$1"
-}
 
 container_name_for_map_partition() {
   local map="$1"
@@ -89,7 +108,7 @@ rebuild_port_reservation_file() {
   local rows partition_id map game_port igw_port container_name
 
   : >"$output_path"
-  rows="$(engine exec dune-postgres psql -U postgres -d dune -At -F '|' -c "
+  rows="$(dune_psql -At -F '|' -c "
     select
       wp.partition_id,
       wp.map,
@@ -160,20 +179,22 @@ release_port_reservation() {
 }
 
 cleanup_port_reservations() {
-  local tmp line container_name
+  local tmp line container_name containers
 
   mkdir -p runtime/generated
   [ -f "$PORT_RESERVATION_FILE" ] || return 0
 
+  containers="$(docker ps -a --format '{{.Names}}')"
   tmp="$(mktemp)"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     container_name="$(printf '%s' "$line" | cut -f1)"
-    if engine ps -a --format '{{.Names}}' | grep -qx "$container_name"; then
+    if printf '%s\n' "$containers" | grep -Fxq "$container_name"; then
       printf '%s\n' "$line" >>"$tmp"
     fi
   done <"$PORT_RESERVATION_FILE"
   mv "$tmp" "$PORT_RESERVATION_FILE"
+  PORT_RESERVATIONS_CLEANED=1
 }
 
 reservation_has_port() {
@@ -212,7 +233,7 @@ purge_stale_farm_rows_for_map() {
   local safe_map
   safe_map="${map//\'/\'\'}"
 
-  engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+  dune_psql -v ON_ERROR_STOP=1 -c "
 begin;
 delete from dune.farm_state fs
 where fs.map = '$safe_map'
@@ -245,7 +266,7 @@ clear_dead_partition_assignment() {
     return 1
   fi
 
-  engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+  dune_psql -v ON_ERROR_STOP=1 -c "
 begin;
 update dune.world_partition
 set server_id = null
@@ -286,16 +307,27 @@ bind_partition_to_live_server() {
     " | tr -d '\r[:space:]')"
 
     if [ -n "$live_server_id" ]; then
-      engine exec dune-postgres psql -U postgres -d dune -v ON_ERROR_STOP=1 -c "
+      if live_server_id="$(dune_psql -Atq -v ON_ERROR_STOP=1 -c "
 begin;
-update dune.world_partition
+set local lock_timeout = '5s';
+lock table dune.world_partition in share row exclusive mode;
+update dune.world_partition wp
 set server_id = '$live_server_id'
-where partition_id = $partition_id
-  and coalesce(server_id, '') = '';
+where wp.partition_id = $partition_id
+  and wp.map = '${map_name//\'/\'\'}'
+  and (coalesce(wp.server_id, '') = '' or wp.server_id = '$live_server_id')
+  and not exists (
+    select 1 from dune.world_partition assigned
+    where assigned.server_id = '$live_server_id'
+      and assigned.map = wp.map
+      and assigned.partition_id <> wp.partition_id
+  )
+returning wp.server_id;
 commit;
-" >/dev/null
-      printf '%s' "$live_server_id"
-      return 0
+" )" && [ -n "$live_server_id" ]; then
+        printf '%s' "$live_server_id"
+        return 0
+      fi
     fi
 
     sleep "$sleep_seconds"
@@ -340,6 +372,24 @@ if [ -z "$ROW" ]; then
 fi
 
 IFS='|' read -r PARTITION_ID MAP_NAME DIMENSION_INDEX LABEL ASSIGNED_SERVER <<< "$ROW"
+if [ -f runtime/generated/experimental-tanks.json ]; then
+  python3 runtime/scripts/experimental_tanks.py launch-guard "$MAP_NAME"
+fi
+IMAGE="$(resolve_game_server_image "$MAP_NAME")"
+
+mkdir -p runtime/generated
+PARTITION_SPAWN_LOCK_FILE="runtime/generated/spawn-partition-${PARTITION_ID}.lock"
+exec 7>"$PARTITION_SPAWN_LOCK_FILE"
+if ! flock -n 7; then
+  echo "Spawn already in progress for partition $PARTITION_ID ($MAP_NAME / $LABEL)."
+  exit 0
+fi
+
+if [ "$FORCE" != "1" ] && runtime/scripts/map-modes.sh is-disabled "$MAP_NAME" >/dev/null 2>&1; then
+  echo "Refusing to spawn disabled map: $MAP_NAME"
+  echo "Set the map mode to Dynamic, Overmap Active, or Always On first."
+  exit 1
+fi
 
 if [ -n "$ASSIGNED_SERVER" ]; then
   if clear_dead_partition_assignment "$PARTITION_ID" "$ASSIGNED_SERVER"; then
@@ -353,13 +403,8 @@ fi
 safe_name="$(echo "$MAP_NAME-$PARTITION_ID" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')"
 CONTAINER_NAME="dune-server-${safe_name}"
 
-if [ -n "${DUNE_FAKE_K8S_SERVICEACCOUNT_DIR:-}" ]; then
-  FAKE_K8S_SERVICEACCOUNT_DIR="$DUNE_FAKE_K8S_SERVICEACCOUNT_DIR"
-else
-  FAKE_K8S_SERVICEACCOUNT_DIR="$PWD/runtime/generated/dune-fake-k8s-serviceaccount-${safe_name}-$$"
-fi
+FAKE_K8S_SERVICEACCOUNT_DIR="$(fake_k8s_serviceaccount_dir "$safe_name")"
 
-mkdir -p runtime/generated
 ensure_runtime_state_file "$PORT_LOCK_FILE" "spawn port reservation lock"
 exec 9>"$PORT_LOCK_FILE"
 flock 9
@@ -367,64 +412,19 @@ ensure_runtime_state_file "$PORT_RESERVATION_FILE" "spawn port reservation state
 cleanup_port_reservations
 release_port_reservation "$CONTAINER_NAME"
 
-memory_for_map() {
-  local map="$1"
-  local map_key
-  local env_key
-  local configured
-  local recommended
-
-  map_key="$(printf '%s' "$map" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')"
-  env_key="DUNE_MEMORY_${map_key}"
-  configured="${!env_key:-}"
-
-  if [ -n "$configured" ]; then
-    echo "$configured"
-    return 0
-  fi
-
-  if [ -n "${DUNE_MEMORY_DEFAULT:-}" ]; then
-    echo "$DUNE_MEMORY_DEFAULT"
-    return 0
-  fi
-
-  recommended="$(default_memory_for_map "$map")"
-  case "${map,,}" in
-    survival_1|deepdesert_1|overmap)
-      echo "$recommended"
-      return 0
-      ;;
-  esac
-
-  python3 - "$map" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-target = sys.argv[1].lower()
-catalog_path = Path("runtime/generated/server-catalog.json")
-
-default = "3g"
-
-if not catalog_path.exists():
-    print(default)
-    raise SystemExit
-
-catalog = json.loads(catalog_path.read_text())
-for item in catalog:
-    if str(item.get("map", "")).lower() == target:
-        mem = item.get("resources", {}).get("limits", {}).get("memory", "")
-        if mem:
-            print(mem.replace("Gi", "g").replace("G", "g"))
-            raise SystemExit
-
-print(default)
-PY
-}
-
-MEMORY="$(memory_for_map "$MAP_NAME")"
+MEMORY="$(effective_memory_for_map "$MAP_NAME" "$PARTITION_ID")"
 mapfile -t SIETCH_RUNTIME_ARGS < <(runtime/scripts/sietches.sh runtime-args "$MAP_NAME" "$PARTITION_ID" 2>/dev/null || true)
 mapfile -t LOG_RUNTIME_ARGS < <(full_stdout_log_args)
+
+# GHSA-fc89-h24v-6j3x (issue #252): move ServerLoginPassword/ServerPassword
+# from docker run positional arguments to environment variables -- see
+# sietch-login-password-args.sh for the full rationale and the shared
+# implementation used identically by all three launcher scripts.
+declare -a SIETCH_LOGIN_PASSWORD_ARGS
+declare -a SIETCH_RUNTIME_ARGS_FILTERED
+sietch_login_password_docker_args SIETCH_RUNTIME_ARGS SIETCH_LOGIN_PASSWORD_ARGS SIETCH_RUNTIME_ARGS_FILTERED
+SIETCH_RUNTIME_ARGS=("${SIETCH_RUNTIME_ARGS_FILTERED[@]}")
+
 if [ "$MAP_NAME" = "Survival_1" ]; then
   if [ "$DIMENSION_INDEX" -eq 0 ]; then
     SERVER_INDEX=1
@@ -440,7 +440,9 @@ port_is_free() {
   local port="$1"
   local db_in_use
 
-  cleanup_port_reservations
+  if [ "$PORT_RESERVATIONS_CLEANED" -eq 0 ]; then
+    cleanup_port_reservations
+  fi
 
   db_in_use="$(psql_value "
     select count(*)
@@ -460,7 +462,9 @@ port_is_free() {
     return 1
   fi
 
-  ! ss -lnup 2>/dev/null | grep -q ":$port "
+  local sockets
+  sockets="$(ss -lnup 2>/dev/null || true)"
+  ! grep -q ":$port " <<<"$sockets"
 }
 
 pick_port() {
@@ -530,6 +534,8 @@ else
 fi
 
 reserve_port_pair "$CONTAINER_NAME" "$GAME_PORT" "$IGW_PORT"
+flock -u 9 || true
+exec 9>&- || true
 
 echo "Spawning dedicated server:"
 echo "  map:        $MAP_NAME"
@@ -543,41 +549,38 @@ echo "  igw port:   $IGW_PORT"
 echo "  container:  $CONTAINER_NAME"
 echo
 
-mkdir -p "runtime/game/$safe_name/Saved"
 mkdir -p runtime/game/artifacts
-mkdir -p "$FAKE_K8S_SERVICEACCOUNT_DIR"
 mkdir -p runtime/container
-python3 runtime/scripts/usersettings.py materialize "$MAP_NAME" "$PWD/runtime/game/$safe_name/Saved" "$PARTITION_ID"
 purge_stale_farm_rows_for_map "$MAP_NAME"
+runtime/scripts/network-addresses.sh reconcile >/dev/null 2>&1 || true
+prepare_fake_k8s_serviceaccount "$FAKE_K8S_SERVICEACCOUNT_DIR" "funcom-seabass-$BATTLEGROUP_ID"
 
-cat > "$FAKE_K8S_SERVICEACCOUNT_DIR/namespace" <<EOF
-funcom-seabass-$BATTLEGROUP_ID
-EOF
-cat > "$FAKE_K8S_SERVICEACCOUNT_DIR/token" <<'EOF'
-fake-token
-EOF
-: > "$FAKE_K8S_SERVICEACCOUNT_DIR/ca.crt"
-chmod -R 755 "$FAKE_K8S_SERVICEACCOUNT_DIR"
+remove_existing_game_container "$CONTAINER_NAME"
+runtime/scripts/repair-map-settings-permissions.sh "$safe_name"
+python3 runtime/scripts/usersettings.py materialize "$MAP_NAME" "$PWD/runtime/game/$safe_name/Saved" "$PARTITION_ID"
+ensure_host_latency_tuned
+mapfile -t MEMORY_SWAP_ARGS < <(memory_swap_docker_args "$MEMORY")
+mapfile -t GAME_CONTAINER_SECURITY_ARGS < <(game_container_security_args)
+GAME_SECRET_ENV_FILE="$(prepare_game_container_secret_file "$safe_name")"
 
-engine rm -f "$CONTAINER_NAME" 2>/dev/null || true
-
-engine run -d \
+docker run -d \
+  "${DUNE_DOCKER_LOG_ARGS[@]}" \
   --name "$CONTAINER_NAME" \
   --network host \
   --restart unless-stopped \
-  --privileged \
-  --cap-add SYS_ADMIN \
-  --security-opt seccomp=unconfined \
+  "${GAME_CONTAINER_SECURITY_ARGS[@]}" \
   --memory "$MEMORY" \
+  "${MEMORY_SWAP_ARGS[@]}" \
   --memory-reservation "$MEMORY" \
-  -v "$PWD/runtime/game/$safe_name/Saved:/home/dune/server/DuneSandbox/Saved" \
-  -v "$PWD/runtime/game/artifacts:/home/dune/artifacts" \
-  -v "$PWD/runtime/container:/opt/dune-local:ro" \
-  -v "$FAKE_K8S_SERVICEACCOUNT_DIR:/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$(host_path "$PWD/runtime/game/$safe_name/Saved"):/home/dune/server/DuneSandbox/Saved" \
+  -v "$(host_path "$PWD/runtime/game/artifacts"):/home/dune/artifacts" \
+  -v "$(host_path "$PWD/runtime/container"):/opt/dune-local:ro" \
+  -v "$(host_path "$FAKE_K8S_SERVICEACCOUNT_DIR"):/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$(host_path "$GAME_SECRET_ENV_FILE"):/run/secrets/dune-game-env:ro" \
   -e "POD_UID=docker-$safe_name" \
   -e "POD_NAME=${BATTLEGROUP_ID}-sg-${safe_name}-pod-${PARTITION_ID}" \
   -e "POD_IP=$MULTIHOME_IP" \
-  -e "EXTERNAL_ADDRESS_OVERRIDE=$SERVER_IP" \
+  "${GAME_EXTERNAL_ADDRESS_ENV[@]}" \
   -e "NODE_NAME=$(hostname)" \
   -e "SERVER_INDEX=$SERVER_INDEX" \
   -e "FARM_NAME=$BATTLEGROUP_ID" \
@@ -586,40 +589,8 @@ engine run -d \
   -e "BATTLEGROUP_DISPLAY_NAME=$BATTLEGROUP_ID" \
   -e "BATTLEGROUP_TITLE=$SERVER_TITLE" \
   -e "FC_CRASHREPORTER_LOGS=/home/dune/server/DuneSandbox/Saved/CrashReporterLogs" \
-  -e "FuncomLiveServices__ServiceAuthToken=$FUNCOM_TOKEN" \
   -e "FuncomLiveServices__RmqTlsEnabled=true" \
-  -e "RMQ_HTTP_TOKEN_AUTH_SECRET=$RMQ_HTTP_TOKEN_AUTH_SECRET" \
-  -e "DUNE_SERVER_LOGIN_PASSWORD_SECRET=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "DUNE_USERNAME_SERVER_LOGIN_SECRET=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "DUNE_LOGIN_PASSWORD_SKEW_SECONDS=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "ServerLoginPasswordSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "UsernameServerLoginSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "LoginPasswordSkew=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "BackendLoginConfiguration__ServerLoginPasswordSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "BackendLoginConfiguration__UsernameServerLoginSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "BackendLoginConfiguration__LoginPasswordSkew=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET" \
-  -e "BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginPasswordSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__UsernameServerLoginSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__LoginPasswordSkew=$LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginPasswordSecretEnvironmentVariable=DUNE_SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__UsernameServerLoginSecretEnvironmentVariable=DUNE_USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__LoginPasswordSkewEnvironmentVariable=DUNE_LOGIN_PASSWORD_SKEW_SECONDS" \
-  -e "Secret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "UsernameSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "ServerLoginSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "ChecksumSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "BackendLoginConfiguration__Secret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "BackendLoginConfiguration__UsernameSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "BackendLoginConfiguration__ServerLoginSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "BackendLoginConfiguration__ChecksumSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__Secret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__UsernameSecret=$USERNAME_SERVER_LOGIN_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__ServerLoginSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "AuthenticationConfiguration__BackendLoginConfiguration__ChecksumSecret=$SERVER_LOGIN_PASSWORD_SECRET" \
-  -e "fls-apikey=$FLS_APIKEY" \
+  "${SIETCH_LOGIN_PASSWORD_ARGS[@]}" \
   "$IMAGE" \
   /opt/dune-local/run-server.sh \
   "$MAP_NAME" \
@@ -629,31 +600,34 @@ engine run -d \
   "ServerName=$BATTLEGROUP_ID" \
   "-MultiHome=$MULTIHOME_IP" \
   -DatabaseName=dune \
-  -DatabaseHost=127.0.0.1:15432 \
+  "-DatabaseHost=127.0.0.1:${POSTGRES_PORT}" \
   -DatabaseUser=dune \
-  -DatabasePassword=dune \
+  "-DatabasePassword=$DUNE_DB_PASSWORD" \
   "-PartitionIndex=$PARTITION_ID" \
   "-ini:engine:[URL]:Port=$GAME_PORT" \
   "-ini:engine:[URL]:IGWPort=$IGW_PORT" \
-  -battlegroup-director-url=127.0.0.1:11717 \
-  --RMQGameHostname=127.0.0.1 \
-  --RMQGamePort=31982 \
-  --RMQAdminHostname=127.0.0.1 \
-  --RMQAdminPort=32573 \
+  "-battlegroup-director-url=127.0.0.1:${DIRECTOR_PORT}" \
+  "--RMQGameHostname=$RMQ_GAME_HOST" \
+  "--RMQGamePort=${RMQ_GAME_PORT}" \
+  "--RMQAdminHostname=$RMQ_ADMIN_HOST" \
+  "--RMQAdminPort=${RMQ_ADMIN_PORT}" \
   "${SIETCH_RUNTIME_ARGS[@]}" \
   "${LOG_RUNTIME_ARGS[@]}"
 
+prune_legacy_fake_k8s_serviceaccounts
+
 sleep 5
 
-engine ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+docker ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
 echo
 echo "Watch logs with:"
-echo "  podman logs -f $CONTAINER_NAME"
+echo "  docker logs -f $CONTAINER_NAME"
 
 if live_server_id="$(bind_partition_to_live_server "$PARTITION_ID" "$MAP_NAME" "$GAME_PORT" "$IGW_PORT" 15 2)"; then
   echo "Bound partition $PARTITION_ID to warming server_id: $live_server_id"
 fi
+runtime/scripts/network-addresses.sh reconcile >/dev/null 2>&1 || true
 
 if [ "$MAP_NAME" = "Survival_1" ]; then
   runtime/scripts/sietches.sh sync >/dev/null 2>&1 || true
@@ -662,6 +636,46 @@ fi
 
 if [ "$MAP_NAME" = "DeepDesert_1" ] && [ -x runtime/scripts/publish-deepdesert-state.sh ]; then
   runtime/scripts/publish-deepdesert-state.sh once >/dev/null 2>&1 || true
+  runtime/scripts/publish-deepdesert-overrides.sh once >/dev/null 2>&1 || true
+fi
+
+if [ "$MAP_NAME" != "Survival_1" ]; then
+  if [ "${DUNE_SYNC_NETWORK_STATE_AFTER_SPAWN:-0}" = "1" ]; then
+    runtime/scripts/publish-network-server-state-overrides.sh map "$MAP_NAME" >/dev/null 2>&1 || true
+  elif pgrep -f "publish-network-server-state-overrides.sh loop" >/dev/null 2>&1; then
+    timeout 20 runtime/scripts/publish-network-server-state-overrides.sh map "$MAP_NAME" >/dev/null 2>&1 || true
+  else
+    (
+      trap - EXIT
+      attempts="${DUNE_DYNAMIC_MAP_STATE_PUBLISH_ATTEMPTS:-12}"
+      interval="${DUNE_DYNAMIC_MAP_STATE_PUBLISH_INTERVAL_SECONDS:-10}"
+      ready_seen=0
+
+      for attempt in $(seq 1 "$attempts"); do
+        timeout 20 runtime/scripts/publish-network-server-state-overrides.sh map "$MAP_NAME" >/dev/null 2>&1 || true
+
+        if [ "$ready_seen" = "1" ]; then
+          break
+        fi
+
+        if dune_psql -Atc "
+          select exists (
+            select 1
+            from dune.world_partition wp
+            join dune.farm_state fs on fs.server_id = wp.server_id
+            where wp.map = '${MAP_NAME//\'/\'\'}'
+              and coalesce(wp.server_id, '') <> ''
+              and fs.ready = true
+              and fs.alive = true
+          );
+        " 2>/dev/null | grep -qx t; then
+          ready_seen=1
+        fi
+
+        sleep "$interval"
+      done
+    ) >/dev/null 2>&1 &
+  fi
 fi
 
 SPAWN_SUCCESS=1

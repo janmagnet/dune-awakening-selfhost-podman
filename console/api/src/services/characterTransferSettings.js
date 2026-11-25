@@ -1,0 +1,262 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+
+export const incomingCharacterTransferPolicies = [
+  { value: 0, label: "Accept All Incoming" },
+  { value: 10, label: "Deny All Incoming" },
+  { value: 20, label: "Accept Incoming From Private" },
+  { value: 30, label: "Accept Incoming From Official" }
+];
+
+export const characterTransferDefaults = Object.freeze({
+  ShouldDeleteOriginCharactersDuringTransfers: true,
+  AcceptOutgoingCharacterTransfers: true,
+  IncomingCharacterTransfers: 0,
+  ExportCharacterTimeout: 900,
+  ImportCharacterTimeout: 900,
+  FreeToTransferCharactersFrom: true,
+  FreeToTransferCharactersTo: true,
+  ValidateBeforeImportCharacterTimeout: 180,
+  ForceIsWorldClosed: false,
+  ForceIsWorldClosingSoon: false
+});
+
+const booleanKeys = new Set([
+  "ShouldDeleteOriginCharactersDuringTransfers",
+  "AcceptOutgoingCharacterTransfers",
+  "FreeToTransferCharactersFrom",
+  "FreeToTransferCharactersTo",
+  "ForceIsWorldClosed",
+  "ForceIsWorldClosingSoon"
+]);
+
+const integerKeys = new Set([
+  "IncomingCharacterTransfers",
+  "ExportCharacterTimeout",
+  "ImportCharacterTimeout",
+  "ValidateBeforeImportCharacterTimeout"
+]);
+
+const transferKeys = Object.keys(characterTransferDefaults);
+const transferKeySet = new Set(transferKeys);
+const incomingPolicyValues = new Set(incomingCharacterTransferPolicies.map((entry) => entry.value));
+const pendingSaves = new Set();
+
+async function directorTransferRequest(config, endpoint, settings, options) {
+  const port = config.ports?.director;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Director port is unavailable.");
+  const response = await (options.fetchImpl || fetch)(`http://127.0.0.1:${port}/v0/${endpoint}`, {
+    method: settings ? "POST" : "GET",
+    headers: settings ? { "Content-Type": "application/json" } : undefined,
+    body: settings ? JSON.stringify(settings) : undefined,
+    redirect: "error",
+    signal: AbortSignal.timeout(5000)
+  });
+  if (!response.ok) throw new Error("Director rejected the request.");
+  if (settings) return;
+  const body = await response.json();
+  const normalized = {};
+  for (const key of transferKeys) {
+    const camel = key[0].toLowerCase() + key.slice(1);
+    if (!body.config || (!Object.hasOwn(body.config, camel) && !Object.hasOwn(body.config, key))) throw new Error("Director returned incomplete settings.");
+    normalized[key] = body.config?.[camel] ?? body.config?.[key];
+  }
+  return validateCharacterTransferSettings(normalized);
+}
+
+export async function readCharacterTransferSettingsStatus(config, options = {}) {
+  const result = readCharacterTransferSettings(config);
+  try {
+    const effective = await directorTransferRequest(config, "BattlegroupFetchCharacterTransferRules", null, options);
+    return { ...result, applied: transferKeys.every((key) => effective[key] === result.settings[key]) };
+  } catch {
+    return { ...result, applied: null };
+  }
+}
+
+export async function saveAndApplyCharacterTransferSettings(config, payload, options = {}) {
+  const lock = characterTransferSettingsPath(config);
+  if (pendingSaves.has(lock)) {
+    const error = new Error("Character transfer settings are already being saved. Please retry shortly.");
+    error.statusCode = 409;
+    throw error;
+  }
+  pendingSaves.add(lock);
+  try {
+    const result = saveCharacterTransferSettings(config, payload, options);
+    try {
+      await directorTransferRequest(config, "BattlegroupUpdateCharacterTransferSettings", result.settings, options);
+      const effective = await directorTransferRequest(config, "BattlegroupFetchCharacterTransferRules", null, options);
+      if (!transferKeys.every((key) => effective[key] === result.settings[key])) throw new Error("Settings differ.");
+      return { ...result, applied: true };
+    } catch {
+      const error = new Error("Settings were saved, but Director did not confirm live application. No services were restarted. Retry Save when Director is available.");
+      error.statusCode = 503;
+      throw error;
+    }
+  } finally {
+    pendingSaves.delete(lock);
+  }
+}
+
+export function characterTransferSettingsPath(config) {
+  return resolve(config.repoRoot, "runtime/generated/director-character-transfer.ini");
+}
+
+export function readCharacterTransferSettings(config) {
+  const path = characterTransferSettingsPath(config);
+  const source = existsSync(path) ? readFileSync(path, "utf8") : "";
+  const parsed = parseCharacterTransferSettings(source);
+  const settings = { ...characterTransferDefaults, ...parsed.settings };
+  return {
+    settings,
+    defaults: characterTransferDefaults,
+    policies: incomingCharacterTransferPolicies,
+    path,
+    customized: Boolean(source.trim())
+  };
+}
+
+export function saveCharacterTransferSettings(config, payload, options = {}) {
+  const settings = options.defaults ? characterTransferDefaults : validateCharacterTransferSettings(payload);
+  const path = characterTransferSettingsPath(config);
+  const previous = existsSync(path) ? readFileSync(path, "utf8") : "";
+  const next = writeCharacterTransferSettingsText(previous, settings);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, next);
+  return { settings, path };
+}
+
+export function validateCharacterTransferSettings(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw badRequest("Character transfer settings are required.");
+  }
+  const out = {};
+  for (const key of transferKeys) {
+    if (!Object.hasOwn(payload, key)) throw badRequest(`${key} is required.`);
+    if (booleanKeys.has(key)) {
+      if (typeof payload[key] !== "boolean") throw badRequest(`${key} must be true or false.`);
+      out[key] = payload[key];
+      continue;
+    }
+    if (integerKeys.has(key)) {
+      out[key] = validatePositiveInteger(key, payload[key]);
+      continue;
+    }
+  }
+  if (!incomingPolicyValues.has(out.IncomingCharacterTransfers)) {
+    throw badRequest("IncomingCharacterTransfers must be one of 0, 10, 20, or 30.");
+  }
+  return out;
+}
+
+export function parseCharacterTransferSettings(text) {
+  const settings = {};
+  const lines = String(text || "").split(/\r?\n/);
+  let activeSection = "";
+  let sawSection = false;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const section = line.match(/^\[([^\]]+)\]$/);
+    if (section) {
+      sawSection = true;
+      activeSection = section[1].trim();
+      continue;
+    }
+    if (sawSection && activeSection.toLowerCase() !== "battlegroup") continue;
+    if (!line || line.startsWith(";") || line.startsWith("#")) continue;
+    const match = line.match(/^([^=]+)=(.*)$/);
+    if (!match) continue;
+    const key = match[1].trim();
+    if (!transferKeySet.has(key)) continue;
+    settings[key] = parseTransferValue(key, match[2].trim());
+  }
+  return { settings };
+}
+
+export function writeCharacterTransferSettingsText(existingText, settings) {
+  const values = validateCharacterTransferSettings(settings);
+  const lines = String(existingText || "").split(/\r?\n/);
+  const output = [];
+  const written = new Set();
+  let activeSection = "";
+  let sawSection = false;
+  let insertedBeforeNextSection = false;
+
+  for (const rawLine of lines) {
+    const section = rawLine.trim().match(/^\[([^\]]+)\]$/);
+    if (section) {
+      if (sawSection && activeSection.toLowerCase() === "battlegroup" && !insertedBeforeNextSection) {
+        appendMissingTransferLines(output, values, written);
+        insertedBeforeNextSection = true;
+      }
+      sawSection = true;
+      activeSection = section[1].trim();
+      output.push(rawLine);
+      continue;
+    }
+
+    const match = rawLine.match(/^(\s*)([^=;\s#][^=]*?)(\s*)=(.*)$/);
+    if (match && (!sawSection || activeSection.toLowerCase() === "battlegroup")) {
+      const key = match[2].trim();
+      if (transferKeySet.has(key)) {
+        output.push(`${match[1]}${key}${match[3]}=${formatTransferValue(values[key])}`);
+        written.add(key);
+        continue;
+      }
+    }
+    if (rawLine !== "" || output.length) output.push(rawLine);
+  }
+
+  if (sawSection && activeSection.toLowerCase() === "battlegroup" && !insertedBeforeNextSection) {
+    appendMissingTransferLines(output, values, written);
+  } else if (!sawSection) {
+    appendMissingTransferLines(output, values, written);
+  } else if (!insertedBeforeNextSection) {
+    if (output.length && output[output.length - 1] !== "") output.push("");
+    output.push("[Battlegroup]");
+    appendMissingTransferLines(output, values, written);
+  }
+
+  return `${trimTrailingBlankLines(output).join("\n")}\n`;
+}
+
+function appendMissingTransferLines(output, values, written) {
+  for (const key of transferKeys) {
+    if (written.has(key)) continue;
+    output.push(`${key}=${formatTransferValue(values[key])}`);
+    written.add(key);
+  }
+}
+
+function parseTransferValue(key, value) {
+  if (booleanKeys.has(key)) return /^true$/i.test(value);
+  if (integerKeys.has(key)) return Number(value);
+  return value;
+}
+
+function formatTransferValue(value) {
+  if (typeof value === "boolean") return value ? "true" : "false";
+  return String(value);
+}
+
+function validatePositiveInteger(key, value) {
+  const number = typeof value === "number" ? value : Number(String(value || "").trim());
+  const minimum = key === "IncomingCharacterTransfers" ? 0 : 1;
+  if (!Number.isInteger(number) || number < minimum || number > 86400) {
+    throw badRequest(`${key} must be a safe positive integer in seconds.`);
+  }
+  return number;
+}
+
+function trimTrailingBlankLines(lines) {
+  const next = [...lines];
+  while (next.length && next[next.length - 1] === "") next.pop();
+  return next;
+}
+
+function badRequest(message) {
+  const error = new Error(message);
+  error.statusCode = 400;
+  return error;
+}

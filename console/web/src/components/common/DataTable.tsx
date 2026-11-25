@@ -1,0 +1,174 @@
+import { Fragment, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { formatCell, friendlyColumnName } from "../../lib/display";
+
+export type SortDirection = "asc" | "desc";
+type SortState = { column: string; direction: SortDirection };
+
+export function compareTableValues(a: unknown, b: unknown, direction: SortDirection) {
+  const aNum = Number(a);
+  const bNum = Number(b);
+  const bothNumeric = a !== null && a !== undefined && a !== "" && b !== null && b !== undefined && b !== "" && !Number.isNaN(aNum) && !Number.isNaN(bNum);
+  const result = bothNumeric ? aNum - bNum : String(a ?? "").localeCompare(String(b ?? ""), undefined, { sensitivity: "base" });
+  return direction === "asc" ? result : -result;
+}
+
+export function useSortState() {
+  const [sort, setSort] = useState<SortState | null>(null);
+  function onSort(column: string) {
+    setSort((current) => (current?.column === column ? { column, direction: current.direction === "asc" ? "desc" : "asc" } : { column, direction: "asc" }));
+  }
+  return { sortColumn: sort?.column, sortDirection: sort?.direction, onSort, reset: () => setSort(null) };
+}
+
+export function useSortableRows<T extends Record<string, unknown>>(rows: T[]) {
+  const sortState = useSortState();
+  const sortedRows = sortState.sortColumn ? [...rows].sort((a, b) => compareTableValues(a[sortState.sortColumn!], b[sortState.sortColumn!], sortState.sortDirection!)) : rows;
+  return { ...sortState, sortedRows };
+}
+
+const MIN_COLUMN_WIDTH = 60;
+
+export function useResizableColumns(enabled = true) {
+  const [colWidths, setColWidths] = useState<Record<string, number>>({});
+  const resizeState = useRef<{ column: string; startX: number; startWidth: number } | null>(null);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    function onMouseMove(event: MouseEvent) {
+      const state = resizeState.current;
+      if (!state) return;
+      const width = Math.max(MIN_COLUMN_WIDTH, state.startWidth + (event.clientX - state.startX));
+      setColWidths((current) => ({ ...current, [state.column]: width }));
+    }
+    function onMouseUp() {
+      if (!resizeState.current) return;
+      resizeState.current = null;
+      document.body.classList.remove("col-resizing");
+    }
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [enabled]);
+
+  function startResize(event: ReactMouseEvent<HTMLSpanElement>, column: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    const th = event.currentTarget.parentElement as HTMLTableCellElement;
+    resizeState.current = { column, startX: event.clientX, startWidth: th.offsetWidth };
+    document.body.classList.add("col-resizing");
+  }
+
+  function columnStyle(column: string) {
+    return colWidths[column] ? { width: colWidths[column], minWidth: colWidths[column], maxWidth: colWidths[column] } : undefined;
+  }
+
+  function resizeHandle(column: string) {
+    return <span className="col-resize-handle" onMouseDown={(event) => startResize(event, column)} onClick={(event) => event.stopPropagation()} />;
+  }
+
+  return { columnStyle, resizeHandle };
+}
+
+type DataTableProps = {
+  rows: Record<string, unknown>[];
+  columns?: string[];
+  columnLabels?: Record<string, string>;
+  onRowClick?: (row: Record<string, unknown>) => void;
+  action?: (row: Record<string, unknown>) => ReactNode;
+  actionClassName?: string;
+  secondaryAction?: (row: Record<string, unknown>) => ReactNode;
+  secondaryActionLabel?: ReactNode;
+  secondaryActionClassName?: string;
+  secondaryActionPosition?: "start" | "end";
+  tableClassName?: string;
+  // Extra class on the scroll container. Lets a panel opt out of the shared
+  // max-height cap without changing it for every table.
+  wrapClassName?: string;
+  renderCell?: (row: Record<string, unknown>, column: string) => ReactNode;
+  emptyMessage?: string;
+  sortColumn?: string;
+  sortDirection?: SortDirection;
+  onSort?: (column: string) => void;
+  nonSortableColumns?: string[];
+  resizableColumns?: boolean;
+  headerTitles?: boolean;
+  isRowExpanded?: (row: Record<string, unknown>) => boolean;
+  renderExpandedRow?: (row: Record<string, unknown>) => ReactNode;
+  // A second, optional row rendered between the clicked row and the main
+  // expanded row (inline placement only), in its own <tr> rather than nested
+  // inside the main expanded row's <td>. Exists so a consumer can make it
+  // sticky: `position: sticky` on a element nested inside a <td> does not
+  // reliably hold in table layout once scrolled past, but the same
+  // declaration on a <tr> itself does -- verified live. Kept as its own prop
+  // rather than folding into renderExpandedRow's return value because a
+  // <td> cannot contain <tr> children; DataTable owns the row/cell wrapper.
+  renderExpandedSticky?: (row: Record<string, unknown>) => ReactNode;
+  expandedRowPlacement?: "inline" | "after-table";
+  rowKey?: (row: Record<string, unknown>) => string | number;
+};
+
+export function DataTable({
+  rows,
+  columns,
+  columnLabels = {},
+  onRowClick,
+  action,
+  actionClassName = "",
+  secondaryAction,
+  secondaryActionLabel = "Action",
+  secondaryActionClassName = "",
+  secondaryActionPosition = "end",
+  tableClassName = "",
+  wrapClassName = "",
+  renderCell,
+  emptyMessage = "No rows.",
+  sortColumn,
+  sortDirection,
+  onSort,
+  nonSortableColumns = [],
+  resizableColumns = false,
+  headerTitles = false,
+  isRowExpanded,
+  renderExpandedRow,
+  renderExpandedSticky,
+  expandedRowPlacement = "inline",
+  rowKey
+}: DataTableProps) {
+  const resize = useResizableColumns(resizableColumns);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const tableRef = useRef<HTMLTableElement>(null);
+  const [horizontalOverflow, setHorizontalOverflow] = useState(false);
+  const hasRows = rows.length > 0;
+
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    const table = tableRef.current;
+    if (!wrap || !table) return;
+    const measure = () => setHorizontalOverflow(table.scrollWidth > wrap.clientWidth + 1);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(wrap);
+    observer.observe(table);
+    return () => observer.disconnect();
+  }, [hasRows]);
+
+  const cols = columns?.length ? columns : Array.from(new Set(rows.flatMap((row) => Object.keys(row)))).slice(0, 8);
+  if (!rows.length) return <div className="empty">{emptyMessage}</div>;
+  const colStyle = (col: string) => resizableColumns ? resize.columnStyle(col) : undefined;
+  const totalColumns = cols.length + (action ? 1 : 0) + (secondaryAction ? 1 : 0);
+  const expandedAfterTable = expandedRowPlacement === "after-table"
+    ? rows.find((row) => isRowExpanded?.(row))
+    : undefined;
+  const leadingSecondaryHeader = secondaryAction && secondaryActionPosition === "start" ? <th className={secondaryActionClassName}>{secondaryActionLabel}</th> : null;
+  const trailingSecondaryHeader = secondaryAction && secondaryActionPosition === "end" ? <th className={secondaryActionClassName}>{secondaryActionLabel}</th> : null;
+  return <>
+    <div ref={wrapRef} className={`table-wrap${wrapClassName ? ` ${wrapClassName}` : ""}${horizontalOverflow ? " has-horizontal-overflow" : ""}${expandedAfterTable ? " has-expanded-row-after-table" : ""}`} role="region" aria-label="Scrollable data table" tabIndex={0}>
+      <table ref={tableRef} className={`data-table ${tableClassName}`.trim()}><thead><tr>{leadingSecondaryHeader}{cols.map((col) => { const sortable = onSort && !nonSortableColumns.includes(col); const label = columnLabels[col] || friendlyColumnName(col); return <th key={col} data-column={col} className={sortable ? "sortable" : ""} style={colStyle(col)} title={headerTitles ? label : undefined} onClick={sortable ? () => onSort?.(col) : undefined}>{label}{sortable && sortColumn === col && <span className="sort-indicator">{sortDirection === "desc" ? " ↓" : " ↑"}</span>}{resizableColumns && resize.resizeHandle(col)}</th>; })}{action && <th className={actionClassName}>Actions</th>}{trailingSecondaryHeader}</tr></thead><tbody>{rows.map((row, index) => <Fragment key={rowKey ? rowKey(row) : index}><tr onClick={() => onRowClick?.(row)} className={`${onRowClick ? "clickable" : ""}${isRowExpanded?.(row) ? " row-expanded" : ""}`}>{secondaryAction && secondaryActionPosition === "start" && <td className={secondaryActionClassName}>{secondaryAction(row)}</td>}{cols.map((col) => { const label = columnLabels[col] || friendlyColumnName(col); return renderCell ? <td key={col} data-column={col} data-label={label} style={colStyle(col)}>{renderCell(row, col)}</td> : <td key={col} data-column={col} data-label={label} style={colStyle(col)} title={formatCell(row[col]) || undefined}>{formatCell(row[col])}</td>; })}{action && <td className={actionClassName} data-label="Actions">{action(row)}</td>}{secondaryAction && secondaryActionPosition === "end" && <td className={secondaryActionClassName}>{secondaryAction(row)}</td>}</tr>{expandedRowPlacement === "inline" && isRowExpanded?.(row) && renderExpandedSticky && <tr className="expanded-row-sticky"><td colSpan={totalColumns} className="expanded-row-cell">{renderExpandedSticky(row)}</td></tr>}{expandedRowPlacement === "inline" && isRowExpanded?.(row) && renderExpandedRow && <tr className="expanded-row"><td colSpan={totalColumns} className="expanded-row-cell">{renderExpandedRow(row)}</td></tr>}</Fragment>)}</tbody></table>
+    </div>
+    {expandedAfterTable && renderExpandedRow && <div className="expanded-row expanded-row-outside"><div className="expanded-row-cell">{renderExpandedRow(expandedAfterTable)}</div></div>}
+  </>;
+}

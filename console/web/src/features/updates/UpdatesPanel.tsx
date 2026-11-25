@@ -1,0 +1,1027 @@
+import { useEffect, useState } from "react";
+import { BookOpen, ChevronDown, ChevronUp, LogIn, LogOut, RotateCcw, ShieldCheck } from "lucide-react";
+import { fetchConsoleAuthState } from "../../api/client";
+import { setupApi, type Task } from "../../api/setup";
+import { updatesApi, type QaBuild, type QaStatus, type StackUpdateProgress as StackUpdateRunProgress } from "../../api/updates";
+import { KeyValueGrid, StatusPill } from "../../components/common/DisplayPrimitives";
+import { formatUiSentence, stripAnsi } from "../../lib/display";
+import { conciseTaskError } from "../../lib/taskDisplay";
+import {
+  canApplyUpdateStatus,
+  gameAssetsMissing,
+  gameUpdateBlockReason,
+  firstVersionMatch,
+  formatStackVersionLabel,
+  GAME_UPDATE_TASK_KEY,
+  loadPersistedUpdateTask,
+  normalizeUpdateVersion,
+  parseUpdateTask,
+  persistUpdateTask,
+  stackReleaseNotesUrl,
+  STACK_UPDATE_TASK_KEY,
+  UPDATE_RESULT_DISMISS_MS,
+  updateDisplayValue,
+  withInstalledVersion
+} from "./updateUtils";
+
+type HomeTaskResult = { status: "running" | "succeeded" | "failed" | "stopped"; title: string; message?: string; details?: string };
+const STACK_UPDATE_REFRESH_SECONDS = 5;
+const STACK_UPDATE_EXPECTED_VERSION_KEY = "arrakis.stackUpdateExpectedVersion";
+
+type UpdatesPanelProps = {
+  // Incremented by a failure elsewhere that needs the game files installed.
+  // 0 means nothing has asked, so a fresh mount never auto-starts a download.
+  installGameFilesRequest?: number;
+  onInstallGameFilesHandled?: () => void;
+  // Keeps the sidebar version badge in step with checks made here.
+  onStackStatus?: (status: Record<string, string>) => void;
+  installedConsoleVersion?: string;
+  confirmAction: (message: string) => Promise<boolean>;
+  waitForTask: (task: Task) => Promise<Task>;
+  parseKeyValueText: (text: string) => Record<string, string>;
+  formatTimerStatus: (value: string) => string;
+  commandStatusSummary: (result: { stdout?: string; stderr?: string; exitCode?: number } | null) => { status: string; reason: string };
+  taskTechnicalDetails: (task: Task) => string;
+  formatResultTitle: (value: unknown, pending?: boolean) => string;
+  formatResultMessage: (value: unknown) => string;
+};
+
+export function UpdatesPanel({
+  installGameFilesRequest = 0,
+  onInstallGameFilesHandled,
+  onStackStatus,
+  installedConsoleVersion = "",
+  confirmAction,
+  waitForTask,
+  parseKeyValueText,
+  formatTimerStatus,
+  commandStatusSummary,
+  taskTechnicalDetails,
+  formatResultTitle,
+  formatResultMessage
+}: UpdatesPanelProps) {
+  const [gameUpdateTask, setGameUpdateTask] = useState<Task | null>(() => loadPersistedUpdateTask(GAME_UPDATE_TASK_KEY));
+  const [stackUpdateTask, setStackUpdateTask] = useState<Task | null>(() => loadPersistedUpdateTask(STACK_UPDATE_TASK_KEY));
+  const [gameStatus, setGameStatus] = useState<Record<string, string>>(() => gameUpdateTask && !isTerminalTask(gameUpdateTask.status) ? { status: "Updating", current: "", latest: "", reason: "Game update is running." } : { status: "Not checked", current: "", latest: "", reason: "" });
+  const [stackStatus, setStackStatus] = useState<Record<string, string>>(() => stackUpdateTask && !isTerminalTask(stackUpdateTask.status) ? { status: "Updating", current: "", latest: "", reason: "Console update is running." } : { status: "Not checked", current: "", latest: "", reason: "" });
+  const [gameSteamcmdFixTask, setGameSteamcmdFixTask] = useState<Task | null>(null);
+  const [autoGame, setAutoGame] = useState<{ stdout?: string; stderr?: string; exitCode?: number } | null>(null);
+  const [autoGameOpen, setAutoGameOpen] = useState(false);
+  const [autoGameLoading, setAutoGameLoading] = useState(true);
+  const [autoGameEnabled, setAutoGameEnabled] = useState(false);
+  const [autoGameIntervalMinutes, setAutoGameIntervalMinutes] = useState("60");
+  const [autoGameApplyEnabled, setAutoGameApplyEnabled] = useState(true);
+  const [autoGameNotifyEnabled, setAutoGameNotifyEnabled] = useState(true);
+  const [autoGameNotifyMinutes, setAutoGameNotifyMinutes] = useState("15, 10, 5, 1");
+  const [autoGameWaitUntilEmpty, setAutoGameWaitUntilEmpty] = useState(false);
+  const [autoGameMaxWaitMinutes, setAutoGameMaxWaitMinutes] = useState("360");
+  const [autoGameUpdateConsole, setAutoGameUpdateConsole] = useState(false);
+  const [autoGameManageTanks, setAutoGameManageTanks] = useState(false);
+  const [autoGameResult, setAutoGameResult] = useState<HomeTaskResult | null>(null);
+  const [stackUpdateNow, setStackUpdateNow] = useState(() => Date.now());
+  const [stackUpdateExpectedVersion, setStackUpdateExpectedVersion] = useState(() => loadStackUpdateExpectedVersion());
+  const [stackUpdateReadyAt, setStackUpdateReadyAt] = useState<number | null>(null);
+  const [stackHelperProgress, setStackHelperProgress] = useState<StackUpdateRunProgress | null>(null);
+  const [qaStatus, setQaStatus] = useState<QaStatus | null>(null);
+  const [qaBuild, setQaBuild] = useState<QaBuild | null>(null);
+  const [qaBusy, setQaBusy] = useState(false);
+  const [qaError, setQaError] = useState("");
+  const autoGameValues = parseKeyValueText(autoGame?.stdout || "");
+  const autoGameTimerValue = autoGameValues.systemd_timer || "";
+  const autoGameTimerLabel = autoGameTimerValue ? formatTimerStatus(autoGameTimerValue) : "Not Installed";
+  const autoGameTimerReady = /^(active|enabled)$/i.test(autoGameTimerValue);
+  const autoGameSaving = autoGameResult?.status === "running";
+  const autoGameLoaded = Boolean(autoGame);
+  const autoGameDisplayActive = autoGameEnabled;
+  const autoGameStatusLabel = !autoGameLoaded && !autoGameSaving ? "Checking" : autoGameDisplayActive ? "Enabled" : "Disabled";
+  const autoGameDisplayTimerLabel = !autoGameLoaded && !autoGameSaving ? "Checking" : autoGameSaving ? autoGameEnabled ? "Activating" : "Deactivating" : autoGameEnabled ? autoGameTimerLabel : "Inactive";
+
+  async function checkGame(options: { fresh?: boolean } = {}) {
+    setGameStatus({ status: "Checking...", current: "", latest: "", reason: "" });
+    const final = await waitForTask((await updatesApi.checkGame(options)).task);
+    setGameStatus(parseUpdateTask(final));
+  }
+
+  async function refreshGameStatus(options: { fresh?: boolean } = {}) {
+    try {
+      await checkGame(options);
+    } catch (error) {
+      setGameStatus({ status: "Check Failed", current: "", latest: "", reason: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  async function checkStack() {
+    setStackStatus({ status: "Checking...", current: "", latest: "", reason: "" });
+    const final = await waitForTask((await updatesApi.checkStack()).task);
+    const parsed = parseUpdateTask(final);
+    setStackStatus(parsed);
+    if (parsed.current || parsed.latest) onStackStatus?.(parsed);
+  }
+
+  async function refreshStackStatus() {
+    try {
+      await checkStack();
+    } catch (error) {
+      setStackStatus({ status: "Check Failed", current: "", latest: "", reason: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  async function applyGameUpdate() {
+    if (!(await confirmAction("Apply the game server update now?"))) return;
+    setGameSteamcmdFixTask(null);
+    const response = await updatesApi.applyGame();
+    setGameUpdateTask(response.task);
+    persistUpdateTask(GAME_UPDATE_TASK_KEY, response.task);
+    setGameStatus((current) => ({ ...current, status: "Updating", reason: "Game update is running." }));
+  }
+
+  async function installGameAssets() {
+    if (!(await confirmAction(
+      "Download and install the game files now? This is several GB and can take a long time. It installs game files and images only -- the database is not touched."
+    ))) return;
+    setGameSteamcmdFixTask(null);
+    const response = await updatesApi.installAssets();
+    setGameUpdateTask(response.task);
+    persistUpdateTask(GAME_UPDATE_TASK_KEY, response.task);
+    setGameStatus((current) => ({ ...current, status: "Installing", reason: "Installing game files." }));
+  }
+
+  async function fixSteamcmd() {
+    const response = await updatesApi.fixSteamcmd();
+    setGameSteamcmdFixTask(response.task);
+    await waitForTaskWithUpdates(response.task, setGameSteamcmdFixTask);
+  }
+
+  async function confirmConsoleUpdate(message: string) {
+    try {
+      const state = await fetchConsoleAuthState();
+      const warning = state?.config?.consoleAccessReviewRequired
+        ? "\n\nConsole IP restrictions await confirmation. This update preserves current access; review the restrictions in Settings before activating them. Keep SSH access available for recovery."
+        : "";
+      return await confirmAction(message + warning);
+    } catch (error) {
+      setStackStatus((current) => ({ ...current, status: "Check Failed", reason: error instanceof Error ? error.message : String(error) }));
+      return false;
+    }
+  }
+
+  async function applyStackUpdate() {
+    if (!(await confirmConsoleUpdate("Apply the latest console update now?"))) return;
+    const expectedVersion = String(stackStatus.latest || "").trim();
+    saveStackUpdateExpectedVersion(expectedVersion);
+    setStackUpdateExpectedVersion(expectedVersion);
+    setStackUpdateReadyAt(null);
+    setStackHelperProgress(null);
+    const response = await updatesApi.applyStack();
+    setStackUpdateTask(response.task);
+    persistUpdateTask(STACK_UPDATE_TASK_KEY, response.task);
+    setStackStatus((current) => ({ ...current, status: "Updating", reason: "Console update is running." }));
+  }
+
+  async function loadQaStatus(refresh = false) {
+    const next = await updatesApi.qaStatus(refresh);
+    setQaStatus(next);
+    if (next.authenticated) setQaBuild(await updatesApi.qaBuild());
+    else setQaBuild(null);
+    return next;
+  }
+
+  async function loginQa() {
+    const popup = window.open("about:blank", "dune-qa-login", "popup,width=620,height=760");
+    setQaBusy(true);
+    setQaError("");
+    try {
+      const started = await updatesApi.qaLogin();
+      if (popup) popup.location.replace(started.authorizeUrl);
+      else throw new Error("Your browser blocked the Discord login window. Allow popups and try again.");
+      setQaStatus((current) => ({ ...(current || { authenticated: false, channel: { channel: "release", label: "Public Release", commitSha: "", shortSha: "" } }), authenticated: false, status: "pending", requestId: started.requestId }));
+      for (let attempt = 0; attempt < 150; attempt += 1) {
+        await new Promise((resolvePromise) => window.setTimeout(resolvePromise, 2000));
+        const next = await loadQaStatus(true);
+        if (next.authenticated) { popup?.close(); setQaError(""); return; }
+        if (next.status === "denied" || next.status === "signed_out") throw new Error(next.reason || "QA authorization was not approved.");
+        if (popup?.closed) {
+          await updatesApi.qaLogout();
+          await loadQaStatus();
+          setQaError("");
+          return;
+        }
+      }
+      throw new Error("QA authorization expired. Try logging in again.");
+    } catch (error) {
+      popup?.close();
+      setQaError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setQaBusy(false);
+    }
+  }
+
+  async function logoutQa() {
+    setQaBusy(true);
+    try { await updatesApi.qaLogout(); await loadQaStatus(); }
+    finally { setQaBusy(false); }
+  }
+
+  async function applyQaUpdate() {
+    if (!(await confirmConsoleUpdate(`Apply QA pre-release ${qaBuild?.shortSha || "build"} and rebuild the Console?`))) return;
+    saveStackUpdateExpectedVersion(String(stackStatus.current || ""));
+    setStackUpdateExpectedVersion(String(stackStatus.current || ""));
+    setStackUpdateReadyAt(null);
+    setStackHelperProgress(null);
+    const response = await updatesApi.applyQa();
+    setStackUpdateTask(response.task);
+    persistUpdateTask(STACK_UPDATE_TASK_KEY, response.task);
+    setStackStatus((current) => ({ ...current, status: "Updating", reason: "QA pre-release is being installed." }));
+  }
+
+  async function reinstallPublicRelease() {
+    if (!(await confirmConsoleUpdate("Replace the QA pre-release with the latest published Console release? Your server configuration and data will be preserved."))) return;
+    const expectedVersion = String(stackStatus.latest || "").trim();
+    saveStackUpdateExpectedVersion(expectedVersion);
+    setStackUpdateExpectedVersion(expectedVersion);
+    setStackUpdateReadyAt(null);
+    setStackHelperProgress(null);
+    const response = await updatesApi.reinstallRelease();
+    setStackUpdateTask(response.task);
+    persistUpdateTask(STACK_UPDATE_TASK_KEY, response.task);
+    setStackStatus((current) => ({ ...current, status: "Updating", reason: "The latest public release is being reinstalled." }));
+  }
+
+  async function loadAutoGame() {
+    try {
+      const result = await updatesApi.autoGameStatus();
+      setAutoGame(result);
+      const values = parseKeyValueText(result.stdout || "");
+      const preferenceEnabled = /^(1|true|enabled)$/i.test(values.auto_updates_enabled || values.enabled || "");
+      const timerReady = /^(active|enabled)$/i.test(values.systemd_timer || "");
+      setAutoGameEnabled(preferenceEnabled && timerReady);
+      if (values.check_interval_minutes) setAutoGameIntervalMinutes(values.check_interval_minutes);
+      if (values.apply_updates) setAutoGameApplyEnabled(/^(1|true|yes|enabled)$/i.test(values.apply_updates));
+      if (values.notify_players) setAutoGameNotifyEnabled(/^(1|true|yes|enabled)$/i.test(values.notify_players));
+      if (values.notify_minutes) setAutoGameNotifyMinutes(formatAutoGameCheckpoints(values.notify_minutes));
+      if (values.wait_until_empty) setAutoGameWaitUntilEmpty(/^(1|true|yes|enabled)$/i.test(values.wait_until_empty));
+      if (values.max_wait_minutes) setAutoGameMaxWaitMinutes(values.max_wait_minutes);
+      if (values.update_console) setAutoGameUpdateConsole(/^(1|true|yes|enabled)$/i.test(values.update_console));
+      if (values.manage_regis_tanks) setAutoGameManageTanks(/^(1|true|yes|enabled)$/i.test(values.manage_regis_tanks));
+    } finally {
+      setAutoGameLoading(false);
+    }
+  }
+
+  async function saveAutoGame(nextEnabled = autoGameEnabled) {
+    const intervalMinutes = validateAutoGameInteger(autoGameIntervalMinutes, 5, 1440);
+    const notifyMinutes = parseAutoGameCheckpoints(autoGameNotifyMinutes);
+    const maxWaitMinutes = validateAutoGameInteger(autoGameMaxWaitMinutes, 0, 10080);
+    if (nextEnabled && (!intervalMinutes || !notifyMinutes.length || maxWaitMinutes === null)) {
+      setAutoGameResult({ status: "failed", title: "Auto Updates Save Failed", message: "Warning times must contain 1 to 12 unique values from largest to smallest, for example 15, 10, 5, 1. Each value must be between 1 and 1440 minutes." });
+      return;
+    }
+    setAutoGameIntervalMinutes(String(intervalMinutes || 60));
+    setAutoGameNotifyMinutes(notifyMinutes.length ? notifyMinutes.join(", ") : "15, 10, 5, 1");
+    setAutoGameMaxWaitMinutes(String(maxWaitMinutes ?? 360));
+    setAutoGameResult({ status: "running", title: "Saving Auto Updates" });
+    const requestedEnabled = nextEnabled;
+    setAutoGameEnabled(requestedEnabled);
+    try {
+      const final = await waitForTask((await updatesApi.saveAutoGame({
+        enabled: requestedEnabled,
+        intervalMinutes: intervalMinutes || 60,
+        applyEnabled: autoGameApplyEnabled,
+        notifyEnabled: autoGameNotifyEnabled,
+        notifyMinutes: notifyMinutes.length ? notifyMinutes.join(",") : "15,10,5,1",
+        waitUntilEmpty: autoGameWaitUntilEmpty,
+        maxWaitMinutes: maxWaitMinutes ?? 360,
+        updateConsole: autoGameUpdateConsole,
+        manageTanks: autoGameManageTanks,
+        confirmation: "SAVE AUTO GAME UPDATES"
+      })).task);
+      const details = taskTechnicalDetails(final);
+      const nextAutoGame = await updatesApi.autoGameStatus();
+      setAutoGame(nextAutoGame);
+      const nextValues = parseKeyValueText(nextAutoGame.stdout || "");
+      const timerReady = /^(active|enabled)$/i.test(nextValues.systemd_timer || "");
+      const timerDisabled = !timerReady || /^(disabled|inactive|not installed)$/i.test(nextValues.systemd_timer || "");
+      if (requestedEnabled && !timerReady) setAutoGameEnabled(false);
+      if (!requestedEnabled && timerDisabled) setAutoGameEnabled(false);
+      setAutoGameResult(final.status === "succeeded" && (!requestedEnabled ? timerDisabled : timerReady)
+        ? { status: "succeeded", title: "Auto Updates Saved Successfully", details }
+        : { status: "failed", title: requestedEnabled ? "Timer Install Failed" : "Auto Updates Save Failed", details: details || nextAutoGame.stdout || nextAutoGame.stderr || "" });
+    } catch (error) {
+      setAutoGameEnabled(!requestedEnabled);
+      setAutoGameResult({ status: "failed", title: "Auto Updates Save Failed", details: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  useEffect(() => {
+    if (!gameUpdateTask || isTerminalTask(gameUpdateTask.status)) refreshGameStatus();
+    if (!stackUpdateTask || isTerminalTask(stackUpdateTask.status)) refreshStackStatus();
+    loadAutoGame().catch((error) => setAutoGame({ stdout: "", stderr: error instanceof Error ? error.message : String(error), exitCode: 1 }));
+    loadQaStatus().catch((error) => setQaError(error instanceof Error ? error.message : String(error)));
+  }, []);
+
+  // Another panel sent the operator here to install the game files. It still
+  // raises its own confirm dialog -- arriving on this tab must not start a
+  // multi-gigabyte download on its own. Skips 0 so a plain mount does nothing.
+  useEffect(() => {
+    if (!installGameFilesRequest) return;
+    // Report it handled before doing the work. This panel is rendered only
+    // while its tab is open, so it unmounts on every tab change; a request left
+    // standing re-ran on each return and offered another download.
+    onInstallGameFilesHandled?.();
+    void installGameAssets();
+  }, [installGameFilesRequest]);
+
+  useEffect(() => {
+    if (!gameUpdateTask || isTerminalTask(gameUpdateTask.status)) {
+      persistUpdateTask(GAME_UPDATE_TASK_KEY, gameUpdateTask);
+      if (gameUpdateTask && gameUpdateBlockReason(gameUpdateTask)) {
+        void refreshGameStatus();
+      } else if (gameUpdateTask?.status === "failed" || gameUpdateTask?.status === "cancelled") {
+        setGameStatus((current) => gameUpdateTerminalStatus(gameUpdateTask, current));
+      }
+      return;
+    }
+    let cancelled = false;
+    persistUpdateTask(GAME_UPDATE_TASK_KEY, gameUpdateTask);
+    setGameStatus((current) => ({ ...current, status: "Updating", reason: "Game update is running." }));
+    void (async () => {
+      let current = gameUpdateTask;
+      for (let i = 0; i < 3600 && !cancelled && !isTerminalTask(current.status); i += 1) {
+        await new Promise((resolvePromise) => window.setTimeout(resolvePromise, 1000));
+        if (cancelled) return;
+        current = (await setupApi.task(current.id)).task;
+        setGameUpdateTask(current);
+        persistUpdateTask(GAME_UPDATE_TASK_KEY, current);
+      }
+      if (!cancelled && current.status === "succeeded") refreshGameStatus({ fresh: true });
+    })().catch(() => {
+      if (cancelled) return;
+      persistUpdateTask(GAME_UPDATE_TASK_KEY, null);
+      setGameUpdateTask(null);
+      refreshGameStatus();
+    });
+    return () => { cancelled = true; };
+  }, [gameUpdateTask?.id, gameUpdateTask?.status]);
+
+  useEffect(() => {
+    if (stackUpdateTask && isDetachedStackUpdateTask(stackUpdateTask)) {
+      persistUpdateTask(STACK_UPDATE_TASK_KEY, stackUpdateTask);
+      return;
+    }
+    if (!stackUpdateTask || isTerminalTask(stackUpdateTask.status)) {
+      persistUpdateTask(STACK_UPDATE_TASK_KEY, stackUpdateTask);
+      return;
+    }
+    let cancelled = false;
+    persistUpdateTask(STACK_UPDATE_TASK_KEY, stackUpdateTask);
+    setStackStatus((current) => ({ ...current, status: "Updating", reason: "Console update is running." }));
+    void (async () => {
+      let current = stackUpdateTask;
+      for (let i = 0; i < 3600 && !cancelled && !isTerminalTask(current.status); i += 1) {
+        await new Promise((resolvePromise) => window.setTimeout(resolvePromise, 1000));
+        if (cancelled) return;
+        current = (await setupApi.task(current.id)).task;
+        setStackUpdateTask(current);
+        persistUpdateTask(STACK_UPDATE_TASK_KEY, current);
+        if (isDetachedStackUpdateTask(current)) return;
+      }
+      if (!cancelled && current.status === "succeeded") refreshStackStatus();
+    })().catch(() => {
+      if (cancelled) return;
+      persistUpdateTask(STACK_UPDATE_TASK_KEY, null);
+      setStackUpdateTask(null);
+      refreshStackStatus();
+    });
+    return () => { cancelled = true; };
+  }, [stackUpdateTask?.id, stackUpdateTask?.status, stackUpdateTask?.currentStep]);
+
+  useEffect(() => {
+    if (!stackUpdateTask || !isDetachedStackUpdateTask(stackUpdateTask) || ["failed", "cancelled"].includes(stackUpdateTask.status)) return;
+    let cancelled = false;
+    void (async () => {
+      while (!cancelled) {
+        try {
+          const progress = await updatesApi.stackProgress(stackUpdateTask.id, stackUpdateTask.startedAt);
+          if (cancelled) return;
+          setStackHelperProgress(progress);
+          if (progress.state === "failed") {
+            const failedTask: Task = {
+              ...stackUpdateTask,
+              status: "failed",
+              currentStep: progress.stage || "Failed",
+              progressMessage: progress.message || "Console update failed.",
+              errorMessage: progress.message || "Console update failed.",
+              finishedAt: progress.finishedAt || new Date().toISOString()
+            };
+            setStackUpdateTask(failedTask);
+            persistUpdateTask(STACK_UPDATE_TASK_KEY, failedTask);
+            setStackStatus((current) => ({ ...current, status: "Update Failed", reason: failedTask.errorMessage || "Console update failed." }));
+            return;
+          }
+          if (progress.state === "succeeded") return;
+        } catch {
+          // The old console can disappear briefly while the replacement starts.
+        }
+        await new Promise((resolvePromise) => window.setTimeout(resolvePromise, 2000));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [stackUpdateTask?.id, stackUpdateTask?.status, stackUpdateTask?.currentStep]);
+
+  useEffect(() => {
+    if (!gameUpdateTask || (gameUpdateTask.status !== "succeeded" && !gameUpdateBlockReason(gameUpdateTask))) return;
+    const id = window.setTimeout(() => setGameUpdateTask(null), UPDATE_RESULT_DISMISS_MS);
+    return () => window.clearTimeout(id);
+  }, [gameUpdateTask?.id, gameUpdateTask?.status]);
+
+  useEffect(() => {
+    if (!stackUpdateTask || stackUpdateTask.status !== "succeeded") return;
+    if (isDetachedStackUpdateTask(stackUpdateTask)) return;
+    refreshStackStatus();
+    const id = window.setTimeout(() => setStackUpdateTask(null), UPDATE_RESULT_DISMISS_MS);
+    return () => window.clearTimeout(id);
+  }, [stackUpdateTask?.id, stackUpdateTask?.status, stackUpdateTask?.currentStep]);
+
+  useEffect(() => {
+    if (!stackUpdateTask || !isDetachedStackUpdateTask(stackUpdateTask)) return;
+    setStackUpdateNow(Date.now());
+    const id = window.setInterval(() => setStackUpdateNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [stackUpdateTask?.id, stackUpdateTask?.status, stackUpdateTask?.currentStep]);
+
+  useEffect(() => {
+    if (!stackUpdateTask || !isDetachedStackUpdateTask(stackUpdateTask) || stackUpdateReadyAt !== null || stackHelperProgress?.state !== "succeeded") return;
+    let cancelled = false;
+    const startedAt = Date.now();
+    const expectedVersion = stackUpdateExpectedVersion || stackStatus.latest || "";
+    void (async () => {
+      while (!cancelled) {
+        const state = await fetchConsoleAuthState().catch(() => null);
+        const runningVersion = String(state?.config?.version || "").trim();
+        if (isUpdatedConsoleReady(stackHelperProgress, runningVersion, expectedVersion)) {
+          const completedTask: Task = {
+            ...stackUpdateTask,
+            status: "succeeded",
+            currentStep: "Finished",
+            progressMessage: "Console update completed successfully.",
+            errorMessage: null,
+            finishedAt: stackHelperProgress.finishedAt || new Date().toISOString()
+          };
+          setStackUpdateTask(completedTask);
+          persistUpdateTask(STACK_UPDATE_TASK_KEY, completedTask);
+          saveStackUpdateExpectedVersion("");
+          setStackUpdateExpectedVersion("");
+          setStackUpdateReadyAt(Date.now());
+          return;
+        }
+        const elapsed = Date.now() - startedAt;
+        await new Promise((resolvePromise) => window.setTimeout(resolvePromise, elapsed < 30000 ? 2000 : 5000));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [stackUpdateTask?.id, stackUpdateTask?.status, stackUpdateTask?.currentStep, stackUpdateExpectedVersion, stackStatus.latest, stackUpdateReadyAt, stackHelperProgress?.state]);
+
+  const stackUpdateRefreshCountdown = stackUpdateTask && isDetachedStackUpdateTask(stackUpdateTask) && stackUpdateReadyAt !== null
+    ? Math.max(0, STACK_UPDATE_REFRESH_SECONDS - Math.floor((stackUpdateNow - stackUpdateReadyAt) / 1000))
+    : null;
+
+  useEffect(() => {
+    if (stackUpdateRefreshCountdown !== 0) return;
+    window.location.reload();
+  }, [stackUpdateRefreshCountdown]);
+
+  useEffect(() => {
+    if (!autoGameResult || autoGameResult.status === "running") return;
+    const id = window.setTimeout(() => setAutoGameResult(null), 10400);
+    return () => window.clearTimeout(id);
+  }, [autoGameResult?.status, autoGameResult?.title]);
+
+  const gameUpdateRunning = Boolean(gameUpdateTask && !isTerminalTask(gameUpdateTask.status));
+  const gameCanApply = canApplyUpdateStatus(gameStatus) && !gameUpdateRunning;
+  const assetsMissing = gameAssetsMissing(gameStatus);
+  const stackUpdateRunning = Boolean(stackUpdateTask && stackUpdateTask.status !== "failed" && (!isTerminalTask(stackUpdateTask.status) || isDetachedStackUpdateTask(stackUpdateTask)));
+  const stackCanApply = canApplyUpdateStatus(stackStatus) && !stackUpdateRunning;
+  const stackReleaseNotes = stackReleaseNotesUrl(stackStatus);
+
+  const qaAuthenticated = qaStatus?.authenticated === true;
+  const qaApplyReason = !qaBuild ? "Checking the latest QA build." : !qaBuild.ready ? qaBuild.reason || "The latest main build has not passed all checks." : !qaBuild.updateAvailable ? "This Console already has the latest QA build." : "";
+  const latestConsoleValue = qaAuthenticated
+    ? <span className="qa-version-value"><span>{updateDisplayValue(stackStatus, "latest", formatStackVersionLabel)}</span><button type="button" className="icon-button qa-release-reinstall" aria-label="Reinstall latest public release" title="Reinstall latest public release" disabled={stackUpdateRunning} onClick={() => void reinstallPublicRelease()}><RotateCcw size={16} aria-hidden="true" /></button></span>
+    : updateDisplayValue(stackStatus, "latest", formatStackVersionLabel);
+
+  return <section className="panel updates-panel">
+    <div className="panel-title updates-page-title"><h2>Updates</h2><div className="qa-login-actions">{qaAuthenticated ? <><span className="qa-authenticated"><ShieldCheck size={17} aria-hidden="true" /><span>{qaStatus.user?.username || "Discord User"}</span><span className="qa-auth-role">{qaStatus.user?.role || "QA Tester"}</span></span><button disabled={qaBusy || stackUpdateRunning} onClick={() => void logoutQa()}><LogOut size={16} aria-hidden="true" />Logout</button></> : <button className="qa-login-button" disabled={qaBusy} onClick={() => void loginQa()}><LogIn size={14} aria-hidden="true" />{qaBusy || qaStatus?.status === "pending" ? "Waiting for Discord..." : "QA Tester Login"}</button>}</div></div>
+    {qaError && <div className="qa-login-feedback"><p className="danger-note qa-login-error">{qaError}</p></div>}
+    <div className="action-sections">
+      <section className="action-section">
+        <div className="panel-title"><h4>Game Update</h4><StatusPill value={gameStatus.status} /></div>
+        <KeyValueGrid items={[["Current Build", updateDisplayValue(gameStatus, "current")], ["Latest Build", updateDisplayValue(gameStatus, "latest")], ["Status", gameStatus.status]]} />
+        {gameStatus.status === "Check Failed" && gameStatus.reason && <p className="danger-note">{gameStatus.reason}</p>}
+        {gameStatus.status === "Version details unavailable" && <p className="muted">{gameStatus.reason}</p>}
+        {assetsMissing && <p className="danger-note">The game files are not installed on this host, so nothing that needs the database or the game images can run. Install them to continue.</p>}
+        <div className="action-line">
+          <button disabled={gameUpdateRunning} onClick={() => checkGame({ fresh: true })}>Refresh Game Check</button>
+          {gameCanApply && <button className="update-action" onClick={applyGameUpdate}>Apply Game Update</button>}
+          {/* Never gated on an update being available: the case this exists for
+              is a host with no game files at all, where the Steam check itself
+              fails and every "Update Available" condition is false. */}
+          <button className={assetsMissing ? "update-action" : ""} disabled={gameUpdateRunning} onClick={installGameAssets}>
+            {assetsMissing ? "Install Game Files" : "Reinstall Game Files"}
+          </button>
+        </div>
+        {gameUpdateTask && <GameUpdateProgress task={gameUpdateTask} repairTask={gameSteamcmdFixTask} onDismiss={() => setGameUpdateTask(null)} onRetry={gameUpdateTask.operation === "updateInstallAssets" ? installGameAssets : applyGameUpdate} onFixSteamcmd={fixSteamcmd} formatResultTitle={formatResultTitle} formatResultMessage={formatResultMessage} />}
+      </section>
+      <section className="action-section">
+        <div className="panel-title"><h4>Console Update</h4><StatusPill value={stackStatus.status} /></div>
+        <KeyValueGrid items={[["Current Console Version", updateDisplayValue(withInstalledVersion(stackStatus, installedConsoleVersion), "current", formatStackVersionLabel)], ["Latest Console Version", latestConsoleValue], ["Update Channel", qaStatus?.channel.label || "Public Release"], ["Status", stackStatus.status]]} />
+        {qaAuthenticated && <div className="qa-build-row"><div><strong>Latest GitHub Pre-Release</strong><span>{qaBuild ? `${qaBuild.shortSha} · ${qaBuild.status}` : "Checking..."}</span>{qaBuild?.reason && !qaBuild.ready && <small>{qaBuild.reason}</small>}</div>{qaBuild?.commitUrl && <a href={qaBuild.commitUrl} target="_blank" rel="noreferrer">View Commit</a>}</div>}
+        {stackStatus.status === "Check Failed" && stackStatus.reason && <p className="danger-note">{stackStatus.reason}</p>}
+        {stackStatus.status === "Version details unavailable" && <p className="muted">{stackStatus.reason}</p>}
+        <div className="action-line">
+          <button disabled={stackUpdateRunning} onClick={checkStack}>Refresh Console Check</button>
+          {stackReleaseNotes && <a className="button-link" href={stackReleaseNotes} target="_blank" rel="noreferrer"><BookOpen size={16} aria-hidden="true" />View Patch Notes</a>}
+          {stackCanApply && <button className="update-action" onClick={applyStackUpdate}>Apply Console Update</button>}
+          {qaAuthenticated && <button className="update-action qa-apply-button" disabled={stackUpdateRunning || !qaBuild?.ready || !qaBuild.updateAvailable} title={qaApplyReason} onClick={() => void applyQaUpdate()}>Apply Pre-Release</button>}
+        </div>
+        {stackUpdateTask && <StackUpdateProgress task={stackUpdateTask} helperProgress={stackHelperProgress} refreshCountdown={stackUpdateRefreshCountdown} onDismiss={() => setStackUpdateTask(null)} onRetry={stackUpdateTask.operation === "selfUpdateQaApply" ? applyQaUpdate : applyStackUpdate} formatResultTitle={formatResultTitle} formatResultMessage={formatResultMessage} />}
+      </section>
+      <div className={`playerAdmin_toggle auto-game-toggle ${autoGameOpen ? "open" : ""}`}>
+          <button className="playerAdmin_toggleHeader" aria-label={autoGameOpen ? "Collapse Automatic Game Updates" : "Expand Automatic Game Updates"} onClick={() => setAutoGameOpen(!autoGameOpen)}>{autoGameOpen ? <ChevronUp size={18} /> : <ChevronDown size={18} />}<span>Automatic Game Updates</span></button>
+          {autoGameOpen && <div className="playerAdmin_toggleBody">
+        <div className="panel-title"><h4>Service Configuration</h4><label className={`switch-checkbox ${autoGameEnabled ? "enabled" : "disabled"}`}><input type="checkbox" disabled={autoGameLoading || autoGameSaving} checked={autoGameEnabled} onChange={(event) => saveAutoGame(event.target.checked)} /><span className="switch-label">Auto Updates</span><strong className="switch-state">{autoGameEnabled ? "ON" : "OFF"}</strong></label></div>
+        <KeyValueGrid items={[
+          ["Current Status", autoGameStatusLabel],
+          ["Check Interval", `Every ${autoGameValues.check_interval_minutes || autoGameIntervalMinutes} minutes`],
+          ["Apply Updates", enabledLabel(autoGameValues.apply_updates, autoGameApplyEnabled)],
+          ["Player Notice", enabledLabel(autoGameValues.notify_players, autoGameNotifyEnabled, `${formatAutoGameCheckpoints(autoGameValues.notify_minutes || autoGameNotifyMinutes)} Min`)],
+          ["Empty Server Policy", enabledLabel(autoGameValues.wait_until_empty, autoGameWaitUntilEmpty, `max ${autoGameValues.max_wait_minutes || autoGameMaxWaitMinutes} minutes`)],
+          ["Console Updates", enabledLabel(autoGameValues.update_console, autoGameUpdateConsole)],
+          ["Regis Tanks", enabledLabel(autoGameValues.manage_regis_tanks, autoGameManageTanks, "disable, then restore")],
+          ["Timer", autoGameDisplayTimerLabel]
+        ]} />
+        {commandStatusSummary(autoGame).reason && <p className="danger-note">{commandStatusSummary(autoGame).reason}</p>}
+        <div className="auto-update-policy-grid">
+          <section className="auto-update-policy-group">
+            <h5>Schedule</h5>
+            <label className="auto-update-settings-row"><span>Check for updates every</span><span className="number-unit-field"><input type="number" min="5" max="1440" step="1" disabled={autoGameSaving} value={autoGameIntervalMinutes} onChange={(event) => setAutoGameIntervalMinutes(event.target.value)} /><em>min</em></span><span className="auto-update-settings-spacer" /></label>
+          </section>
+          <section className="auto-update-policy-group">
+            <h5>Update Action</h5>
+            <label className="auto-update-settings-row auto-update-settings-boolean-row"><span>Apply update when found</span><strong>{autoGameApplyEnabled ? "Enabled" : "Disabled"}</strong><input type="checkbox" disabled={autoGameSaving} checked={autoGameApplyEnabled} onChange={(event) => setAutoGameApplyEnabled(event.target.checked)} /></label>
+          </section>
+          <section className="auto-update-policy-group">
+            <h5>Player Notice</h5>
+            <label className="auto-update-settings-row auto-update-settings-boolean-row"><span>Warn players before restart</span><strong>{autoGameNotifyEnabled ? "Enabled" : "Disabled"}</strong><input type="checkbox" disabled={autoGameSaving} checked={autoGameNotifyEnabled} onChange={(event) => setAutoGameNotifyEnabled(event.target.checked)} /></label>
+            <label className={`auto-update-settings-row ${autoGameNotifyEnabled ? "" : "is-disabled"}`}><span>Warning Times (Min)</span><input type="text" disabled={autoGameSaving || !autoGameNotifyEnabled} value={autoGameNotifyMinutes} onChange={(event) => setAutoGameNotifyMinutes(event.target.value)} placeholder="15, 10, 5, 1" /><span className="auto-update-settings-spacer" /></label>
+            <p className="muted auto-update-setting-help">Enter unique times from largest to smallest, separated by commas. Example: 15, 10, 5, 1.</p>
+          </section>
+          <section className="auto-update-policy-group">
+            <h5>Empty Server Policy</h5>
+            <label className="auto-update-settings-row auto-update-settings-boolean-row"><span>Wait until server is empty</span><strong>{autoGameWaitUntilEmpty ? "Enabled" : "Disabled"}</strong><input type="checkbox" disabled={autoGameSaving} checked={autoGameWaitUntilEmpty} onChange={(event) => setAutoGameWaitUntilEmpty(event.target.checked)} /></label>
+            <label className={`auto-update-settings-row ${autoGameWaitUntilEmpty ? "" : "is-disabled"}`}><span>Maximum wait</span><span className="number-unit-field"><input type="number" min="0" max="10080" step="1" disabled={autoGameSaving || !autoGameWaitUntilEmpty} value={autoGameMaxWaitMinutes} onChange={(event) => setAutoGameMaxWaitMinutes(event.target.value)} /><em>min</em></span><span className="auto-update-settings-spacer" /></label>
+          </section>
+          <section className="auto-update-policy-group">
+            <h5>Dune Docker Console</h5>
+            <label className="auto-update-settings-row auto-update-settings-boolean-row"><span>Update the Console after a game update</span><strong>{autoGameUpdateConsole ? "Enabled" : "Disabled"}</strong><input type="checkbox" aria-label="Update the Console after a game update" disabled={autoGameSaving} checked={autoGameUpdateConsole} onChange={(event) => setAutoGameUpdateConsole(event.target.checked)} /></label>
+            <p className="muted auto-update-setting-help">After the game files are updated, check RedBlink for a newer Dune Docker release and install it. Without this, the Console is never updated automatically.</p>
+          </section>
+          <section className="auto-update-policy-group">
+            <h5>Regis Tanks</h5>
+            <label className="auto-update-settings-row auto-update-settings-boolean-row"><span>Disable before, restore after the update</span><strong>{autoGameManageTanks ? "Enabled" : "Disabled"}</strong><input type="checkbox" aria-label="Disable Regis Tanks before the update and restore them afterwards" disabled={autoGameSaving} checked={autoGameManageTanks} onChange={(event) => setAutoGameManageTanks(event.target.checked)} /></label>
+            <p className="muted auto-update-setting-help">If Regis Tanks are enabled, they are switched off and confirmed off before the game files are updated. They are switched on again only after a newer Dune Docker release from RedBlink has been installed and supports the new game build. Without a new release they stay off. Without this option, an update is blocked while Regis Tanks are enabled.</p>
+            {autoGameValues.regis_tanks_restore && <p className="danger-note auto-update-setting-help">Regis Tanks restore: {autoGameValues.regis_tanks_restore}</p>}
+          </section>
+        </div>
+        <div className="auto-update-settings-divider" />
+        <div className="action-line schedule-action-line auto-game-action-line">
+          <button disabled={autoGameLoading || autoGameSaving} onClick={() => saveAutoGame()}>Save Auto Updates</button>
+          {autoGameResult && <span className={`inline-task-result result-${autoGameResult.status === "succeeded" ? "ok" : autoGameResult.status === "failed" ? "fail" : "running"}`}>
+            <strong className={autoGameResult.status === "running" ? "loading-dots" : ""}>{formatResultTitle(autoGameResult.title, autoGameResult.status === "running")}</strong>
+          </span>}
+        </div>
+          </div>}
+      </div>
+    </div>
+  </section>;
+}
+
+function validateAutoGameInteger(value: string, min: number, max: number) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min || n > max) return null;
+  return n;
+}
+
+function parseAutoGameCheckpoints(value: string): number[] {
+  const raw = value.split(/[\s,]+/).filter(Boolean);
+  if (!raw.length || raw.length > 12) return [];
+  const parsed = raw.map((item) => Number(item));
+  if (parsed.some((minutes) => !Number.isInteger(minutes) || minutes < 1 || minutes > 1440)) return [];
+  if (new Set(parsed).size !== parsed.length) return [];
+  if (parsed.some((minutes, index) => index > 0 && minutes >= parsed[index - 1])) return [];
+  return parsed;
+}
+
+function formatAutoGameCheckpoints(value: string): string {
+  const parsed = parseAutoGameCheckpoints(value);
+  return parsed.length ? parsed.join(", ") : value;
+}
+
+function enabledLabel(rawValue: string | undefined, fallback: boolean, detail = "") {
+  const enabled = rawValue ? /^(1|true|yes|enabled)$/i.test(rawValue) : fallback;
+  return enabled ? detail ? `Enabled (${detail})` : "Enabled" : "Disabled";
+}
+
+function GameUpdateProgress({
+  task,
+  repairTask,
+  onRetry,
+  onFixSteamcmd,
+  onDismiss,
+  formatResultTitle,
+  formatResultMessage
+}: { task: Task; repairTask: Task | null; onRetry: () => Promise<void>; onFixSteamcmd: () => Promise<void>; onDismiss: () => void; formatResultTitle: (value: unknown, pending?: boolean) => string; formatResultMessage: (value: unknown) => string }) {
+  const blockedReason = gameUpdateBlockReason(task);
+  if (blockedReason) return <div key={task.id} className="game-update-blocked-notice" role="status" style={{ animationDuration: `${UPDATE_RESULT_DISMISS_MS}ms` }}>
+    <ShieldCheck size={18} aria-hidden="true" />
+    <div><strong>Game Update Blocked</strong><p>{blockedReason}</p></div>
+  </div>;
+  const progress = summarizeGameUpdateProgress(task);
+  const running = !isTerminalTask(task.status);
+  const repairRunning = Boolean(repairTask && !isTerminalTask(repairTask.status));
+  const repairSucceeded = repairTask?.status === "succeeded";
+  const repairable = task.status === "failed" && isSteamcmdManifestFailure(task);
+  const updateLog = task.logLines.slice(-160).map((line) => line.line).join("\n").trim();
+  return <div className={`result-panel game-update-progress result-${task.status === "succeeded" ? "ok" : task.status === "failed" ? "fail" : "running"}`} aria-live="polite">
+    <div className="panel-title">
+      <h4 className={running ? "loading-dots" : ""}>{formatResultTitle(progress.title, running)}</h4>
+      <StatusPill value={task.status === "failed" ? "Failed" : task.status === "cancelled" ? "Cancelled" : task.status === "succeeded" ? "Succeeded" : "Running"} />
+    </div>
+    <div className="progress-row">
+      <div className="progress-track" aria-label={`Game update progress ${progress.percent}%`}>
+        <div className="progress-fill" style={{ width: `${progress.percent}%` }} />
+      </div>
+      <strong>{progress.percent}%</strong>
+    </div>
+    <p>{formatResultMessage(progress.message)}</p>
+    {repairRunning && <p className="muted loading-dots">{formatUiSentence("Fixing SteamCMD", true)}</p>}
+    {repairSucceeded && <p className="muted">{formatResultMessage("SteamCMD manifest reset. Retry the game update when ready.")}</p>}
+    {task.status === "failed" && <div className="action-line">
+      {repairable && <button disabled={repairRunning} onClick={onFixSteamcmd}>Fix SteamCMD</button>}
+      <button disabled={repairRunning} onClick={onRetry}>Retry Game Update</button>
+      <button onClick={onDismiss}>Dismiss</button>
+    </div>}
+    {task.status === "cancelled" && <div className="action-line"><button onClick={onDismiss}>Dismiss</button></div>}
+    <details className="task-technical-details update-log-details">
+      <summary>Update Log</summary>
+      <pre className="log-box">{updateLog || "Waiting for game update output..."}</pre>
+    </details>
+  </div>;
+}
+
+function summarizeGameUpdateProgress(task: Task) {
+  const text = task.logLines.map((line) => line.line).join("\n");
+  const latestLine = [...task.logLines].reverse().map((line) => line.line.trim()).find(Boolean) || task.progressMessage || task.currentStep || "";
+  if (task.status === "succeeded") {
+    // install-assets deliberately starts nothing and touches no database, so
+    // the game-update wording ("coming back up now") would be wrong twice.
+    if (task.operation === "updateInstallAssets") {
+      return { title: "Game Files Installed", percent: 100, message: "Game files and images are installed. The database was not touched." };
+    }
+    return { title: "Update Complete", percent: 100, message: "The game server update is complete. The server is coming back up now." };
+  }
+  if (task.status === "failed") {
+    return { title: "Update Failed", percent: Math.max(5, gameUpdatePercent(text)), message: conciseTaskError(task) };
+  }
+  if (task.status === "cancelled") {
+    return { title: "Update Cancelled", percent: gameUpdatePercent(text), message: "The game update was cancelled. Review the update log before retrying." };
+  }
+
+  const fixIndex = text.lastIndexOf("Detected a common SteamCMD cache error");
+  const attemptIndexes = [...text.matchAll(/SteamCMD install attempt\s+\d+\/\d+/gi)].map((match) => match.index || 0);
+  const latestAttemptIndex = attemptIndexes.length ? attemptIndexes[attemptIndexes.length - 1] : -1;
+  if (fixIndex >= 0 && fixIndex > latestAttemptIndex) {
+    return { title: "Fixing SteamCMD", percent: Math.max(45, gameUpdatePercent(text)), message: "Detected a common Steam download error. Applying the automatic SteamCMD fix, then retrying the update." };
+  }
+  if (!isSteamcmdUpdateActive(text)) {
+    return { title: "Updating", percent: gameUpdatePercent(text), message: friendlyGameUpdateMessage(text, latestLine) };
+  }
+  const retryMatches = [...text.matchAll(/Retrying(?: app install)? in (\d+)s/gi)];
+  const retryMatch = retryMatches[retryMatches.length - 1];
+  const retryIndex = retryMatch?.index ?? -1;
+  if (retryMatch && retryIndex > latestAttemptIndex) {
+    return { title: "Updating", percent: Math.max(45, gameUpdatePercent(text)), message: `Steam download hit a temporary problem. Retrying in ${retryMatch[1]} seconds.` };
+  }
+  const attemptMatch = text.match(/SteamCMD install attempt\s+(\d+)\/(\d+)/i);
+  const steamcmdStage = summarizeSteamcmdStage(task.logLines.map((line) => line.line), attemptMatch);
+  if (steamcmdStage) {
+    return { title: steamcmdStage.title, percent: Math.max(42, gameUpdatePercent(text), steamcmdStage.percent), message: steamcmdStage.message };
+  }
+  if (attemptMatch) {
+    return { title: "Updating", percent: Math.max(42, gameUpdatePercent(text)), message: `Downloading server files with SteamCMD. Attempt ${attemptMatch[1]} of ${attemptMatch[2]}.` };
+  }
+  return { title: "Updating", percent: gameUpdatePercent(text), message: friendlyGameUpdateMessage(text, latestLine) };
+}
+
+export function gameUpdateTerminalStatus(task: Task, previous: Record<string, string> = {}) {
+  if (task.status === "failed") {
+    return { ...previous, status: "Update Failed", reason: conciseTaskError(task) };
+  }
+  if (task.status === "cancelled") {
+    return { ...previous, status: "Update Cancelled", reason: task.errorMessage || "The game update was cancelled." };
+  }
+  return previous;
+}
+
+function isSteamcmdUpdateActive(text: string) {
+  const clean = stripAnsi(text);
+  const steamStart = clean.lastIndexOf("=== Download/update server files with SteamCMD ===");
+  if (steamStart < 0) return false;
+  const laterText = clean.slice(steamStart);
+  return !/===\s+(Load updated Funcom image tarballs|Detect loaded image tags|Run database update\/migration|Refresh generated map catalogs|Restarting Dune stack)\s+===/i.test(laterText);
+}
+
+function summarizeSteamcmdStage(lines: string[], attemptMatch: RegExpMatchArray | null) {
+  const attemptText = attemptMatch ? ` Attempt ${attemptMatch[1]} of ${attemptMatch[2]}.` : "";
+  const cleanLines = lines.flatMap((line) => stripAnsi(line).split(/\r+/).map((part) => part.trim()).filter(Boolean));
+
+  for (const line of [...cleanLines].reverse()) {
+    const progressMatches = [...line.matchAll(/Update state\s+\([^)]+\)\s+([^,]+),\s+progress:\s+([0-9.]+)/gi)];
+    const progressMatch = progressMatches[progressMatches.length - 1];
+    if (progressMatch) {
+      const state = progressMatch[1].trim().toLowerCase();
+      const steamPercent = Math.max(0, Math.min(100, Number(progressMatch[2]) || 0));
+      const scaledPercent = 42 + Math.round(steamPercent * 0.18);
+      if (/download/i.test(state)) return { title: "Downloading Server Files", percent: scaledPercent, message: `SteamCMD is downloading updated server files (${steamPercent.toFixed(1)}%).${attemptText}` };
+      if (/verif/i.test(state)) return { title: "Verifying Server Files", percent: Math.max(56, scaledPercent), message: `SteamCMD is verifying downloaded server files (${steamPercent.toFixed(1)}%).${attemptText}` };
+      if (/install|commit|staging|reconfig/i.test(state)) return { title: "Installing Server Files", percent: Math.max(48, scaledPercent), message: `SteamCMD is ${state} (${steamPercent.toFixed(1)}%).${attemptText}` };
+      return { title: "Updating Server Files", percent: scaledPercent, message: `SteamCMD update state: ${state} (${steamPercent.toFixed(1)}%).${attemptText}` };
+    }
+
+    if (/Success!\s+App\s+'?\d+'?.*fully installed/i.test(line)) return { title: "Server Files Installed", percent: 62, message: `SteamCMD finished installing the server files.${attemptText}` };
+    if (/Validating|validation/i.test(line)) return { title: "Validating Server Files", percent: 56, message: `SteamCMD is validating the installed server files.${attemptText}` };
+    if (/Downloading item|download item|download depot|downloading/i.test(line)) return { title: "Downloading Server Files", percent: 46, message: `SteamCMD is downloading server file content.${attemptText}` };
+    if (/Connecting anonymously|Connecting to Steam/i.test(line)) return { title: "Connecting To Steam", percent: 43, message: `SteamCMD is connecting to Steam.${attemptText}` };
+    if (/Waiting for (client config|user info)/i.test(line)) return { title: "Loading Steam Metadata", percent: 44, message: `SteamCMD is loading Steam account and depot metadata.${attemptText}` };
+    if (/Logging in user|login anonymous|Logged in OK/i.test(line)) return { title: "Logging In To Steam", percent: 44, message: `SteamCMD is logging in anonymously to Steam.${attemptText}` };
+    if (/Loading Steam API/i.test(line)) return { title: "Starting SteamCMD", percent: 42, message: `SteamCMD is starting and loading the Steam API.${attemptText}` };
+  }
+
+  return null;
+}
+
+function gameUpdatePercent(text: string) {
+  const stages: [RegExp, number][] = [
+    [/Pre-flight: check Steam/i, 8],
+    [/Update is available/i, 15],
+    [/Check Docker volume free space/i, 22],
+    [/Stop game servers before update/i, 30],
+    [/Download\/update server files with SteamCMD/i, 40],
+    [/SteamCMD install attempt\s+2\//i, 52],
+    [/SteamCMD install attempt\s+3\//i, 60],
+    [/Load updated Funcom image tarballs/i, 70],
+    [/Detect loaded image tags/i, 78],
+    [/Run database update\/migration/i, 86],
+    [/Refresh generated map catalogs/i, 94],
+    [/Restarting Dune stack/i, 98]
+  ];
+  let percent = 3;
+  for (const [pattern, value] of stages) {
+    if (pattern.test(text)) percent = Math.max(percent, value);
+  }
+  return percent;
+}
+
+function friendlyGameUpdateMessage(text: string, latestLine: string) {
+  if (/Restarting Dune stack/i.test(text)) return "Restarting the Dune server with the updated build.";
+  if (/Refresh generated map catalogs/i.test(text)) return "Refreshing generated map catalogs.";
+  if (/Run database update\/migration/i.test(text)) return "Running database migrations for the updated build.";
+  if (/Detect loaded image tags/i.test(text)) return "Detecting updated image versions.";
+  if (/Load updated Funcom image tarballs/i.test(text)) return "Loading updated game container images.";
+  if (/Download\/update server files with SteamCMD/i.test(text)) return "Downloading updated game server files.";
+  if (/Stop game servers before update/i.test(text)) return "Stopping game servers before replacing server files.";
+  if (/Check Docker volume free space/i.test(text)) return "Checking available disk space before downloading files.";
+  if (/Pre-flight: check Steam/i.test(text)) return "Checking Steam for the latest available server build.";
+  return latestLine && !/^\s*Task started/i.test(latestLine) ? friendlyGameUpdateLine(latestLine) : "Preparing the game update.";
+}
+
+function friendlyGameUpdateLine(line: string) {
+  if (/^Running updateApply$/i.test(line)) return "Preparing the game update.";
+  if (/^Task started$/i.test(line)) return "Preparing the game update.";
+  if (/Steam app id:/i.test(line)) return "Preparing Steam update metadata.";
+  return "Working on the game update.";
+}
+
+function isSteamcmdManifestFailure(task: Task) {
+  const text = stripAnsi(task.logLines.map((line) => line.line).join("\n"));
+  return /SteamCMD failed|App\s+'[^']+'\s+state is\s+0x6|appmanifest_\d+\.acf|SteamCMD cache\/metadata is stale/i.test(text);
+}
+
+function StackUpdateProgress({
+  task,
+  helperProgress,
+  refreshCountdown,
+  onRetry,
+  onDismiss,
+  formatResultTitle,
+  formatResultMessage
+}: { task: Task; helperProgress: StackUpdateRunProgress | null; refreshCountdown: number | null; onRetry: () => Promise<void>; onDismiss: () => void; formatResultTitle: (value: unknown, pending?: boolean) => string; formatResultMessage: (value: unknown) => string }) {
+  const progress = summarizeStackUpdateProgress(task, helperProgress, refreshCountdown);
+  const running = !["failed", "cancelled"].includes(task.status) && (!isTerminalTask(task.status) || (isDetachedStackUpdateTask(task) && refreshCountdown === null));
+  const resultState = task.status === "failed" ? "fail" : refreshCountdown !== null || (task.status === "succeeded" && !isDetachedStackUpdateTask(task)) ? "ok" : "running";
+  return <div className={`result-panel stack-update-progress result-${resultState}`} aria-live="polite">
+    <div className="panel-title">
+      <h4 className={running ? "loading-dots" : ""}>{formatResultTitle(progress.title, running)}</h4>
+      <StatusPill value={task.status === "failed" ? "Failed" : task.status === "cancelled" ? "Cancelled" : refreshCountdown !== null ? "Succeeded" : "Running"} />
+    </div>
+    <div className="progress-row">
+      <div className="progress-track" aria-label={`Console update progress ${progress.percent}%`}>
+        <div className="progress-fill" style={{ width: `${progress.percent}%` }} />
+      </div>
+      <strong>{progress.percent}%</strong>
+    </div>
+    <p>{formatResultMessage(progress.message)}</p>
+    {refreshCountdown !== null && <div className="action-line"><button onClick={() => window.location.reload()}>Refresh Now</button></div>}
+    {refreshCountdown === null && helperProgress?.state === "succeeded" && <div className="action-line stack-update-refresh-line"><button onClick={() => window.location.reload()}>Refresh Now</button><span className="muted">The update helper finished. Refresh manually if this page does not detect it shortly.</span></div>}
+    {task.status === "succeeded" && !isDetachedStackUpdateTask(task) && <div className="action-line"><button onClick={() => window.location.reload()}>Refresh Console</button></div>}
+    {task.status === "failed" && <div className="action-line"><button onClick={onRetry}>Retry Console Update</button><button onClick={onDismiss}>Dismiss</button></div>}
+    {task.status === "cancelled" && <div className="action-line"><button onClick={onDismiss}>Dismiss</button></div>}
+    <details className="task-technical-details update-log-details">
+      <summary>Update Log</summary>
+      <pre className="log-box">{task.logLines.slice(-160).map((line) => line.line).join("\n").trim() || "Waiting for Console update output..."}</pre>
+    </details>
+  </div>;
+}
+
+export function summarizeStackUpdateProgress(task: Task, helperProgress: StackUpdateRunProgress | null = null, refreshCountdown: number | null = null) {
+  const text = task.logLines.map((line) => line.line).join("\n");
+  const latestLine = [...task.logLines].reverse().map((line) => line.line.trim()).find(Boolean) || task.progressMessage || task.currentStep || "";
+  if (task.status === "failed") {
+    return { title: "Console Update Failed", percent: Math.max(5, helperProgress?.percent || stackUpdatePercent(text)), message: helperProgress?.message || conciseTaskError(task) };
+  }
+  if (task.status === "cancelled") {
+    return { title: "Console Update Cancelled", percent: stackUpdatePercent(text), message: "The Console update was cancelled. Review the update log before retrying." };
+  }
+  if (isDetachedStackUpdateTask(task)) {
+    if (refreshCountdown !== null) {
+      return { title: "Console Update Complete", percent: 100, message: `The console update is complete. This browser will refresh in ${refreshCountdown} second${refreshCountdown === 1 ? "" : "s"}. You may need to sign in again.` };
+    }
+    const percent = Math.max(1, Math.min(99, helperProgress?.percent || 1));
+    return {
+      title: helperProgress?.state === "succeeded" ? "Waiting for Updated Console" : stackUpdateStageTitle(helperProgress?.stage),
+      percent,
+      message: helperProgress?.state === "succeeded"
+        ? "The update helper finished successfully. Waiting for the updated web console to answer."
+        : helperProgress?.message || "Waiting for the update helper to start."
+    };
+  }
+  if (task.status === "succeeded") {
+    const installedVersion = firstVersionMatch(text, [/Installed stack version:\s*([^\n]+)/i]);
+    return { title: "Console Update Complete", percent: 100, message: installedVersion ? `Console files were updated to ${installedVersion}. Refresh this page to load the new Web UI. You may need to sign in again.` : "Console files were updated. Refresh this page to load the new Web UI. You may need to sign in again." };
+  }
+  const stackStage = summarizeStackUpdateStage(task.logLines.map((line) => line.line));
+  if (stackStage) return stackStage;
+  return { title: "Updating Console", percent: stackUpdatePercent(text), message: friendlyStackUpdateMessage(text, latestLine) };
+}
+
+export function isDetachedStackUpdateTask(task: Task) {
+  return ["selfUpdateApply", "selfUpdateQaApply"].includes(task.operation) && /Update helper started/i.test(task.logLines.map((line) => line.line).join("\n"));
+}
+
+export function isUpdatedConsoleReady(progress: StackUpdateRunProgress | null, runningVersion: string, expectedVersion: string) {
+  const running = normalizeUpdateVersion(runningVersion);
+  if (!running) return false;
+  const expected = normalizeUpdateVersion(expectedVersion);
+  return progress?.consoleReplaced === true || !expected || running === expected;
+}
+
+function stackUpdateStageTitle(stage?: string) {
+  const titles: Record<string, string> = {
+    launching: "Launching Console Update",
+    preparing: "Preparing Console Update",
+    downloading: "Downloading Console Release",
+    backup: "Backing Up Console Files",
+    installing: "Installing Console Release",
+    installed: "Verifying Console Release",
+    building: "Building Web Console",
+    restarting: "Restarting Web Console",
+    busy: "Console Update Already Running"
+  };
+  return titles[String(stage || "")] || "Updating Console";
+}
+
+function loadStackUpdateExpectedVersion() {
+  if (typeof window === "undefined") return "";
+  try {
+    return window.localStorage.getItem(STACK_UPDATE_EXPECTED_VERSION_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function saveStackUpdateExpectedVersion(value: string) {
+  if (typeof window === "undefined") return;
+  try {
+    const clean = String(value || "").trim();
+    if (clean) window.localStorage.setItem(STACK_UPDATE_EXPECTED_VERSION_KEY, clean);
+    else window.localStorage.removeItem(STACK_UPDATE_EXPECTED_VERSION_KEY);
+  } catch {
+    // The visible update flow still works if localStorage is unavailable.
+  }
+}
+
+
+function stackUpdatePercent(text: string) {
+  const stages: [RegExp, number][] = [
+    [/Running selfUpdateApply/i, 5],
+    [/Downloading stack release/i, 20],
+    [/Backing up current stack files/i, 42],
+    [/Installing stack release into/i, 66],
+    [/Installed stack version/i, 88],
+    [/Previous stack files backup/i, 94],
+    [/Rebuilding Dune Docker Console|Dune Docker Console was rebuilt/i, 98]
+  ];
+  let percent = 3;
+  for (const [pattern, value] of stages) {
+    if (pattern.test(text)) percent = Math.max(percent, value);
+  }
+  return percent;
+}
+
+function friendlyStackUpdateMessage(text: string, latestLine: string) {
+  if (/Downloading stack release/i.test(text)) return "Downloading the selected console release.";
+  if (/Backing up current stack files/i.test(text)) return "Backing up the current console files before replacing them.";
+  if (/Installing stack release into/i.test(text)) return "Installing the downloaded console release files.";
+  if (/Installed stack version/i.test(text)) return "Verifying the installed console version.";
+  if (/Rebuilding Dune Docker Console/i.test(text)) return "Rebuilding and restarting the web console container.";
+  if (/Dune Docker Console was rebuilt/i.test(text)) return "The web console container was rebuilt successfully.";
+  if (/Previous stack files backup/i.test(text)) return "Finishing the console update and recording the backup location.";
+  return latestLine && !/^\s*Task started/i.test(latestLine) ? friendlyStackUpdateLine(latestLine) : "Preparing the console update.";
+}
+
+function summarizeStackUpdateStage(lines: string[]) {
+  const cleanLines = lines.map((line) => stripAnsi(line).replace(/\s+$/g, "")).filter((line) => line.trim());
+  const latestIndex = (pattern: RegExp) => {
+    for (let index = cleanLines.length - 1; index >= 0; index -= 1) {
+      if (pattern.test(cleanLines[index].trim())) return index;
+    }
+    return -1;
+  };
+  const backupIndex = latestIndex(/^Backing up current stack files to:/i);
+  const installIndex = latestIndex(/^Installing stack release into:/i);
+  const installedIndex = latestIndex(/^Installed stack version:\s*/i);
+  const backupDoneIndex = latestIndex(/^Previous stack files backup:/i);
+  const downloadIndex = latestIndex(/^Downloading stack release:\s*/i);
+  const dirtyIndex = latestIndex(/^Local repo has uncommitted tracked changes\./i);
+
+  if (backupDoneIndex >= 0) {
+    const backupFile = nextIndentedLine(cleanLines, backupDoneIndex);
+    return { title: "Finishing Console Update", percent: 94, message: backupFile ? `Recorded backup at ${backupFile}.` : "Recording the previous console backup location." };
+  }
+  if (installedIndex >= 0) {
+    const version = cleanLines[installedIndex].trim().replace(/^Installed stack version:\s*/i, "").trim();
+    return { title: "Verifying Console Version", percent: 88, message: version ? `Installed console version ${version}. Verifying the update before finishing.` : "Verifying the installed console version." };
+  }
+  if (installIndex >= 0) {
+    const target = nextIndentedLine(cleanLines, installIndex);
+    return { title: "Installing Console Release", percent: 66, message: target ? `Installing the downloaded console release into ${target}.` : "Installing the downloaded console release files." };
+  }
+  if (backupIndex >= 0) {
+    const backupDir = nextIndentedLine(cleanLines, backupIndex);
+    return { title: "Backing Up Console Files", percent: 42, message: backupDir ? `Backing up current console files to ${backupDir}.` : "Backing up the current console files before replacing them." };
+  }
+  if (downloadIndex >= 0) {
+    const tag = cleanLines[downloadIndex].trim().replace(/^Downloading stack release:\s*/i, "").trim();
+    return { title: "Downloading Console Release", percent: 20, message: tag ? `Downloading console release ${tag} from GitHub.` : "Downloading the selected console release." };
+  }
+  if (dirtyIndex >= 0) {
+    return { title: "Preparing Console Backup", percent: 12, message: "Local tracked changes were detected; the updater will back up the current console files first." };
+  }
+  return null;
+}
+
+function nextIndentedLine(lines: string[], index: number) {
+  const next = lines[index + 1] || "";
+  return /^\S/.test(next) ? "" : next.trim();
+}
+
+function friendlyStackUpdateLine(line: string) {
+  if (/^Running selfUpdateApply$/i.test(line)) return "Preparing the console update.";
+  if (/^Task started$/i.test(line)) return "Preparing the console update.";
+  if (/Could not|failed|denied|rate-limited/i.test(line)) return line;
+  return "Working on the console update.";
+}
+
+async function waitForTaskWithUpdates(task: Task, setTask: (task: Task) => void) {
+  let current = task;
+  setTask(current);
+  for (let i = 0; i < 3600 && !isTerminalTask(current.status); i += 1) {
+    await new Promise((resolvePromise) => window.setTimeout(resolvePromise, 1000));
+    current = (await setupApi.task(current.id)).task;
+    setTask(current);
+  }
+  return current;
+}
+
+function isTerminalTask(status: string) {
+  return ["succeeded", "failed", "cancelled"].includes(status);
+}

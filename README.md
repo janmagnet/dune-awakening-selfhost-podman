@@ -3,6 +3,8 @@
 > [!CAUTION]
 > This is a very early experimental Podman port of the excellent [Dune Awakening Self-Host Docker](https://github.com/Red-Blink/dune-awakening-selfhost-docker) tool by RedBlink. If in doubt then use the original Docker tool instead of this port.
 
+This port follows upstream closely: upstream's scripts run unmodified, and a small Podman layer in [`runtime/podman/`](runtime/podman/README.md) routes their `docker` calls to rootful Podman.
+
 ![Podman](https://img.shields.io/badge/Podman-ready-brightgreen)
 ![Linux](https://img.shields.io/badge/Linux-supported-brightgreen)
 ![Self--Hosted](https://img.shields.io/badge/Self--Hosted-yes-brightgreen)
@@ -32,11 +34,11 @@ This project is unofficial. It is not affiliated with, endorsed by, sponsored by
 | Requirement | Plain explanation |
 |---|---|
 | Linux server | Fedora CoreOS or any systemd Linux with rootful Podman. Ubuntu 24.04 also works. |
-| Podman 4.4+ with Quadlet | Podman runs the server pieces as rootful systemd units. |
+| Podman 4.4+ | Podman runs the server containers as root. A Docker installation on the same host is left alone. |
 | python3 on the host | Used by setup, world/sietch state, and admin tools. Standard library only (no pip). |
 | Funcom self-host token | Required to authenticate your self-host server. |
 | CPU with AVX and AVX2 | Required by the game server. |
-| Disk space | 100 GB or more recommended. |
+| Disk space | 200 GB or more recommended. |
 | RAM | 20 GB minimum for a basic layout; more for extra maps. |
 
 RAM guide:
@@ -46,6 +48,7 @@ RAM guide:
 | Basic Hagga Basin / Sietch layout | 20 GB |
 | Hagga Basin plus story/social maps | 30 GB |
 | Hagga Basin plus story/social maps plus Deep Desert | 40 GB |
+| Many always-on maps or heavier player activity | 60 GB+ |
 
 If map containers fail with `Illegal instruction (core dumped)`, the machine usually does not expose AVX/AVX2 to Linux. This is common with some virtual machines and must be fixed in the host or hypervisor, not inside Ubuntu.
 
@@ -58,6 +61,12 @@ sudo runtime/scripts/install-command.sh
 ```
 
 The installer creates `/usr/local/bin/dune`, so you can run `dune manager` from anywhere. If you move the repo later, either reinstall the command or set `DUNE_PODMAN_DIR=/path/to/dune-awakening-selfhost-podman`.
+
+It also prepares the host for rootful Podman: it enables the Podman API socket, makes sure the server containers come back after a reboot, and (on SELinux hosts such as Fedora CoreOS) turns off SELinux label separation for Podman containers. It does not install a `docker` command. Re-running it is safe. See [`runtime/podman/README.md`](runtime/podman/README.md) for details.
+
+`dune` always runs as root and re-runs itself with `sudo` when needed.
+
+Do not use upstream's `install.sh` or `bootstrap.sh`: they install Docker and upstream's web console.
 
 ### 3. First-Time Setup
 
@@ -94,7 +103,7 @@ Run:
 dune manager
 ```
 
-The manager is the recommended path for non-technical users.
+The manager is the recommended path for non-technical users. Upstream has moved its manager into a web console, which this port does not run yet, so `dune manager` here opens upstream's terminal manager (`runtime/scripts/manager.sh`).
 
 | Manager menu | What it is for |
 |---|---|
@@ -127,7 +136,7 @@ Common beginner tasks:
 | Feature | Beginner access | Advanced command / location |
 |---|---|---|
 | Guided interactive manager | `dune manager` | `runtime/scripts/manager.sh` |
-| Podman + Quadlet server stack | Manager start/stop menus | `runtime/quadlet/`, `dune start`, `dune stop` |
+| Podman server stack | Manager start/stop menus | `dune start`, `dune stop` |
 | First-time setup | `dune init` | `runtime/scripts/init.sh` |
 | Status and readiness | Battlegroup Overview | `dune status`, `dune ready`, `dune ps`, `dune ports` |
 | Redacted logs | Logs menu | `dune logs <service>` |
@@ -153,7 +162,10 @@ Common beginner tasks:
 | Game server updates | Updates menu | `dune update ...` |
 | Automatic game updates | Updates menu | `dune update auto ...` |
 | Scheduled restart | Battlegroup Settings | `dune restart-schedule ...` |
+| Container image storage cleanup | — | `dune storage status`, `dune storage cleanup --dry-run` |
 | Runtime file repair | Updates menu | `runtime/generated/*catalog*.json` |
+
+Not available in this port yet: upstream's web console and its Compose add-ons (metrics, encrypted API, public server probe, realtime map agent). Commands that would start them, such as `dune console restart`, `dune metrics start` or `dune encrypted-api enable`, stop with a "not supported by the Podman port" message.
 
 Experimental or limited areas are labeled where they matter:
 
@@ -166,7 +178,7 @@ Experimental or limited areas are labeled where they matter:
 
 ### What Podman Does Here
 
-Podman runs the many server pieces as containers, managed as rootful systemd Quadlet services. You do not need to manage each container by hand if you use `dune manager`.
+Podman runs the many server pieces as containers. They restart automatically when they stop unexpectedly and come back after a reboot. You do not need to manage each container by hand if you use `dune manager`.
 
 The main always-on pieces are Postgres, RabbitMQ, TextRouter, Director, ServerGateway, Survival_1, and Overmap. Dynamic map containers can be spawned by the autoscaler when needed.
 
@@ -196,7 +208,7 @@ Do not share this file, paste it into chat, or include it in screenshots.
 |---|---|
 | `.env` | Your local server settings. |
 | `.env.example` | Example settings you can compare against. |
-| `runtime/quadlet/` | Quadlet network and volume units installed for the stack. |
+| `runtime/podman/` | The Podman layer that runs upstream's scripts on Podman. |
 | `runtime/scripts/` | The scripts behind `dune` and `dune manager`. |
 | `runtime/secrets/` | Local secrets such as the Funcom token. |
 | `runtime/generated/` | Generated config, catalogs, state, logs, and exports. |
@@ -412,7 +424,6 @@ Prefer the manager for Admin Tools because it gives player, item, vehicle, and s
 dune self-update check
 dune self-update list
 dune self-update install latest
-dune self-update install previous
 dune update check
 dune update
 dune update --yes
@@ -421,26 +432,23 @@ dune update auto disable
 dune update auto status
 ```
 
-`dune self-update` updates this self-host stack from GitHub releases. `dune update` updates Funcom game server files and images. Automatic updates use a systemd timer when systemd is available.
+`dune self-update` updates this self-host stack from this repository's GitHub releases (never from upstream's Docker releases). `dune update` updates Funcom game server files and images. Automatic updates use a systemd timer when systemd is available.
 
 ### Scheduled Restart
 
 ```bash
 dune restart-schedule status
-sudo dune restart-schedule enable 12
-sudo dune restart-schedule disable
+dune restart-schedule enable 04:00
+dune restart-schedule disable
 ```
 
-## Podman + Quadlet Architecture
+## How The Podman Port Works
 
-This repo runs the stack with rootful Podman. The long-lived services are installed as systemd Quadlet units (see `runtime/quadlet/` plus the units generated into `/etc/containers/systemd/` by `runtime/scripts/render-quadlet.sh` and the `start-*.sh` scripts). The orchestrator container builds/loads images and the autoscaler spawns dynamic map containers through the rootful Podman API socket.
+The stack runs on rootful Podman. Upstream's scripts call `docker`; the `dune` command puts a small `docker` shim first on `PATH`, which runs `podman` and translates only the behaviour that differs between the two (for example, timestamp formats and batch container removal). Containers that manage the stack themselves (orchestrator, autoscaler) reach Podman through its Docker-compatible API socket. A Docker installation on the same host is never used. See [`runtime/podman/README.md`](runtime/podman/README.md) for the full list of translations.
 
-The `dune-orchestrator` Quadlet unit defines:
+Containers use restart policies like upstream's Docker setup: they restart when they stop unexpectedly, and `podman-restart.service` (plus `dune-podman-restore.service` on Podman before 5.8.2) starts them again after a reboot.
 
-- `dune-orchestrator`, running with host networking.
-- A mount of the rootful Podman API socket (`/run/podman/podman.sock`) so it can load server images onto the host engine.
-- Named volumes for server files, Steam files, cache, and generated data.
-- A bind mount of `./work:/work`.
+The orchestrator is upstream's Compose service from `docker-compose.yml`, run by the shim as `dune-orchestrator` with host networking, the Podman API socket, and named volumes `<project>_dune-server`, `<project>_dune-steam`, `<project>_dune-cache`, `<project>_dune-generated` and `<project>_dune-work`.
 
 The runtime scripts then manage service containers named like:
 
@@ -455,11 +463,42 @@ The runtime scripts then manage service containers named like:
 | `dune-server-survival-1` | Always-on Survival_1 map server. |
 | `dune-server-overmap` | Always-on Overmap server. |
 | `dune-autoscaler` | Watches demand and starts/stops dynamic map servers. |
+| `dune-coriolis-coordinator` | Restarts the game servers when the game signals a Coriolis storm reset. |
 | `dune-server-<map>-<partition>` | Dynamic or extra map server containers. |
 
-Startup order in `dune start` is Postgres, database update, stale server cleanup, RabbitMQ, TextRouter, Director, Survival_1, Overmap, state publishers, Gateway, autoscaler, and deferred reconcile.
+Startup order in `dune start` is Postgres, database update, stale server cleanup, RabbitMQ, TextRouter, Director, Survival_1, Overmap, state publishers, Gateway, autoscaler, Coriolis coordinator, and deferred reconcile.
 
 Generated runtime files live mostly under `runtime/generated/`. Local secrets live under `runtime/secrets/`. Database backups live under `runtime/backups/db/`.
+
+## Upgrading From The Quadlet-Based Port
+
+Earlier versions of this port (v1.3.3) ran the services as Quadlet units. To upgrade:
+
+1. With the old version, back up the database and stop the server:
+
+   ```bash
+   dune db backup
+   dune stop
+   ```
+
+2. Get the new version (`git pull`) and reinstall the command. This removes the old Quadlet units and the old orchestrator image; the world database volume (`dune-postgres-data`) and the `dune-net` network are kept:
+
+   ```bash
+   sudo runtime/scripts/install-command.sh
+   ```
+
+3. Download the server files into the new orchestrator volumes, then start:
+
+   ```bash
+   dune update install-assets
+   dune start
+   ```
+
+4. Once the server works, remove the old server-file volumes:
+
+   ```bash
+   sudo podman volume rm dune-server dune-steam dune-cache dune-generated
+   ```
 
 ## Configuration
 
@@ -470,13 +509,15 @@ Generated runtime files live mostly under `runtime/generated/`. Local secrets li
 ```env
 SERVER_IP=auto
 SERVER_TITLE="My Dune Server"
-SERVER_REGION="Europe Test"
-SERVER_PROVIDER="dune-podman"
+SERVER_REGION="Europe"
+HOST_DATACENTER_ID="dune-podman"
 STEAM_APP_ID=4754530
 BATTLEGROUP_ID=
 ```
 
 `SERVER_IP=auto` detects the public IPv4 during init/start flows. The manager checks the player-facing IP before start/restart and can update `.env` if your IP changed.
+
+`HOST_DATACENTER_ID` replaces the older `SERVER_PROVIDER` setting, which is still honored when `HOST_DATACENTER_ID` is unset.
 
 ### Secrets
 
@@ -633,7 +674,7 @@ Update types:
 | Update type | Manager path | Command |
 |---|---|---|
 | This self-host stack | Updates -> Check Stack Update | `dune self-update check` |
-| Install stack release | Updates -> Restore Previous Stack or latest prompt | `dune self-update install latest` |
+| Install stack release | Updates -> Check Stack Update | `dune self-update install latest` |
 | Funcom game server files/images | Updates -> Check Game Server Update | `dune update check`, `dune update` |
 | Automatic game updates | Updates -> Automatic Updates | `dune update auto enable` |
 | Runtime catalog repair | Updates -> Repair Runtime Files | Manager-only helper flow |
@@ -663,18 +704,20 @@ Common problems:
 
 | Problem | What to try |
 |---|---|
-| `podman: command not found` | Install Podman 4.4+ (includes Quadlet). |
+| `podman: command not found` | Install Podman 4.4+. |
 | `python3: command not found` | Install python3 on the host. RHEL / Rocky / Alma: `sudo dnf install -y python3`, Debian / Ubuntu `sudo apt-get install -y python3`, or Fedora / Fedora CoreOS: `sudo rpm-ostree install python3 && sudo systemctl reboot`. |
 | Podman API socket not active | Run `sudo systemctl enable --now podman.socket`. |
 | Missing Funcom token | Run `dune init` or place it in `runtime/secrets/funcom-token.txt`. |
-| SteamCMD `state is 0x6` during init | Usually disk space, Steam anonymous depot availability, stale SteamCMD metadata, or Steam CDN/network failure. Check `sudo podman exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache`, free space, then retry `runtime/scripts/update.sh install`. |
+| SteamCMD `state is 0x6` during init | Usually disk space, Steam anonymous depot availability, stale SteamCMD metadata, or Steam CDN/network failure. Check `sudo podman exec dune-orchestrator df -h /srv/dune/server /srv/dune/steam /srv/dune/cache`, free space, then retry `dune update install`. |
 | Server not showing publicly | Check `SERVER_IP`, router/firewall forwarding, and `dune ports`. |
 | Server only needed for LAN | Use a local/private server IP during init. |
 | Port conflict | Run `dune ports` and check other services using the same ports. |
 | Database not starting | Run `dune doctor`, then inspect `dune logs postgres`. |
 | Services stuck warming | Wait several minutes, then run `dune ready` and check Director/Gateway/map logs. |
 | Runtime map picker missing | Manager -> Updates -> Runtime Files Status, then Repair Runtime Files. |
-| Permission issues with `dune` | Run `dune` as root (rootful Podman); reinstall with `sudo runtime/scripts/install-command.sh`. |
+| Permission issues with `dune` | `dune` re-runs itself with `sudo`; reinstall it with `sudo runtime/scripts/install-command.sh`. |
+| A script reached Docker instead of Podman | Run commands through `dune`. Running `runtime/scripts/*` directly bypasses the Podman layer. |
+| `... is not supported by the Podman port` | The web console and its Compose add-ons are not ported yet. |
 | Raw logs requested | Be careful; raw logs can contain tokens or player identifiers. |
 
 Podman install helper shown by `dune init` if Podman is missing:
@@ -685,7 +728,7 @@ sudo dnf install -y podman                              # RHEL / Rocky / Alma
 sudo apt-get update && sudo apt-get install -y podman   # Debian / Ubuntu
 ```
 
-Follow Podman's official install steps for your distribution if Podman 4.4+ (which includes Quadlet) is not already installed.
+Follow Podman's official install steps for your distribution if Podman 4.4+ is not already installed.
 
 ## FAQ
 
@@ -731,6 +774,7 @@ Use the manager's `Logs` menu or run `dune logs <service>`. Use `dune doctor` fo
 - Be careful exposing ports publicly. Only forward what is required.
 - Back up before database edits, imports, restores, or destructive SQL.
 - Admin Tools affect live players and live server state.
+- On SELinux hosts, the installer turns off SELinux label separation for Podman containers, because upstream's containers mount the repository and the container API socket without relabeling (Docker does not label containers by default). The game server containers already run privileged. Set `DUNE_PODMAN_KEEP_SELINUX_LABELS=1` when installing to keep labels.
 - If a token is exposed, rotate it from your Funcom self-host account page.
 
 This repository does not include Funcom game files, container image tarballs, tokens, secrets, or proprietary assets. Server files and images are downloaded or loaded at runtime by the user's own environment.
@@ -738,6 +782,8 @@ This repository does not include Funcom game files, container image tarballs, to
 ## Contributing And Project Notes
 
 This is a RedBlink community project. Keep `LICENSE` and `NOTICE` intact when redistributing or modifying it.
+
+The Podman port keeps upstream's files unchanged wherever possible. [`runtime/podman/README.md`](runtime/podman/README.md) describes how to merge new upstream releases and how to test the Podman layer.
 
 Runtime scripts live in `runtime/scripts/`. If you change Admin Tools, run:
 

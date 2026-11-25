@@ -1,0 +1,464 @@
+import { timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { audit } from "../../audit.js";
+import { readPlayerAnnouncements } from "../../services/playerAnnouncements.js";
+import { parseBackupListRows } from "../../statusParsers.js";
+import {
+  discordAdapterEnabled, discordAdapterErrorResponse, discordAdapterHealth,
+  discordAdapterPopulation, discordAdapterReadiness, discordAdapterServices,
+  discordAdapterStatus, discordWritesEnabled, DISCORD_ADAPTER_ROUTES, DISCORD_PLANNED_ADAPTER_ROUTES,
+  DISCORD_CATALOG_PROTOCOL_VERSION, validateDiscordActor, discordRoleMappingFromEnv
+} from "./adapter.js";
+import { buildCommandCatalog } from "./commandCatalog.js";
+import { discordActorTier, policyError, requireDiscordCapability, DISCORD_CAPABILITIES } from "./policy.js";
+import { discordStatusProvider } from "./statusProvider.js";
+import { discordReadinessProvider, discordServicesProvider } from "./readOnlyProviders.js";
+import {
+  opsActivityProvider, opsCombatProvider, opsResourcesProvider,
+  opsEconomyProvider, opsInventoryProvider,
+  opsSocProvider, opsPrometheusProvider
+} from "./opsProvider.js";
+import {
+  linkPlayerProvider,
+  verifyPlayerLinkProvider,
+  unlinkProvider,
+  whoamiProvider,
+  requireLinkedPlayer
+} from "./linkProvider.js";
+import {
+  playerInventoryProvider,
+  playerStorageProvider,
+  itemSearchProvider,
+  inventorySearchProvider
+} from "./inventoryProvider.js";
+import { broadcastProvider } from "./broadcastProvider.js";
+import { buildDuneArgs, runDockerLogs, runDune, validateServiceName } from "../../runner.js";
+import { sanitizeDiscordValue } from "./sanitize.js";
+import { initializeDiscordAdapterSchema } from "./schema.js";
+
+const INFRA_OPERATIONS = Object.freeze({
+  SERVERS: { operation: "servers", timeoutMs: 15000, capability: DISCORD_CAPABILITIES.SERVICES_READ },
+  PORTS: { operation: "ports", timeoutMs: 15000, capability: DISCORD_CAPABILITIES.SERVICES_READ },
+  DB: { operation: "dbStatus", timeoutMs: 15000, capability: DISCORD_CAPABILITIES.SERVICES_READ }
+});
+
+async function handleSecureInfraRoute({ key, config, json, res, actor }) {
+  const op = INFRA_OPERATIONS[key];
+  if (!op) throw policyError("not_found", "Unsupported infrastructure operation.", 404);
+  const mapping = discordRoleMappingFromEnv();
+  requireDiscordCapability(actor, mapping, op.capability);
+  const result = await runDune(config, buildDuneArgs(op.operation), {
+    timeoutMs: op.timeoutMs,
+    allowedExitCodes: [0]
+  });
+  return json(res, 200, {
+    ok: true,
+    operation: op.operation,
+    result: { output: (result.stdout || "").slice(0, 4000) }
+  });
+}
+
+async function defaultPopulationProvider(config) {
+  try {
+    const status = await discordStatusProvider(config);
+    const population = status?.population;
+    if (population !== undefined) return parsePopulationValue(population);
+
+    // Fallback: scan raw status for population-like fields
+    if (status && typeof status === "object") {
+      for (const [key, val] of Object.entries(status)) {
+        if (/pop/i.test(key) && typeof val === "string") {
+          return parsePopulationValue(val);
+        }
+        if (typeof val === "object" && val !== null) {
+          for (const [k2, v2] of Object.entries(val)) {
+            if (/pop/i.test(k2) && typeof v2 === "string") {
+              return parsePopulationValue(v2);
+            }
+          }
+        }
+      }
+    }
+    return { onlinePlayers: "unknown", totalPlayers: "unknown", aggregate: true, detailsSuppressed: true };
+  } catch {
+    return { onlinePlayers: "unknown", totalPlayers: "unknown", aggregate: true, detailsSuppressed: true };
+  }
+}
+
+function parsePopulationValue(value = "") {
+  const text = String(value).trim();
+  const match = text.match(/(\d+)\s*\/?\s*(\d+)/);
+  if (match) return { onlinePlayers: Number(match[1]), totalPlayers: match[2] ? Number(match[2]) : 0, aggregate: true, detailsSuppressed: true };
+  const num = Number(text);
+  if (Number.isFinite(num)) return { onlinePlayers: num, totalPlayers: 0, aggregate: true, detailsSuppressed: true };
+  return { onlinePlayers: "unknown", totalPlayers: "unknown", aggregate: true, detailsSuppressed: true };
+}
+
+function boundedEnvInt(name, fallback, min, max) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value >= min && value <= max ? value : fallback;
+}
+
+async function runOpsProvider(db, timeoutMs, provider) {
+  if (!db || typeof db.transaction !== "function") return provider(db);
+  return db.transaction(async (tx) => {
+    await tx.query("select set_config('statement_timeout', $1, true)", [`${timeoutMs}ms`]);
+    return provider(tx);
+  });
+}
+
+export function isDiscordAdapterRoute(path) {
+  return Object.values(DISCORD_ADAPTER_ROUTES).includes(path);
+}
+
+export async function handleDiscordAdapterRoute({
+  req, res, path, config, readJson, json, db,
+  statusProvider, readinessProvider, servicesProvider, populationProvider,
+  commandRunner = runDune,
+  dockerLogsRunner = runDockerLogs,
+  announcementsProvider = readPlayerAnnouncements
+}) {
+  const safeStatusProvider = typeof statusProvider === "function" ? statusProvider : () => discordStatusProvider(config);
+  const safeReadinessProvider = typeof readinessProvider === "function" ? readinessProvider : () => discordReadinessProvider(config);
+  const safeServicesProvider = typeof servicesProvider === "function" ? servicesProvider : () => discordServicesProvider(config);
+  const safePopulationProvider = typeof populationProvider === "function" ? populationProvider : () => defaultPopulationProvider(config);
+  try {
+    if (!discordAdapterEnabled(config)) throw policyError("adapter_disabled", "Discord adapter is disabled.", 404);
+    requireDiscordBotToken(req, config);
+
+    if (path.startsWith("/api/integrations/discord/players/") || path.startsWith("/api/integrations/discord/guilds/")) {
+      if (!db) throw policyError("database_unavailable", "Discord player data is unavailable.", 503);
+      await initializeDiscordAdapterSchema(db);
+    }
+
+    if (path === DISCORD_ADAPTER_ROUTES.HEALTH && req.method === "GET") {
+      return json(res, 200, await discordAdapterHealth(config));
+    }
+
+    // Command catalog (Phase 1 of docs/rfc-command-discovery.md).
+    // Bearer-token auth only (requireDiscordBotToken() above, matching
+    // HEALTH) -- no actor signature, no per-capability check: this is
+    // read-only metadata about route/command shape, not game or player
+    // data, so it does not need per-actor tier enforcement the way an
+    // actual data route does.
+    if (path === DISCORD_ADAPTER_ROUTES.CATALOG && req.method === "GET") {
+      return json(res, 200, { ok: true, protocolVersion: DISCORD_CATALOG_PROTOCOL_VERSION, catalog: buildCommandCatalog() });
+    }
+
+    if (path === DISCORD_ADAPTER_ROUTES.STATUS && req.method === "POST") {
+      const body = await readJson(req);
+      return json(res, 200, await discordAdapterStatus({
+        config,
+        actorPayload: body.actor,
+        diagnostic: Boolean(body.diagnostic),
+        statusProvider: safeStatusProvider
+      }));
+    }
+
+    if (path === DISCORD_ADAPTER_ROUTES.READINESS && req.method === "POST") {
+      const body = await readJson(req);
+      return json(res, 200, await discordAdapterReadiness({
+        config,
+        actorPayload: body.actor,
+        readinessProvider: safeReadinessProvider
+      }));
+    }
+
+    if (path === DISCORD_ADAPTER_ROUTES.SERVICES && req.method === "POST") {
+      const body = await readJson(req);
+      return json(res, 200, await discordAdapterServices({
+        config,
+        actorPayload: body.actor,
+        servicesProvider: safeServicesProvider
+      }));
+    }
+
+    if (path === DISCORD_ADAPTER_ROUTES.POPULATION && req.method === "POST") {
+      const body = await readJson(req);
+      return json(res, 200, await discordAdapterPopulation({
+        config,
+        actorPayload: body.actor,
+        populationProvider: safePopulationProvider
+      }));
+    }
+
+    const opsRoutes = {
+      [DISCORD_ADAPTER_ROUTES.OPS_ACTIVITY]: { capability: DISCORD_CAPABILITIES.OPS_ACTIVITY_READ, provider: opsActivityProvider },
+      [DISCORD_ADAPTER_ROUTES.OPS_COMBAT]: { capability: DISCORD_CAPABILITIES.OPS_COMBAT_READ, provider: opsCombatProvider },
+      [DISCORD_ADAPTER_ROUTES.OPS_RESOURCES]: { capability: DISCORD_CAPABILITIES.OPS_RESOURCES_READ, provider: opsResourcesProvider },
+      [DISCORD_ADAPTER_ROUTES.OPS_ECONOMY]: { capability: DISCORD_CAPABILITIES.OPS_ECONOMY_READ, provider: opsEconomyProvider },
+      [DISCORD_ADAPTER_ROUTES.OPS_INVENTORY]: { capability: DISCORD_CAPABILITIES.OPS_INVENTORY_READ, provider: opsInventoryProvider },
+      [DISCORD_ADAPTER_ROUTES.OPS_SOC]: { capability: DISCORD_CAPABILITIES.OPS_SOC_READ, provider: opsSocProvider, queryBound: false },
+      [DISCORD_ADAPTER_ROUTES.OPS_PROMETHEUS]: { capability: DISCORD_CAPABILITIES.OPS_PROMETHEUS_READ, provider: opsPrometheusProvider, queryBound: false }
+    };
+
+    if (opsRoutes[path] && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      const mapping = discordRoleMappingFromEnv();
+      const route = opsRoutes[path];
+      requireDiscordCapability(actor, mapping, route.capability);
+      const timeoutMs = boundedEnvInt("DUNE_OPS_QUERY_TIMEOUT_MS", 5000, 250, 30000);
+      const maxBytes = boundedEnvInt("DUNE_OPS_MAX_RESPONSE_BYTES", 65536, 1024, 1048576);
+      const result = route.queryBound === false
+        ? await route.provider(config, db)
+        : await runOpsProvider(db, timeoutMs, (queryDb) => route.provider(config, queryDb));
+      const response = Buffer.byteLength(JSON.stringify(result), "utf8") <= maxBytes
+        ? result
+        : { ok: false, _truncated: true, _maxBytes: maxBytes, error: "OPS response exceeded the configured size limit." };
+      audit(config, req, "discord.ops", { route: path, userId: actor.userId, tier: discordActorTier(actor, mapping), ok: response.ok !== false });
+      return json(res, 200, response);
+    }
+
+    // Broadcast route — gated behind write enablement, actor identity, and admin/owner capability.
+    if (path === DISCORD_ADAPTER_ROUTES.BROADCAST && req.method === "POST") {
+      if (!discordWritesEnabled(config)) throw policyError("writes_disabled", "Write operations are not enabled.", 403);
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      const mapping = discordRoleMappingFromEnv();
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.BROADCAST_SEND);
+      const result = await broadcastProvider(config, { message: body.message });
+      return json(res, 200, result);
+    }
+
+    // Announcement settings used by the companion bot's read-only status command.
+    if (path === DISCORD_ADAPTER_ROUTES.ANNOUNCEMENTS && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, discordRoleMappingFromEnv(), DISCORD_CAPABILITIES.MAPS_READ);
+      const announcements = await announcementsProvider(config);
+      return json(res, 200, { ok: true, announcements: sanitizeDiscordValue(announcements) });
+    }
+
+    // Backup metadata only. No create, restore, delete, or filesystem paths.
+    if (path === DISCORD_ADAPTER_ROUTES.BACKUPS_LIST && req.method === "GET") {
+      const result = await commandRunner(config, buildDuneArgs("backupList"), {
+        timeoutMs: 15000,
+        allowedExitCodes: [0]
+      });
+      return json(res, 200, { ok: true, backups: parseBackupListRows(result.stdout || "").slice(0, 100) });
+    }
+
+    const mapping = discordRoleMappingFromEnv();
+
+    // Players link
+    if (path === DISCORD_ADAPTER_ROUTES.PLAYERS_LINK && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.PLAYER_LINK_WRITE);
+      return json(res, 200, await linkPlayerProvider(db, config, {
+        discordUserId: actor.userId,
+        characterName: body.characterName
+      }));
+    }
+
+    // Players link verify
+    if (path === DISCORD_ADAPTER_ROUTES.PLAYERS_LINK_VERIFY && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.PLAYER_LINK_WRITE);
+      return json(res, 200, await verifyPlayerLinkProvider(db, {
+        discordUserId: actor.userId,
+        code: body.code
+      }));
+    }
+
+    // Players unlink
+    if (path === DISCORD_ADAPTER_ROUTES.PLAYERS_UNLINK && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.PLAYER_LINK_WRITE);
+      return json(res, 200, await unlinkProvider(db, {
+        discordUserId: actor.userId
+      }));
+    }
+
+    // Players me
+    if (path === DISCORD_ADAPTER_ROUTES.PLAYERS_ME && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.INVENTORY_READ);
+      return json(res, 200, await whoamiProvider(db, {
+        discordUserId: actor.userId
+      }));
+    }
+
+    // Players inventory
+    if (path === DISCORD_ADAPTER_ROUTES.PLAYERS_INVENTORY && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.INVENTORY_READ);
+      const linked = await requireLinkedPlayer(db, actor.userId);
+      return json(res, 200, await playerInventoryProvider(db, {
+        playerPawnId: linked.player_pawn_id,
+        characterName: linked.character_name
+      }));
+    }
+
+    // Players storage
+    if (path === DISCORD_ADAPTER_ROUTES.PLAYERS_STORAGE && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.STORAGE_READ);
+      const linked = await requireLinkedPlayer(db, actor.userId);
+      const scope = body.scope || "owned";
+      if (scope !== "owned" && scope !== "guild") {
+        throw policyError("invalid_scope", 'Storage scope must be "owned" or "guild".');
+      }
+      return json(res, 200, await playerStorageProvider(db, {
+        playerControllerId: linked.player_controller_id,
+        scope
+      }));
+    }
+
+    // Players find (item search in containers)
+    if (path === DISCORD_ADAPTER_ROUTES.PLAYERS_FIND && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.INVENTORY_READ);
+      const linked = await requireLinkedPlayer(db, actor.userId);
+      const scope = body.scope || "owned";
+      if (scope !== "owned" && scope !== "guild") {
+        throw policyError("invalid_scope", 'Search scope must be "owned" or "guild".');
+      }
+      return json(res, 200, await itemSearchProvider(db, {
+        playerControllerId: linked.player_controller_id,
+        query: body.query,
+        scope
+      }));
+    }
+
+    // Players inventory search
+    if (path === DISCORD_ADAPTER_ROUTES.PLAYERS_INVENTORY_SEARCH && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.INVENTORY_READ);
+      const linked = await requireLinkedPlayer(db, actor.userId);
+      return json(res, 200, await inventorySearchProvider(db, {
+        playerPawnId: linked.player_pawn_id,
+        query: body.query
+      }));
+    }
+
+    // Guild storage
+    if (path === DISCORD_ADAPTER_ROUTES.GUILD_STORAGE && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.GUILD_READ);
+      const linked = await requireLinkedPlayer(db, actor.userId);
+      return json(res, 200, await playerStorageProvider(db, {
+        playerControllerId: linked.player_controller_id,
+        scope: "guild"
+      }));
+    }
+
+    // Guild find (item search in guild containers)
+    if (path === DISCORD_ADAPTER_ROUTES.GUILD_FIND && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.GUILD_READ);
+      const linked = await requireLinkedPlayer(db, actor.userId);
+      return json(res, 200, await itemSearchProvider(db, {
+        playerControllerId: linked.player_controller_id,
+        query: body.query,
+        scope: "guild"
+      }));
+    }
+
+    if (path === DISCORD_ADAPTER_ROUTES.SERVERS && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      return handleSecureInfraRoute({ key: "SERVERS", config, json, res, actor });
+    }
+    if (path === DISCORD_ADAPTER_ROUTES.PORTS && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      return handleSecureInfraRoute({ key: "PORTS", config, json, res, actor });
+    }
+    if (path === DISCORD_ADAPTER_ROUTES.DB && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      return handleSecureInfraRoute({ key: "DB", config, json, res, actor });
+    }
+
+    if (path === DISCORD_ADAPTER_ROUTES.VERSION && req.method === "GET") {
+      return json(res, 200, { ok: true, version: config.version || "dev" });
+    }
+
+    if (path === DISCORD_ADAPTER_ROUTES.MAINTENANCE && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.READINESS_READ);
+      const result = await commandRunner(config, buildDuneArgs("readiness"), {
+        timeoutMs: 15000,
+        allowedExitCodes: [0, 1]
+      });
+      return json(res, 200, { ok: result.code === 0, output: cappedOutput(result.stdout || result.stderr) });
+    }
+
+    if (path === DISCORD_ADAPTER_ROUTES.LOGS && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.LOGS_READ);
+      const service = validateServiceName(body.service);
+      const result = await dockerLogsRunner(service, { tail: 100, timeoutMs: 10000 });
+      const lines = sanitizeDiscordValue(`${result.stdout || ""}${result.stderr || ""}`)
+        .split(/\r?\n/).filter(Boolean).slice(-50);
+      return json(res, 200, { ok: true, service, lines });
+    }
+
+    if (path === DISCORD_ADAPTER_ROUTES.MAP_STATE && req.method === "POST") {
+      const body = await readJson(req);
+      const actor = validateDiscordActor(body.actor);
+      requireDiscordCapability(actor, mapping, DISCORD_CAPABILITIES.MAPS_READ);
+      const result = await commandRunner(config, buildDuneArgs("mapsList"), {
+        timeoutMs: 15000,
+        allowedExitCodes: [0]
+      });
+      const output = cappedOutput(result.stdout || result.stderr);
+      return json(res, 200, { ok: true, maps: output.split(/\r?\n/).filter(Boolean), output });
+    }
+
+    throw policyError("not_found", "Discord adapter route not found.", 404);
+  } catch (error) {
+    const response = discordAdapterErrorResponse(error);
+    return json(res, response.statusCode, response.body);
+  }
+}
+
+function cappedOutput(value, maxChars = 12000) {
+  return sanitizeDiscordValue(String(value || "")).slice(0, maxChars);
+}
+
+export function requireDiscordBotToken(req, config) {
+  const expected = readDiscordBotApiToken(config);
+  if (!expected) throw policyError("bot_token_not_configured", "Adapter credential is not configured.", 503);
+
+  const actual = bearerToken(req?.headers?.authorization || req?.headers?.Authorization || "");
+  if (!actual) throw policyError("missing_bot_token", "Missing adapter credential.", 401);
+  if (!constantTimeStringEqual(actual, expected)) throw policyError("invalid_bot_token", "Invalid adapter credential.", 401);
+}
+
+export function readDiscordBotApiToken(config) {
+  const directToken = process.env.DUNE_DISCORD_ADAPTER_TOKEN || config?.discordAdapterToken || "";
+  if (directToken) return String(directToken).trim();
+  const tokenFile = process.env.DUNE_DISCORD_ADAPTER_TOKEN_FILE || process.env.DUNE_BOT_API_TOKEN_FILE || config?.discordAdapterTokenFile || config?.discordBotApiTokenFile || "";
+  if (!tokenFile) return "";
+  try {
+    return readFileSync(tokenFile, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function bearerToken(value) {
+  const parts = String(value || "").split(/\s+/);
+  return parts.length === 2 && /^Bearer$/i.test(parts[0]) ? parts[1].trim() : "";
+}
+
+function constantTimeStringEqual(actual, expected) {
+  const actualBuffer = Buffer.from(String(actual));
+  const expectedBuffer = Buffer.from(String(expected));
+  if (actualBuffer.length !== expectedBuffer.length) return false;
+  return timingSafeEqual(actualBuffer, expectedBuffer);
+}

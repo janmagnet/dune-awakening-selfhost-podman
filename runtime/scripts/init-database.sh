@@ -4,14 +4,14 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 cd "$(dirname "$0")/../.."
-[ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+[ -r runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
 source runtime/scripts/image-tags.sh
 DB_UTILS_IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-db-utils:$(resolve_world_image_tag)"
 PARTITION_PRESET="${PARTITION_PRESET:-full_battlegroup}"
 
 echo "Initializing Dune database with partition preset: ${PARTITION_PRESET}"
 
-engine run --rm \
+docker run --rm \
   --network dune-net \
   --entrypoint sh \
   "$DB_UTILS_IMAGE" \
@@ -42,4 +42,4 @@ echo "Database initialization finished."
 
 echo
 echo "Checking schema/version tables..."
-engine exec dune-postgres psql -U dune -d dune -c "\\dt" | head -80
+docker exec dune-postgres psql -U dune -d dune -c "\\dt" | head -80

@@ -3,14 +3,47 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+set -a
+[ -f .env ] && . ./.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+set +a
 source runtime/scripts/runtime-env.sh
+source runtime/scripts/fls-signals.sh
+source runtime/scripts/farm-readiness.sh
+# shellcheck source=runtime/scripts/lib/postgres.sh
+source runtime/scripts/lib/postgres.sh
+# shellcheck source=runtime/scripts/lib/rabbitmq.sh
+source runtime/scripts/lib/rabbitmq.sh
+
+postgres_port="$(resolve_postgres_port)"
+rmq_admin_port="$(resolve_rmq_admin_port)"
+rmq_game_port="$(resolve_rmq_game_port)"
+rmq_game_http_port="$(resolve_rmq_game_http_port)"
+text_router_port="$(resolve_text_router_port)"
+director_port="$(resolve_director_port)"
 
 fail=0
 wait=0
+docker_timeout_seconds="${DUNE_READY_DOCKER_TIMEOUT_SECONDS:-12}"
+log_tail_lines="${DUNE_READY_LOG_TAIL_LINES:-4000}"
+
+docker_timeout() {
+  timeout --kill-after=2s "${docker_timeout_seconds}s" "$@"
+}
+
+# The database checks below run through lib/postgres.sh (sourced by
+# farm-readiness.sh) rather than a `docker exec` each. docker_timeout cannot
+# wrap them -- `timeout` runs a program and the seam is a shell function -- so
+# the seam is handed the same budget and applies it to whichever leg it picks.
+DUNE_PSQL_TIMEOUT_SECONDS="$docker_timeout_seconds"
+
+db_bool_true() {
+  [[ "${1,,}" =~ ^(t|true|1|yes|y)$ ]]
+}
 
 is_running() {
   local name="$1"
-  engine ps --format '{{.Names}}' | grep -qx "$name"
+  docker_timeout docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null | grep -qx true
 }
 
 mark_ok() {
@@ -25,6 +58,20 @@ mark_wait() {
 mark_fail() {
   echo "FAIL $*"
   fail=1
+}
+
+tcp_socket_listening() {
+  local port="$1"
+  local sockets
+  sockets="$(ss -lntp 2>/dev/null || true)"
+  grep -q ":$port " <<<"$sockets"
+}
+
+udp_socket_listening() {
+  local port="$1"
+  local sockets
+  sockets="$(ss -lnup 2>/dev/null || true)"
+  grep -q ":$port " <<<"$sockets"
 }
 
 check_container() {
@@ -42,7 +89,7 @@ check_tcp() {
   local label="$2"
   local container="${3:-}"
 
-  if ss -lntp | grep -q ":$port "; then
+  if tcp_socket_listening "$port"; then
     mark_ok "TCP $port $label"
   elif [ -n "$container" ] && is_running "$container"; then
     mark_wait "TCP $port $label"
@@ -52,12 +99,25 @@ check_tcp() {
   fi
 }
 
+container_logs_have_udp_listener() {
+  local container="$1"
+  local port="$2"
+
+  [ -n "$container" ] || return 1
+  is_running "$container" || return 1
+
+  container_logs "$container" \
+    | grep -Eq "listening for (Clients|Servers) on [0-9.]+:${port}\\b"
+}
+
 check_udp() {
   local port="$1"
   local label="$2"
   local container="${3:-}"
 
-  if ss -lnup | grep -q ":$port "; then
+  if udp_socket_listening "$port"; then
+    mark_ok "UDP $port $label"
+  elif container_logs_have_udp_listener "$container" "$port"; then
     mark_ok "UDP $port $label"
   elif [ -n "$container" ] && is_running "$container"; then
     mark_wait "UDP $port $label"
@@ -69,7 +129,12 @@ check_udp() {
 
 container_logs() {
   local container="$1"
-  engine logs "$container" 2>&1 || true
+  local started_at
+  # Docker retains previous process logs after an automatic restart. Only the
+  # current attempt can establish listeners, readiness or a startup failure.
+  started_at="$(docker_timeout docker inspect -f '{{.State.StartedAt}}' "$container" 2>/dev/null)" || return 0
+  [ -n "$started_at" ] || return 0
+  docker_timeout docker logs --since "$started_at" --tail "$log_tail_lines" "$container" 2>&1 || true
 }
 
 container_partition_id() {
@@ -83,7 +148,7 @@ partition_map_and_server() {
   local partition_id="$1"
 
   [ -n "$partition_id" ] || return 1
-  engine exec dune-postgres psql -U dune -d dune -Atc "
+  psql_app_value "
     select map || '|' || coalesce(server_id, '')
     from dune.world_partition
     where partition_id = $partition_id
@@ -99,7 +164,7 @@ server_effective_players() {
     return 0
   }
 
-  engine exec dune-postgres psql -U dune -d dune -Atc "
+  psql_app_value "
     select count(*)
     from dune.player_state
     where server_id = '${server_id//\'/\'\'}'
@@ -129,7 +194,7 @@ partition_effective_players() {
     return 0
   }
 
-  engine exec dune-postgres psql -U dune -d dune -Atc "
+  psql_app_value "
     select count(*)
     from dune.player_state ps
     left join dune.farm_state fs on fs.server_id = ps.server_id
@@ -164,7 +229,7 @@ map_has_recent_travel_demand() {
   [ -n "$map_name" ] || return 1
   is_running dune-director || return 1
 
-  engine logs --since 5m dune-director 2>&1 \
+  docker_timeout docker logs --since 5m dune-director 2>&1 \
     | grep -Fq "Processing travel queue for ClassicalInstancing group ${map_name} "
 }
 
@@ -227,7 +292,14 @@ check_game_server_ready() {
   local label="$2"
   local pattern="${3:-Server farm is READY}"
   local partition_id=""
-  local farm_ready=""
+  local required_reports="0"
+  local logs=""
+
+  if ! is_running "$container"; then
+    mark_fail "$label ready"
+    echo "     $container is not running."
+    return
+  fi
 
   if [[ "$container" =~ -([0-9]+)$ ]]; then
     partition_id="${BASH_REMATCH[1]}"
@@ -237,20 +309,25 @@ check_game_server_ready() {
     partition_id="2"
   fi
 
-  if [ -n "$partition_id" ] && is_running dune-postgres; then
-    farm_ready="$(
-      engine exec dune-postgres psql -U dune -d dune -Atc "
-        select coalesce(fs.ready::text, 'f')
-        from dune.world_partition wp
-        left join dune.farm_state fs on fs.server_id = wp.server_id
-        where wp.partition_id = ${partition_id}
-        limit 1;
-      " 2>/dev/null | tr -d '[:space:]'
-    )"
-    if [ "$farm_ready" = "t" ]; then
-      mark_ok "$label ready"
-      return
+  if [ "$partition_id" = "1" ]; then
+    required_reports="$farm_ready_survival_reports"
+  fi
+
+  if [ -n "$partition_id" ] && farm_partition_is_ready "$container" "$partition_id" "$required_reports"; then
+    mark_ok "$label ready"
+    return
+  fi
+
+  if [ -n "$partition_id" ]; then
+    logs="$(container_logs "$container")"
+    if logs_have_fatal "$logs"; then
+      mark_fail "$label ready"
+      echo "     $container logged a fatal-looking startup error."
+    else
+      mark_wait "$label warming - finalizing startup"
+      echo "     The map is running, but farm-wide travel/login readiness is not stable yet."
     fi
+    return
   fi
 
   check_log_ready \
@@ -261,17 +338,35 @@ check_game_server_ready() {
     "This is normal after init/start/restart; game maps can take several minutes to finish loading."
 }
 
+# `rabbitmqctl list_connections user state`, preferring the management API.
+#
+# This is the most frequently repeated exec in the stack: the autoscaler runs a
+# ready sweep every 30 seconds, this check retries once, and each attempt used
+# to be a container exec whose conmon pair stays resident for the engine's exit
+# delay. The HTTP leg answers the same question over the loopback management
+# port with no exec at all.
+#
+# The fallback is the exact call that ran here before, and it runs whenever the
+# seam declines -- no curl, no published loopback port, no credentials in the
+# director log, a non-2xx answer. `local` scopes the HTTP budget to this
+# function and whatever it calls, so the seam gets the same 7 seconds the
+# `timeout` gives the exec and nothing outside inherits it.
 game_server_rmq_connections_ready() {
-  local attempt
+  local attempt connections
+  local RMQ_HTTP_TIMEOUT_SECONDS=7
 
-  for attempt in 1 2 3 4 5; do
-    if engine exec dune-rmq-game rabbitmqctl list_connections user state 2>/dev/null \
+  for attempt in 1 2; do
+    connections="$(dune_rmq_game_connections 2>/dev/null)" \
+      || connections="$(timeout 7 docker exec dune-rmq-game rabbitmqctl list_connections user state 2>/dev/null)" \
+      || connections=""
+
+    if printf '%s\n' "$connections" \
       | awk '$1 ~ /^sg[.]/ && $2 == "running" { found=1 } END { exit(found ? 0 : 1) }'; then
       return 0
     fi
 
-    if [ "$attempt" -lt 5 ]; then
-      sleep 2
+    if [ "$attempt" -lt 2 ]; then
+      sleep 1
     fi
   done
 
@@ -285,21 +380,9 @@ director_fls_ready() {
     return 1
   fi
 
-  logs="$(engine logs --tail 3000 dune-director 2>&1 || true)"
+  logs="$(container_logs dune-director)"
 
-  if grep -q 'Battlegroups_SendBattlegroupHeartbeat.*Request successful' <<< "$logs"; then
-    return 0
-  fi
-
-  if grep -Eq 'Population declaration: .*"IsLocked":false' <<< "$logs"; then
-    return 0
-  fi
-
-  if grep -q 'RMQ connection successful.*Initiating heartbeat' <<< "$logs"; then
-    return 0
-  fi
-
-  return 1
+  director_fls_logs_ready "$logs"
 }
 
 partition_mismatch_hint_needed() {
@@ -307,12 +390,22 @@ partition_mismatch_hint_needed() {
 
   logs="$(
     {
-      engine logs --since 10m dune-server-survival-1 2>&1 || true
-      engine logs --since 10m dune-server-overmap 2>&1 || true
+      docker_timeout docker logs --since 10m dune-server-survival-1 2>&1 || true
+      docker_timeout docker logs --since 10m dune-server-overmap 2>&1 || true
     }
   )"
 
   grep -Eq 'Invalid PartitionId|has no partition definition|thinks farm size is|waiting for persistence to finish initial load' <<< "$logs"
+}
+
+heal_core_readiness_if_possible() {
+  is_running dune-postgres || return 0
+
+  if ! is_running dune-server-survival-1 && ! is_running dune-server-overmap; then
+    return 0
+  fi
+
+  bash runtime/scripts/heal-core-ready.sh all >/dev/null 2>&1 || true
 }
 
 echo "=== Container checks ==="
@@ -331,12 +424,12 @@ done
 
 echo
 echo "=== Listener checks ==="
-check_tcp 15432 "Postgres localhost" "dune-postgres"
-check_tcp 32573 "RabbitMQ admin localhost" "dune-rmq-admin"
-check_tcp 31982 "RabbitMQ game public" "dune-rmq-game"
-check_tcp 31983 "RabbitMQ game HTTP public" "dune-rmq-game"
-check_tcp 5059  "TextRouter localhost" "dune-text-router"
-check_tcp 11717 "Director localhost" "dune-director"
+check_tcp "$postgres_port" "Postgres localhost" "dune-postgres"
+check_tcp "$rmq_admin_port" "RabbitMQ admin localhost" "dune-rmq-admin"
+check_tcp "$rmq_game_port" "RabbitMQ game public" "dune-rmq-game"
+check_tcp "$rmq_game_http_port" "RabbitMQ game HTTP public" "dune-rmq-game"
+check_tcp "$text_router_port" "TextRouter localhost" "dune-text-router"
+check_tcp "$director_port" "Director localhost" "dune-director"
 
 client_port_base="$(resolve_client_port_base)"
 igw_port_base="$(resolve_igw_port_base)"
@@ -348,21 +441,30 @@ check_udp "$((igw_port_base + 1))" "Overmap S2S" "dune-server-overmap"
 echo
 echo "=== Database world partition checks ==="
 if is_running dune-postgres; then
-  partition_count="$(engine exec dune-postgres psql -U dune -d dune -Atc "select count(*) from world_partition;" 2>/dev/null | tr -d '[:space:]' || true)"
+  partition_count="$(psql_app_value "select count(*) from world_partition;" 2>/dev/null | tr -d '[:space:]' || true)"
   partition_count="${partition_count:-0}"
 
   if [ "$partition_count" -gt 0 ]; then
     mark_ok "world_partition rows: $partition_count"
+    if runtime/scripts/reconcile-world-partitions.sh --check >/dev/null 2>&1; then
+      mark_ok "official world partitions"
+    else
+      mark_fail "official world partitions"
+      echo "     Installed map definitions are missing from the database. Run:"
+      echo "       runtime/scripts/dune start"
+    fi
   else
     mark_fail "world_partition rows: 0"
     echo "     Fresh init needs canonical world partitions. Run:"
     echo "       runtime/scripts/generate-world-partitions-sql.sh"
-    echo "       podman exec -i dune-postgres psql -U dune -d dune < runtime/generated/reset-world-partitions.sql"
+    echo "       docker exec -i dune-postgres psql -U dune -d dune < runtime/generated/reset-world-partitions.sql"
   fi
 else
   mark_fail "world_partition check"
   echo "     dune-postgres is not running."
 fi
+
+heal_core_readiness_if_possible
 
 echo
 echo "=== Readiness log checks ==="
@@ -413,7 +515,7 @@ while IFS= read -r c; do
 
   farm_ready="f"
   if [ -n "$server_id" ]; then
-    farm_ready="$(engine exec dune-postgres psql -U dune -d dune -Atc "
+    farm_ready="$(psql_app_value "
       select coalesce(ready::text, 'f')
       from dune.farm_state
       where server_id = '${server_id//\'/\'\'}'
@@ -422,14 +524,14 @@ while IFS= read -r c; do
     farm_ready="${farm_ready:-f}"
   fi
 
-  if [ "$farm_ready" = "t" ]; then
+  if db_bool_true "$farm_ready"; then
     check_game_server_ready "$c" "$c"
     continue
   fi
 
   connected_players="0"
   if [ -n "$server_id" ]; then
-    connected_players="$(engine exec dune-postgres psql -U dune -d dune -Atc "
+    connected_players="$(psql_app_value "
       select coalesce(connected_players::text, '0')
       from dune.farm_state
       where server_id = '${server_id//\'/\'\'}'
@@ -447,7 +549,7 @@ while IFS= read -r c; do
   fi
 
   check_game_server_ready "$c" "$c"
-done < <(engine ps --format '{{.Names}}' | grep '^dune-server-' || true)
+done < <(docker_timeout docker ps --format '{{.Names}}' | grep '^dune-server-' || true)
 
 if [ "$dynamic_found" -eq 0 ]; then
   echo "OK   no dynamic game maps currently running"
@@ -466,7 +568,7 @@ fi
 
 echo
 if [ "$fail" -eq 0 ] && [ "$wait" -eq 0 ]; then
-  echo "READY: Dune Awakening Self-Host Podman stack looks healthy."
+  echo "READY: Dune Awakening Self-Host Docker stack looks healthy."
   echo
   echo "Note: after local READY, the in-game server browser may still take a few minutes"
   echo "to show population and sietch availability while Funcom/FLS and the client refresh."
@@ -478,9 +580,7 @@ elif [ "$fail" -eq 0 ]; then
   echo
   if partition_mismatch_hint_needed; then
     echo "Possible runtime partition mismatch detected."
-    echo "If maps stay WARMING after an update, run:"
-    echo "  dune manager"
-    echo "  Updates -> Repair Runtime Files"
+    echo "If maps stay WARMING after an update, open Dune Docker Console and use Updates repair actions."
     echo
   fi
   echo "After READY, population and sietch availability may still take a few minutes"

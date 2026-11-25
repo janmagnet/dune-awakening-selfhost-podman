@@ -4,8 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 [ -f .env ] && . ./.env
-[ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 source runtime/scripts/runtime-env.sh
+
+rmq_game_port="$(resolve_rmq_game_port)"
+rmq_game_http_port="$(resolve_rmq_game_http_port)"
 
 fail=0
 warn=0
@@ -26,22 +29,30 @@ fail_msg() {
 
 container_running() {
   local name="$1"
-  engine ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
 }
 
 container_arg_has() {
   local container="$1"
   local pattern="$2"
 
-  engine inspect "$container" --format '{{range .Args}}{{println .}}{{end}}' 2>/dev/null | grep -Fxq -- "$pattern"
+  docker inspect "$container" --format '{{range .Args}}{{println .}}{{end}}' 2>/dev/null | grep -Fxq -- "$pattern"
 }
 
 container_arg_value() {
   local container="$1"
   local prefix="$2"
 
-  engine inspect "$container" --format '{{range .Args}}{{println .}}{{end}}' 2>/dev/null \
+  docker inspect "$container" --format '{{range .Args}}{{println .}}{{end}}' 2>/dev/null \
     | awk -v prefix="$prefix" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }'
+}
+
+container_env_value() {
+  local container="$1"
+  local key="$2"
+
+  docker inspect "$container" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+    | awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); exit }'
 }
 
 ss_has_udp() {
@@ -52,6 +63,48 @@ ss_has_udp() {
 ss_has_tcp() {
   local port="$1"
   ss -lntp 2>/dev/null | grep -Eq "[:.]${port}[[:space:]]"
+}
+
+udp_listener_addresses_for_port() {
+  local port="$1"
+
+  awk -v port="$port" '
+    $0 ~ "[:.]" port "[[:space:]]" {
+      local = $4
+      gsub(/^\[/, "", local)
+      gsub(/\]$/, "", local)
+      sub(":" port "$", "", local)
+      print local
+    }
+  ' /tmp/dune-ping-ss-udp.out 2>/dev/null | sort -u
+}
+
+check_udp_listener_bind() {
+  local label="$1"
+  local port="$2"
+  local addresses
+
+  addresses="$(udp_listener_addresses_for_port "$port" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  if [ -z "$addresses" ]; then
+    fail_msg "$label is not listening on UDP $port"
+    return 0
+  fi
+
+  if [ "$server_ip" != "$bind_ip" ] && printf '%s\n' "$addresses" | grep -Eq "(^|[[:space:]])${server_ip//./\\.}([[:space:]]|$)"; then
+    fail_msg "NAT address mismatch. $label UDP $port is bound to $server_ip, but SERVER_BIND_IP resolves to $bind_ip."
+    echo "     Game sockets must bind to SERVER_BIND_IP while farm_state.game_addr advertises SERVER_IP."
+    if [ "$(read_ipv4_ip_nonlocal_bind 2>/dev/null || true)" = "1" ]; then
+      echo "     net.ipv4.ip_nonlocal_bind=1 allows binding to non-local public IPs and can cause this."
+      echo "     Fix: sudo sysctl -w net.ipv4.ip_nonlocal_bind=0, then restart the stack."
+    fi
+    return 0
+  fi
+
+  if printf '%s\n' "$addresses" | grep -Eq "(^|[[:space:]])(${bind_ip//./\\.}|0\.0\.0\.0|\*)($|[[:space:]])"; then
+    ok "$label listening on UDP $port at ${addresses}"
+  else
+    warn_msg "$label UDP $port is listening at ${addresses}; expected $bind_ip or 0.0.0.0"
+  fi
 }
 
 ini_value() {
@@ -72,7 +125,7 @@ ini_value() {
 }
 
 docker_available() {
-  engine ps >/dev/null 2>&1
+  docker ps >/dev/null 2>&1
 }
 
 print_row() {
@@ -81,10 +134,12 @@ print_row() {
 
 server_ip="$(resolve_server_ip)"
 bind_ip="$(resolve_bind_ip)"
+igw_advertised_ip="$(resolve_igw_addr_ip)"
 mode="$(resolve_server_ip_mode 2>/dev/null || printf '%s' unknown)"
 title="$(resolve_server_title)"
 region="$(resolve_server_region)"
 battlegroup="$(resolve_battlegroup_id)"
+datacenter_id="$(resolve_host_datacenter_id 2>/dev/null || true)"
 client_port_base="$(resolve_client_port_base)"
 igw_port_base="$(resolve_igw_port_base)"
 overmap_game_port="$client_port_base"
@@ -97,27 +152,60 @@ echo
 print_row "Title" "$title" ""
 print_row "Region" "$region" ""
 print_row "Battlegroup" "$battlegroup" ""
+print_row "Datacenter ID" "${datacenter_id:-<invalid>}" ""
 print_row "IP mode" "$mode" ""
 print_row "Advertised IP" "$server_ip" ""
 print_row "Local bind IP" "$bind_ip" ""
+print_row "Advertised IGW IP" "$igw_advertised_ip" ""
 echo
 
 if [ "$mode" = "public" ] && is_private_ipv4 "$bind_ip" && [ "$server_ip" != "$bind_ip" ]; then
+  echo "Network mode: public/NAT"
   warn_msg "Public mode advertises $server_ip while game UDP is bound on private host IP $bind_ip."
   echo "     This is valid only when the router/firewall forwards the public UDP ports to $bind_ip."
-  echo "     A blank in-game ping usually means the client cannot reach ${server_ip}:${survival_game_port}/udp or ${server_ip}:${overmap_game_port}/udp."
+  echo "     Verify those UDP forwards for gameplay connectivity. A blank browser ping can still occur when gameplay traffic succeeds."
 elif is_private_ipv4 "$server_ip" && [ "$mode" = "public" ]; then
   fail_msg "Public mode is configured but advertised IP is private: $server_ip"
+else
+  echo "Network mode: $mode"
+fi
+
+echo
+
+echo "=== Datacenter identity ==="
+if [ -z "$datacenter_id" ]; then
+  fail_msg "HOST_DATACENTER_ID is invalid. Use a hostname or short ID containing only letters, numbers, dots, and hyphens."
+elif is_ipv4 "$datacenter_id"; then
+  if [ "$datacenter_id" = "$server_ip" ]; then
+    warn_msg "Datacenter ID is the advertised server IP. A DNS hostname resolving to this IP is recommended for server-browser ping."
+  else
+    warn_msg "Datacenter ID $datacenter_id differs from advertised IP $server_ip."
+  fi
+elif [[ "$datacenter_id" == *.* ]]; then
+  if ! command -v getent >/dev/null 2>&1; then
+    warn_msg "Cannot resolve Datacenter ID $datacenter_id because getent is unavailable."
+  else
+    datacenter_addresses="$(getent ahostsv4 "$datacenter_id" 2>/dev/null | awk '{ print $1 }' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)"
+    if [ -z "$datacenter_addresses" ]; then
+      warn_msg "Datacenter ID $datacenter_id does not resolve to an IPv4 address."
+    elif printf '%s\n' "$datacenter_addresses" | tr ' ' '\n' | grep -Fxq "$server_ip"; then
+      ok "Datacenter ID $datacenter_id resolves to advertised IP $server_ip and is suitable as an FLS ping target"
+    else
+      warn_msg "Datacenter ID $datacenter_id resolves to $datacenter_addresses, not advertised IP $server_ip."
+    fi
+  fi
+else
+  warn_msg "Datacenter ID $datacenter_id is not publicly resolvable. For server-browser ping, use a hostname whose IPv4 A record points to advertised IP $server_ip."
 fi
 
 echo
 echo "=== Expected endpoints ==="
 print_row "Overmap game" "${overmap_game_port}/udp" "advertised as ${server_ip}:${overmap_game_port}"
 print_row "Survival_1 game" "${survival_game_port}/udp" "advertised as ${server_ip}:${survival_game_port}"
-print_row "Survival_1 IGW" "${survival_igw_port}/udp" "server-to-server on ${bind_ip}:${survival_igw_port}"
-print_row "Overmap IGW" "${overmap_igw_port}/udp" "server-to-server on ${bind_ip}:${overmap_igw_port}"
-print_row "RabbitMQ game" "31982/tcp" "advertised to services as ${server_ip}:31982"
-print_row "RabbitMQ game HTTP" "31983/tcp" "advertised to services as ${server_ip}:31983"
+print_row "Survival_1 IGW" "${survival_igw_port}/udp" "server-to-server on ${igw_advertised_ip}:${survival_igw_port}"
+print_row "Overmap IGW" "${overmap_igw_port}/udp" "server-to-server on ${igw_advertised_ip}:${overmap_igw_port}"
+print_row "RabbitMQ game" "${rmq_game_port}/tcp" "advertised to services as ${server_ip}:${rmq_game_port}"
+print_row "RabbitMQ game HTTP" "${rmq_game_http_port}/tcp" "advertised to services as ${server_ip}:${rmq_game_http_port}"
 
 echo
 echo "=== Local listeners ==="
@@ -130,11 +218,7 @@ if ss -lnup >/tmp/dune-ping-ss-udp.out 2>/tmp/dune-ping-ss-udp.err; then
   do
     label="${item%%:*}"
     port="${item##*:}"
-    if grep -Eq "[:.]${port}[[:space:]]" /tmp/dune-ping-ss-udp.out; then
-      ok "$label listening on UDP $port"
-    else
-      fail_msg "$label is not listening on UDP $port"
-    fi
+    check_udp_listener_bind "$label" "$port"
   done
 else
   warn_msg "Cannot inspect UDP listeners with ss: $(tr '\n' ' ' </tmp/dune-ping-ss-udp.err)"
@@ -142,7 +226,7 @@ fi
 rm -f /tmp/dune-ping-ss-udp.out /tmp/dune-ping-ss-udp.err
 
 if ss -lntp >/tmp/dune-ping-ss-tcp.out 2>/tmp/dune-ping-ss-tcp.err; then
-  for item in "RabbitMQ game:31982" "RabbitMQ game HTTP:31983"; do
+  for item in "RabbitMQ game:${rmq_game_port}" "RabbitMQ game HTTP:${rmq_game_http_port}"; do
     label="${item%%:*}"
     port="${item##*:}"
     if grep -Eq "[:.]${port}[[:space:]]" /tmp/dune-ping-ss-tcp.out; then
@@ -212,26 +296,74 @@ if docker_available; then
     else
       fail_msg "$map container does not use expected IGWPort=$expected_igw"
     fi
+    pod_ip="$(container_env_value "$container" POD_IP || true)"
+    external_override="$(container_env_value "$container" EXTERNAL_ADDRESS_OVERRIDE || true)"
+    multihome="$(container_arg_value "$container" -MultiHome= || true)"
+    [ "$pod_ip" = "$bind_ip" ] && ok "$map container POD_IP=$pod_ip" || fail_msg "$map container POD_IP=$pod_ip expected $bind_ip"
+    [ "$multihome" = "$bind_ip" ] && ok "$map container MultiHome=$multihome" || fail_msg "$map container MultiHome=$multihome expected $bind_ip"
+    if [ "$mode" = "public" ]; then
+      [ "$external_override" = "$server_ip" ] && ok "$map container EXTERNAL_ADDRESS_OVERRIDE=$external_override" || fail_msg "$map container EXTERNAL_ADDRESS_OVERRIDE=${external_override:-<empty>} expected $server_ip"
+    elif [ -n "$external_override" ] && [ "$external_override" != "$server_ip" ]; then
+      warn_msg "$map container EXTERNAL_ADDRESS_OVERRIDE=$external_override differs from advertised IP $server_ip."
+    elif [ -n "$external_override" ]; then
+      ok "$map container EXTERNAL_ADDRESS_OVERRIDE=$external_override"
+    else
+      ok "$map container has no EXTERNAL_ADDRESS_OVERRIDE"
+    fi
   done
 
   if container_running dune-server-gateway; then
+    gateway_env_host="$(container_env_value dune-server-gateway HOST_DATACENTER_IP_ADDRESS || true)"
+    gateway_datacenter_id="$(container_env_value dune-server-gateway HOST_DATACENTER_ID || true)"
     gateway_host="$(container_arg_value dune-server-gateway --RMQGameHostname= || true)"
     gateway_port="$(container_arg_value dune-server-gateway --RMQGamePort= || true)"
     gateway_http_port="$(container_arg_value dune-server-gateway --RMQGameHttpPort= || true)"
+    [ "$gateway_env_host" = "$server_ip" ] && ok "Gateway datacenter IP $gateway_env_host" || fail_msg "Gateway datacenter IP is ${gateway_env_host:-<empty>} expected $server_ip"
+    if [ "$gateway_datacenter_id" = "$datacenter_id" ]; then
+      ok "Gateway Datacenter ID $gateway_datacenter_id"
+    else
+      fail_msg "Gateway Datacenter ID is ${gateway_datacenter_id:-<empty>} expected $datacenter_id"
+    fi
     [ "$gateway_host" = "$server_ip" ] && ok "Gateway advertises RMQ host $gateway_host" || fail_msg "Gateway RMQ host is $gateway_host expected $server_ip"
-    [ "$gateway_port" = "31982" ] && ok "Gateway advertises RMQ game port 31982" || fail_msg "Gateway RMQ game port is $gateway_port expected 31982"
-    [ "$gateway_http_port" = "31983" ] && ok "Gateway advertises RMQ HTTP port 31983" || fail_msg "Gateway RMQ HTTP port is $gateway_http_port expected 31983"
+    [ "$gateway_port" = "$rmq_game_port" ] && ok "Gateway advertises RMQ game port $rmq_game_port" || fail_msg "Gateway RMQ game port is $gateway_port expected $rmq_game_port"
+    [ "$gateway_http_port" = "$rmq_game_http_port" ] && ok "Gateway advertises RMQ HTTP port $rmq_game_http_port" || fail_msg "Gateway RMQ HTTP port is $gateway_http_port expected $rmq_game_http_port"
   else
     fail_msg "dune-server-gateway is not running"
   fi
+
+  if container_running dune-director; then
+    director_env_host="$(container_env_value dune-director HOST_DATACENTER_IP_ADDRESS || true)"
+    director_datacenter_id="$(container_env_value dune-director HOST_DATACENTER_ID || true)"
+    [ "$director_env_host" = "$server_ip" ] && ok "Director datacenter IP $director_env_host" || fail_msg "Director datacenter IP is ${director_env_host:-<empty>} expected $server_ip"
+    if [ "$director_datacenter_id" = "$datacenter_id" ]; then
+      ok "Director Datacenter ID $director_datacenter_id"
+    else
+      fail_msg "Director Datacenter ID is ${director_datacenter_id:-<empty>} expected $datacenter_id"
+    fi
+  else
+    fail_msg "dune-director is not running"
+  fi
+
+  if container_running dune-text-router; then
+    text_router_env_host="$(container_env_value dune-text-router HOST_DATACENTER_IP_ADDRESS || true)"
+    text_router_datacenter_id="$(container_env_value dune-text-router HOST_DATACENTER_ID || true)"
+    [ "$text_router_env_host" = "$server_ip" ] && ok "Text Router datacenter IP $text_router_env_host" || fail_msg "Text Router datacenter IP is ${text_router_env_host:-<empty>} expected $server_ip"
+    if [ "$text_router_datacenter_id" = "$datacenter_id" ]; then
+      ok "Text Router Datacenter ID $text_router_datacenter_id"
+    else
+      fail_msg "Text Router Datacenter ID is ${text_router_datacenter_id:-<empty>} expected $datacenter_id"
+    fi
+  else
+    fail_msg "dune-text-router is not running"
+  fi
 else
-  warn_msg "Podman is not reachable; skipped container argument checks."
+  warn_msg "Docker is not reachable; skipped container argument checks."
 fi
 
 echo
 echo "=== Database advertised server endpoints ==="
 if container_running dune-postgres; then
-  rows="$(engine exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "
+  rows="$(docker exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "
     select map, coalesce(host(game_addr), ''), game_port, coalesce(host(igw_addr), ''), igw_port, ready, alive
     from dune.farm_state
     where map in ('Overmap', 'Survival_1')
@@ -245,11 +377,21 @@ if container_running dune-postgres; then
       echo "  $map game=${game_addr}:${game_port} igw=${igw_addr}:${igw_port} ready=$ready alive=$alive"
       expected_game="$overmap_game_port"
       expected_igw="$overmap_igw_port"
-      [ "$map" = "Survival_1" ] && expected_game="$survival_game_port" && expected_igw="$survival_igw_port"
+      if [ "$map" = "Survival_1" ]; then
+        expected_game="$survival_game_port"
+        expected_igw="$survival_igw_port"
+        if [ "$game_port" -gt "$survival_game_port" ] 2>/dev/null \
+          && [ "$game_port" -le "$((client_port_base + 33))" ] 2>/dev/null; then
+          dimension_offset="$((game_port - survival_game_port))"
+          expected_game="$game_port"
+          expected_igw="$((survival_igw_port + 1 + dimension_offset))"
+        fi
+      fi
       [ "$game_addr" = "$server_ip" ] && ok "$map farm_state game_addr=$game_addr" || fail_msg "$map farm_state game_addr=$game_addr expected $server_ip"
+      [ "$igw_addr" = "$igw_advertised_ip" ] && ok "$map farm_state igw_addr=$igw_addr" || fail_msg "$map farm_state igw_addr=$igw_addr expected $igw_advertised_ip"
       [ "$game_port" = "$expected_game" ] && ok "$map farm_state game_port=$game_port" || fail_msg "$map farm_state game_port=$game_port expected $expected_game"
       [ "$igw_port" = "$expected_igw" ] && ok "$map farm_state igw_port=$igw_port" || fail_msg "$map farm_state igw_port=$igw_port expected $expected_igw"
-      [ "$ready" = "t" ] && [ "$alive" = "t" ] && ok "$map farm_state ready/alive" || warn_msg "$map farm_state ready=$ready alive=$alive"
+      [[ "${ready,,}" =~ ^(t|true|1|yes|y)$ ]] && [[ "${alive,,}" =~ ^(t|true|1|yes|y)$ ]] && ok "$map farm_state ready/alive" || warn_msg "$map farm_state ready=$ready alive=$alive"
     done <<< "$rows"
   fi
 else
@@ -257,15 +399,78 @@ else
 fi
 
 echo
+echo "=== Director server-state advertisements ==="
+if [ "$mode" = "public" ] && container_running dune-director; then
+  director_log_file="$(mktemp)"
+  docker logs --since 5m dune-director > "$director_log_file" 2>&1 || true
+  director_state_check="$(
+    python3 - "$server_ip" "$director_log_file" <<'PY'
+import json
+import re
+import sys
+
+server_ip = sys.argv[1]
+log_file = sys.argv[2]
+private_re = re.compile(r"^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)")
+latest = {}
+with open(log_file, encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        if "[ServerState] Received server state:" not in line:
+            continue
+        raw = line.split("[ServerState] Received server state:", 1)[1].strip()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        partition = payload.get("partitionId")
+        ip = payload.get("ip") or ""
+        port = payload.get("port")
+        if partition is None:
+            continue
+        latest[partition] = (ip, port)
+
+bad = []
+for partition, (ip, port) in latest.items():
+    if ip and ip != server_ip and private_re.match(ip):
+        bad.append((partition, ip, port))
+
+if not latest:
+    print("NONE")
+elif bad:
+    for partition, ip, port in bad:
+        print(f"BAD\t{partition}\t{ip}\t{port}")
+else:
+    print("OK")
+PY
+  )"
+  rm -f "$director_log_file"
+  if [ "$director_state_check" = "OK" ]; then
+    ok "Director recent server-state messages advertise public game IPs"
+  elif [ "$director_state_check" = "NONE" ]; then
+    warn_msg "No recent Director ServerState messages found in the last 5 minutes."
+  else
+    while IFS=$'\t' read -r state partition ip port; do
+      [ "$state" = "BAD" ] || continue
+      fail_msg "Director received private server-state endpoint partition=$partition ${ip}:${port}; expected public ${server_ip} for client travel."
+    done <<< "$director_state_check"
+  fi
+elif [ "$mode" = "public" ]; then
+  warn_msg "dune-director is not running; skipped recent Director server-state checks."
+else
+  echo "Local/LAN mode permits private Director server-state addresses."
+fi
+
+echo
 echo "=== External reachability note ==="
 if [ "$mode" = "public" ]; then
   echo "Repo-side checks cannot prove that the public internet can reach your router/firewall UDP forwards."
-  echo "For non-blank ping, external clients must be able to reach:"
+  echo "For gameplay connectivity, external clients must be able to reach:"
   echo "  ${server_ip}:${overmap_game_port}/udp"
   echo "  ${server_ip}:${survival_game_port}/udp"
-  echo "Also forward the IGW UDP ports for server-to-server traffic:"
-  echo "  ${server_ip}:${survival_igw_port}/udp"
-  echo "  ${server_ip}:${overmap_igw_port}/udp"
+  echo "IGW/server-to-server traffic stays on the local bind IP:"
+  echo "  ${igw_advertised_ip}:${survival_igw_port}/udp"
+  echo "  ${igw_advertised_ip}:${overmap_igw_port}/udp"
+  echo "A Datacenter ID hostname resolving to the advertised public IP gives FLS a concrete ping target. Funcom controls the final ping measurement and may display it intermittently."
 else
   echo "Local/LAN mode advertises a private IP. Clients outside the LAN should not be expected to ping or join it."
 fi

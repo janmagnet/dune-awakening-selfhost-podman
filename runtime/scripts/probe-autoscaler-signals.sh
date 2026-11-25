@@ -3,7 +3,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-source runtime/scripts/engine.sh
+[ -f .env ] && . ./.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+source runtime/scripts/runtime-env.sh
+
+DIRECTOR_PORT="$(resolve_director_port)"
 
 echo "=== Director HTTP quick probe ==="
 for path in \
@@ -24,19 +28,19 @@ for path in \
   /queues
 do
   echo
-  echo "--- GET http://127.0.0.1:11717$path ---"
-  curl -fsS --max-time 3 "http://127.0.0.1:11717$path" 2>&1 | head -60 || true
+  echo "--- GET http://127.0.0.1:${DIRECTOR_PORT}${path} ---"
+  curl -fsS --max-time 3 "http://127.0.0.1:${DIRECTOR_PORT}${path}" 2>&1 | head -60 || true
 done
 
 echo
 echo "=== Director recent log lines with route/API/travel/server/queue words ==="
-engine logs dune-director 2>&1 \
+docker logs dune-director 2>&1 \
   | grep -Ei "api|http|route|travel|queue|server|partition|spawn|scale|dedicated|director" \
   | tail -200 || true
 
 echo
 echo "=== DB tables likely related to travel/queues/sessions/server demand ==="
-engine exec dune-postgres psql -U postgres -d dune -Atc "
+docker exec dune-postgres psql -U postgres -d dune -Atc "
 select table_schema || '.' || table_name || ' | ' || string_agg(column_name, ', ' order by ordinal_position)
 from information_schema.columns
 where table_schema not in ('pg_catalog','information_schema')
@@ -75,5 +79,5 @@ for tbl in \
 do
   echo
   echo "--- $tbl ---"
-  engine exec dune-postgres psql -U postgres -d dune -P pager=off -c "select * from $tbl limit 20;" || true
+  docker exec dune-postgres psql -U postgres -d dune -P pager=off -c "select * from $tbl limit 20;" || true
 done

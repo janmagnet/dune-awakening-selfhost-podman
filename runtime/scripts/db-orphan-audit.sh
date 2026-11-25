@@ -3,13 +3,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-source runtime/scripts/engine.sh
-
 mode="${1:-summary}"
 out_file="${2:-}"
 
 require_postgres() {
-  if ! engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
     echo "dune-postgres is not running." >&2
     exit 1
   fi
@@ -118,10 +116,10 @@ require_postgres
 
 case "$mode" in
   summary)
-    engine exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "$(summary_sql)"
+    docker exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "$(summary_sql)"
     ;;
   detail)
-    engine exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "$(detail_sql)"
+    docker exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "$(detail_sql)"
     ;;
   export)
     if [ -z "$out_file" ]; then
@@ -131,7 +129,7 @@ case "$mode" in
     mkdir -p "$(dirname "$out_file")"
     {
       printf 'orphan_type\taccount_id\tfls_id\tfuncom_id\tcharacter_name\n'
-      engine exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "$(detail_sql)"
+      docker exec dune-postgres psql -U postgres -d dune -At -F $'\t' -c "$(detail_sql)"
     } >"$out_file"
     ;;
   *)

@@ -3,7 +3,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-source runtime/scripts/engine.sh
+# POSTGRES_PORT and DUNE_PSQL_TRANSPORT from here configure the Postgres seam.
+# Exported because this script's queries run in embedded Python, which reads
+# them from its environment; a bare `. ./.env` would keep them invisible to any
+# child process.
+[ -f .env ] && . ./.env
+export POSTGRES_PORT DUNE_PSQL_TRANSPORT
 
 failures=0
 
@@ -11,16 +16,21 @@ ok() { printf 'OK   %s\n' "$*"; }
 fail() { printf 'FAIL %s\n' "$*" >&2; failures=$((failures + 1)); }
 warn() { printf 'WARN %s\n' "$*" >&2; }
 
-if bash -n runtime/scripts/sietches.sh runtime/scripts/publish-sietch-overrides.sh runtime/scripts/start-all.sh runtime/scripts/spawn-server.sh runtime/scripts/despawn-server.sh runtime/scripts/manager.sh runtime/scripts/doctor.sh runtime/scripts/dune; then
+if bash -n runtime/scripts/sietch-name.sh runtime/scripts/sietches.sh runtime/scripts/publish-sietch-overrides.sh runtime/scripts/publish-deepdesert-overrides.sh runtime/scripts/publish-network-server-state-overrides.sh runtime/scripts/start-all.sh runtime/scripts/spawn-server.sh runtime/scripts/despawn-server.sh runtime/scripts/manager.sh runtime/scripts/doctor.sh runtime/scripts/dune; then
   ok "shell syntax"
 else
   fail "shell syntax"
 fi
 
-if grep -q 'docs/' README.md; then
-  fail "README still links to docs/"
+if [ "$(bash runtime/scripts/sietch-name.sh "The Kulon Show")" = "The Kulon Show" ] \
+  && [ "$(bash runtime/scripts/sietch-name.sh "Sietch Abbir v2")" = "Sietch Abbir v2" ] \
+  && [ "$(bash runtime/scripts/sietch-name.sh "sietch   Alraab v2")" = "sietch   Alraab v2" ] \
+  && [ -z "$(bash runtime/scripts/sietch-name.sh "")" ] \
+  && ! bash runtime/scripts/sietch-name.sh "Duke's Sietch" >/dev/null 2>&1 \
+  && ! bash runtime/scripts/sietch-name.sh "Alpha|Beta" >/dev/null 2>&1; then
+  ok "Sietch display-name normalization"
 else
-  ok "README has no docs/ dependency"
+  fail "Sietch display-name normalization"
 fi
 
 if grep -q '"isStartingMap": True' runtime/scripts/publish-sietch-overrides.sh \
@@ -32,7 +42,7 @@ else
 fi
 
 if command -v shellcheck >/dev/null 2>&1; then
-  if shellcheck runtime/scripts/sietches.sh runtime/scripts/validate-sietch-state.sh; then
+  if shellcheck -x runtime/scripts/sietch-name.sh runtime/scripts/sietches.sh runtime/scripts/validate-sietch-state.sh; then
     ok "shellcheck"
   else
     fail "shellcheck"
@@ -96,18 +106,19 @@ config = {
     "maps": {"Survival_1": {"active_dimensions": 2, "max_dimensions": 2}},
     "partitions": {
         "1": {"display_name": "Sietch Abbir", "password": "secret"},
-        "41": {"display_name": "Sietch Alraab", "password": "secret2"},
+        "41": {"display_name": "Awesome Map", "password": "secret2"},
     },
 }
 
 config = sync(config, rows_2)
 assert config["maps"]["Survival_1"]["dimensions"]["0"]["display_name"] == "Sietch Abbir"
 assert config["maps"]["Survival_1"]["dimensions"]["1"]["password"] == "secret2"
+assert config["maps"]["Survival_1"]["dimensions"]["1"]["display_name"] == "Awesome Map"
 config = sync(config, rows_1)
 assert "41" not in config["partitions"]
-assert config["maps"]["Survival_1"]["dimensions"]["1"]["display_name"] == "Sietch Alraab"
+assert config["maps"]["Survival_1"]["dimensions"]["1"]["display_name"] == "Awesome Map"
 config = sync(config, rows_2_recreated)
-assert config["partitions"]["55"]["display_name"] == "Sietch Alraab"
+assert config["partitions"]["55"]["display_name"] == "Awesome Map"
 assert config["partitions"]["55"]["password"] == "secret2"
 print("OK   dimension state survives 1 -> 2 -> 1 -> recreated 2")
 PY
@@ -181,7 +192,7 @@ assert usersettings["partitions"]["55"]["userengine"]["server_display_name"] == 
 print("OK   usersettings mirror survives 1 -> 2 -> 1 -> recreated 2")
 PY
 
-if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
   if runtime/scripts/sietches.sh sync >/tmp/dune-sietch-sync.out 2>/tmp/dune-sietch-sync.err; then
     ok "live sietch sync"
   else
@@ -215,22 +226,20 @@ if engine ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-postgres; then
 
   python3 <<'PY' || fail "live Survival_1 active-dimensions state"
 import json
-import subprocess
+import sys
 from pathlib import Path
+
+sys.path.insert(0, "runtime/scripts")
+import dune_psql  # noqa: E402
 
 config = json.loads(Path("runtime/generated/sietch-config.json").read_text())
 usersettings = json.loads(Path("runtime/generated/usersettings.json").read_text()) if Path("runtime/generated/usersettings.json").exists() else {"partitions": {}}
 target = int(config.get("maps", {}).get("Survival_1", {}).get("active_dimensions") or 1)
 
-rows_raw = subprocess.check_output([
-    "podman", "exec", "dune-postgres", "psql",
-    "-U", "postgres", "-d", "dune", "-At", "-F", "\t",
-    "-c",
-    "select wp.partition_id, wp.dimension_index, coalesce(wp.server_id, ''), coalesce(wp.label, '') "
+rows_raw = dune_psql.query_tsv("select wp.partition_id, wp.dimension_index, coalesce(wp.server_id, ''), coalesce(wp.label, '') "
     "from dune.world_partition wp "
     "where lower(wp.map)=lower('Survival_1') "
-    "order by wp.dimension_index, wp.partition_id;"
-], text=True)
+    "order by wp.dimension_index, wp.partition_id;")
 rows = []
 for line in rows_raw.splitlines():
     if not line.strip():

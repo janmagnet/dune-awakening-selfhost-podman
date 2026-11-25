@@ -3,8 +3,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-source runtime/scripts/engine.sh
-
 LOG_FILE="runtime/logs/autoscaler.log"
 CONTAINER_NAME="dune-autoscaler"
 
@@ -24,12 +22,12 @@ EOF
 
 status() {
   echo "=== Autoscaler status ==="
-  if engine ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+  if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
     echo "State: running"
-    engine ps --filter "name=^${CONTAINER_NAME}$" --format "Container: {{.Names}}\nStatus:    {{.Status}}"
-  elif engine ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+    docker ps --filter "name=^${CONTAINER_NAME}$" --format "Container: {{.Names}}\nStatus:    {{.Status}}"
+  elif docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
     echo "State: stopped"
-    engine ps -a --filter "name=^${CONTAINER_NAME}$" --format "Container: {{.Names}}\nStatus:    {{.Status}}"
+    docker ps -a --filter "name=^${CONTAINER_NAME}$" --format "Container: {{.Names}}\nStatus:    {{.Status}}"
   else
     echo "State: stopped"
     echo "Container: not created"
@@ -42,21 +40,19 @@ start() {
 }
 
 stop() {
-  if ! engine ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+  if ! docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
     echo "Autoscaler is not running."
     return 0
   fi
 
-  require_quadlet_privileges || return 1
   echo "Stopping autoscaler..."
-  dune_systemctl stop dune-autoscaler.service 2>/dev/null || true
-  engine rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  docker rm -f "$CONTAINER_NAME" >/dev/null
   echo "Autoscaler stopped."
 }
 
 logs() {
-  if engine ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
-    engine logs --tail 160 "$CONTAINER_NAME"
+  if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+    docker logs --tail 160 "$CONTAINER_NAME"
   elif [ -f "$LOG_FILE" ]; then
     tail -n 160 "$LOG_FILE"
   else

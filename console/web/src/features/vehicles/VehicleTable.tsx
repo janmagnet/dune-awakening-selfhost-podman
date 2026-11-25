@@ -1,0 +1,433 @@
+import { useEffect, useRef, useState } from "react";
+import { Boxes, ChevronDown, ChevronUp, Trash2, X } from "lucide-react";
+import type { VehicleModule, VehicleRow, VehicleSharedEntry } from "../../api/vehicles";
+import { DataTable, type SortDirection } from "../../components/common/DataTable";
+import { cachedInstanceNames, resolveInstanceNames } from "../maps/instanceNames";
+import { sectorForWorldPoint } from "../liveMap/liveMapSectorGrid";
+import { friendlyMapName } from "../maps/mapNames";
+import { VehiclePermissionsTab } from "./VehiclePermissionsTab";
+import { VehicleStorageOverlay } from "./VehicleStorageOverlay";
+
+const GLOBAL_COLUMNS = ["name", "type", "owner", "shared_with", "condition_percent", "fuel_percent", "location"];
+const PLAYER_COLUMNS = ["name", "type", "condition_percent", "fuel_percent", "location"];
+// Shown when a player's list mixes access levels; hidden when every row is the same level.
+const PLAYER_ACCESS_COLUMNS = ["name", "type", "relationship", "owner", "condition_percent", "fuel_percent", "location"];
+// Co-owner view: every row has the same access level but the owner differs, so keep Owner only.
+const PLAYER_OWNER_COLUMNS = ["name", "type", "owner", "condition_percent", "fuel_percent", "location"];
+const COLUMN_LABELS: Record<string, string> = {
+  name: "Vehicle",
+  type: "Type",
+  relationship: "Access",
+  owner: "Owner",
+  shared_with: "Shared With",
+  condition_percent: "Lowest Condition",
+  fuel_percent: "Fuel",
+  location: "Location"
+};
+
+type VehicleTableProps = {
+  rows: VehicleRow[];
+  context?: "global" | "player";
+  showAccessColumns?: boolean;
+  showOwnerColumn?: boolean;
+  emptyMessage?: string;
+  sortColumn?: string;
+  sortDirection?: SortDirection;
+  onSort?: (column: string) => void;
+  canEditPermissions?: boolean;
+  onPermissionsSaved?: () => void;
+  // A deep-link request from elsewhere (the Live Map's "Open in Vehicles"
+  // button) to auto-expand one specific vehicle. focusNonce increments on
+  // every request so the same vehicle can be re-focused twice in a row.
+  focusVehicleId?: string;
+  focusNonce?: number;
+  // Required, not optional: an optional prop would let a mount point silently
+  // render VehiclePermissionsTab's transfer button with no confirmation.
+  confirmAction: (message: string, options?: { title?: string; confirmLabel?: string; warning?: string; danger?: boolean; details?: { label: string; value: string; tone?: "accent" | "success" | "danger" }[] }) => Promise<boolean>;
+  // Delete is optional and defaults off, unlike confirmAction above: this is
+  // v1 scoped to the global Vehicles panel only (matching how Delete Base
+  // shipped), so PlayerVehiclesTab's mount is unaffected until these are
+  // deliberately wired through there too.
+  canDeleteVehicle?: boolean;
+  // capabilities.vehicleStoredDelete. Off, a Stored for Recovery row stays
+  // blocked.
+  canDeleteStoredVehicle?: boolean;
+  // Whether the server can read a vehicle's cargo hold at all
+  // (capabilities.vehicleStorage). Off by default so a mount that does not
+  // pass it through never offers a button that comes back unsupported.
+  storageSupported?: boolean;
+  // Echoes a cargo-delete failure into the panel-level banner once the modal
+  // is dismissed. Optional: PlayerVehiclesTab has no such banner, and the
+  // overlay's own inline error is the primary surface either way.
+  onError?: (text: string) => void;
+  queuedDeleteVehicleIds?: Set<string>;
+  deletingId?: string;
+  cancelingDeleteId?: string;
+  onDeleteVehicle?: (vehicle: VehicleRow) => void;
+  onCancelQueuedDelete?: (vehicle: VehicleRow) => void;
+};
+
+function toNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function meterColor(percent: number) {
+  if (percent >= 66) return "var(--success)";
+  if (percent >= 33) return "var(--warning)";
+  return "var(--danger)";
+}
+
+function formatObservedValue(value: number) {
+  return Number.isInteger(value) ? value.toLocaleString() : value.toLocaleString(undefined, { maximumFractionDigits: 1 });
+}
+
+function renderMeter(percent: number | null, { estimated = false, observedValue = null }: { estimated?: boolean; observedValue?: number | null } = {}) {
+  if (percent === null) {
+    return observedValue === null
+      ? <span className="muted">—</span>
+      : <span className="vehicles-observed-value" title="Current value is known; maximum capacity is unavailable.">{formatObservedValue(observedValue)} current</span>;
+  }
+  const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+  return (
+    <div className="vehicles-meter-cell" title={estimated ? "Estimated from multiple observed vehicles with the same component type." : undefined}>
+      <div className="vehicles-meter"><i style={{ width: `${clamped}%`, background: meterColor(clamped) }} /></div>
+      <span className="vehicles-meter-pct">{clamped}%{estimated && <em> Estimated</em>}</span>
+    </div>
+  );
+}
+
+function vehiclePartitionMap(map: unknown) {
+  const normalized = String(map || "").trim().toLowerCase();
+  if (normalized === "haggabasin") return "Survival_1";
+  if (normalized === "deepdesert") return "DeepDesert_1";
+  return "";
+}
+
+function vehicleLifecycleLocation(row: VehicleRow) {
+  switch (String(row.lifecycle_state || "Default")) {
+    case "Travel": return "In Transit";
+    case "VehicleBackup": return "Vehicle Backup";
+    case "VehicleRecovery": return "Stored for Recovery";
+    case "AbortedAuthorityTransfer": return "Transfer Interrupted";
+    default: return row.partition_id == null ? "Unassigned" : "";
+  }
+}
+
+// States the server refuses to delete, as tooltips. VehicleRecovery applies
+// only when canDeleteStoredVehicle is off.
+const DELETE_BLOCKED_REASONS: Record<string, string> = {
+  Travel: "In Transit — cannot be deleted until it arrives",
+  VehicleBackup: "In Vehicle Backup — cannot be deleted until its owner takes it back out",
+  VehicleRecovery: "Stored for Recovery — cannot be deleted as an ordinary vehicle"
+};
+
+function formatMapPartition(row: VehicleRow, instanceNames: Map<string, string>) {
+  const rawMap = String(row.map || "").trim();
+  const lifecycleLocation = vehicleLifecycleLocation(row);
+  if (lifecycleLocation) return `${friendlyMapName(rawMap)} · ${lifecycleLocation}`;
+  const partitionId = String(row.partition_id);
+  const partitionMap = vehiclePartitionMap(rawMap);
+  const instanceName = partitionMap ? instanceNames.get(`${partitionMap}:${partitionId}`) : "";
+  return `${friendlyMapName(rawMap)} · ${instanceName || `Partition ${partitionId}`}`;
+}
+
+function formatCoords(row: VehicleRow) {
+  const x = toNumber(row.x);
+  const y = toNumber(row.y);
+  return x === null || y === null ? "—" : `(${Math.round(x)}, ${Math.round(y)})`;
+}
+
+function mapGridSector(row: VehicleRow): string | null {
+  if (!/deepdesert/i.test(String(row.map || ""))) return null;
+  const x = toNumber(row.x);
+  const y = toNumber(row.y);
+  if (x === null || y === null) return null;
+  // Same grid as the Live Map; null outside it rather than a clamped edge cell.
+  const sector = sectorForWorldPoint(x, y);
+  return sector ? `${sector[0]}-${sector.slice(1)}` : null;
+}
+
+function formatDurability(value: unknown): string {
+  const number = toNumber(value);
+  return number === null ? "—" : Math.round(number).toLocaleString();
+}
+
+function relationshipClass(value: string) {
+  return `vehicles-access ${value.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+}
+
+function renderVehicleCell(row: Record<string, unknown>, column: string, instanceNames: Map<string, string>) {
+  const vehicle = row as VehicleRow;
+  if (column === "name") {
+    const lifecycleLocation = vehicleLifecycleLocation(vehicle);
+    const rawLocation = lifecycleLocation
+      ? `${vehicle.map || "Unknown map"} · ${lifecycleLocation}`
+      : `${vehicle.map || "Unknown map"} · Partition ${vehicle.partition_id}`;
+    return <div className="vehicles-name-cell"><span className="vehicles-name">{vehicle.name || "—"}</span><span className="vehicles-location" title={rawLocation}>{formatMapPartition(vehicle, instanceNames)}</span></div>;
+  }
+  if (column === "location") {
+    const sector = mapGridSector(vehicle);
+    const subLine = sector ? `Sector ${sector}` : (vehicle.region ? String(vehicle.region) : null);
+    return <div className="vehicles-location-cell"><span className="vehicles-coords">{formatCoords(vehicle)}</span>{subLine && <span className="vehicles-grid">{subLine}</span>}</div>;
+  }
+  if (column === "type") return vehicle.type ? String(vehicle.type) : <span className="muted">—</span>;
+  if (column === "owner") return vehicle.owner ? String(vehicle.owner) : <span className="muted">—</span>;
+  if (column === "relationship") {
+    const relationship = String(vehicle.relationship || "").trim();
+    return relationship ? <span className={relationshipClass(relationship)}>{relationship}</span> : <span className="muted">—</span>;
+  }
+  if (column === "condition_percent") return renderMeter(toNumber(vehicle.condition_percent), { estimated: vehicle.condition_estimated === true });
+  if (column === "fuel_percent") return renderMeter(toNumber(vehicle.fuel_percent), { estimated: vehicle.fuel_percent !== null && vehicle.fuel_percent !== undefined, observedValue: toNumber(vehicle.current_fuel) });
+  if (column === "shared_with") {
+    const shared: VehicleSharedEntry[] = Array.isArray(vehicle.shared_with) ? vehicle.shared_with : [];
+    if (!shared.length) return <span className="muted">—</span>;
+    return <span className="vehicles-shared-list">{shared.map((entry) => <span key={`${entry.name}-${entry.rank}`}>{entry.name} <em>({entry.label})</em></span>)}</span>;
+  }
+  const value = row[column];
+  return value === null || value === undefined || value === "" ? "—" : String(value);
+}
+
+function splitComponentName(name: string): { base: string; position: string | null } {
+  const match = /^(.*\S)\s+\((Front|Back|Center) (Left|Right|Center)\)$/.exec(name || "");
+  return match ? { base: match[1], position: `${match[2]} ${match[3]}` } : { base: name, position: null };
+}
+
+function renderComponent(module: VehicleModule, index: number) {
+  const percent = module.conditionPercent;
+  const { base, position } = splitComponentName(module.name || "");
+  return (
+    <div className="vehicles-component-card" key={`${module.templateId}-${index}`}>
+      <span className="vehicles-component-name">{base}{position && <span className="vehicles-component-position">{position}</span>}</span>
+      {percent === null || percent === undefined
+        ? <span className="vehicles-component-meta">{module.condition === null || module.condition === undefined ? "Durability not reported" : `${formatDurability(module.condition)} durability`}</span>
+        : <><div className="vehicles-meter"><i style={{ width: `${Math.max(0, Math.min(100, Math.round(percent)))}%`, background: meterColor(percent) }} /></div><span className="vehicles-component-meta">{formatDurability(module.condition)} / {formatDurability(module.maxCondition)} · {Math.round(percent)}%{module.maxInferred ? " Estimated" : ""}</span></>}
+    </div>
+  );
+}
+
+export function VehicleTable({
+  rows, context = "global", showAccessColumns = false, showOwnerColumn = false, emptyMessage = "No vehicles have been found yet.", sortColumn, sortDirection, onSort,
+  canEditPermissions = false, onPermissionsSaved, focusVehicleId, focusNonce, confirmAction,
+  canDeleteVehicle = false, canDeleteStoredVehicle = false, storageSupported = false, onError, queuedDeleteVehicleIds, deletingId, cancelingDeleteId, onDeleteVehicle, onCancelQueuedDelete
+}: VehicleTableProps) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [expandedTab, setExpandedTab] = useState<"components" | "permissions">("components");
+  // The open contents overlay's vehicle, or null. Held here rather than in
+  // renderExpandedRow so the modal is rendered outside the table -- inside it
+  // the dialog would live in a <td>.
+  const [storageFor, setStorageFor] = useState<VehicleRow | null>(null);
+  const [instanceNames, setInstanceNames] = useState<Map<string, string>>(new Map());
+  const expandedContentRef = useRef<HTMLDivElement>(null);
+  const satisfiedFocusNonceRef = useRef<number | undefined>(undefined);
+  const columns = context === "player" ? (showAccessColumns ? PLAYER_ACCESS_COLUMNS : showOwnerColumn ? PLAYER_OWNER_COLUMNS : PLAYER_COLUMNS) : GLOBAL_COLUMNS;
+  const partitionMapsKey = [...new Set(rows.map((row) => vehiclePartitionMap(row.map)).filter(Boolean))].sort().join(",");
+
+  useEffect(() => {
+    if (expandedId && !rows.some((row) => String(row.id) === expandedId)) {
+      setExpandedId(null);
+      setExpandedTab("components");
+    }
+  }, [expandedId, rows]);
+
+  // The overlay reads one vehicle's hold, so it cannot outlive that vehicle
+  // being on screen -- a background refresh that drops the row (a delete, or
+  // a search the admin changed) closes it rather than leaving a modal
+  // describing something no longer listed.
+  useEffect(() => {
+    if (storageFor && !rows.some((row) => String(row.id) === String(storageFor.id))) setStorageFor(null);
+  }, [rows, storageFor]);
+
+  // The caller's search request and this row data arrive on different
+  // renders (the id lands in `rows` only once the parent's fetch resolves),
+  // so this waits for a matching row instead of setting expandedId eagerly
+  // -- which would just get bounced straight back to null by the reset
+  // effect above while the old (non-matching) rows are still on screen.
+  // satisfiedFocusNonceRef stops a later, unrelated rows refresh (the
+  // 15-minute auto-refresh) from re-opening a panel the admin already
+  // closed by hand.
+  useEffect(() => {
+    if (focusNonce === undefined || !focusVehicleId || satisfiedFocusNonceRef.current === focusNonce) return;
+    if (!rows.some((row) => String(row.id) === focusVehicleId)) return;
+    satisfiedFocusNonceRef.current = focusNonce;
+    setExpandedTab("components");
+    setExpandedId(focusVehicleId);
+  }, [focusNonce, focusVehicleId, rows]);
+
+  // Moves focus into the expanded content so keyboard and screen-reader users
+  // land on what they just opened instead of staying on the (now possibly
+  // relocated) expand button. Fires only on an actual expandedId change --
+  // not on every render -- so a background row refresh never yanks focus
+  // away from a control the user is mid-interaction with.
+  useEffect(() => {
+    // preventScroll: a row expanding near the bottom of the viewport
+    // otherwise triggers the browser's default scroll-into-view on focus,
+    // which yanks the page out from under a mouse user who just clicked a
+    // row in place (confirmed live: a 147px jump). Keyboard/screen-reader
+    // users still get the focus move itself, which is what they need --
+    // browsers already keep a newly focused element approximately in view
+    // when it was reached via Tab or a same-page click, since both already
+    // scrolled the row into view before it expanded. The Live Map's "Open
+    // in Vehicles" deep link (focusVehicleId below) also lands here after
+    // switching tabs and narrowing the search to one row, which puts it at
+    // the top of the page already -- same "already in view" outcome.
+    if (expandedId) expandedContentRef.current?.focus({ preventScroll: true });
+  }, [expandedId]);
+
+  useEffect(() => {
+    const maps = partitionMapsKey ? partitionMapsKey.split(",") : [];
+    if (!maps.length) return undefined;
+    const cached = cachedInstanceNames(maps);
+    if (cached) {
+      setInstanceNames(cached);
+      return undefined;
+    }
+    let cancelled = false;
+    void resolveInstanceNames(maps).then((resolved) => {
+      if (!cancelled && resolved) setInstanceNames(resolved);
+    });
+    return () => { cancelled = true; };
+  }, [partitionMapsKey]);
+
+  function toggleExpanded(id: string) {
+    // A different vehicle's expansion should never inherit the previous one's
+    // tab -- landing on Permissions for a vehicle that was never showing it
+    // would look like a stale/wrong panel.
+    setExpandedTab("components");
+    setExpandedId((current) => current === id ? null : id);
+  }
+
+  return (
+    <>
+    <DataTable
+      rows={rows}
+      columns={columns}
+      columnLabels={COLUMN_LABELS}
+      tableClassName={`vehicles-table${context === "player" ? " player-vehicles-table" : ""}`}
+      wrapClassName="vehicles-table-wrap"
+      headerTitles
+      renderCell={(row, column) => renderVehicleCell(row, column, instanceNames)}
+      nonSortableColumns={["shared_with", "location"]}
+      sortColumn={sortColumn}
+      sortDirection={sortDirection}
+      onSort={onSort}
+      actionClassName="actions-column vehicles-actions-column"
+      action={canDeleteVehicle ? (row) => {
+        const vehicle = row as VehicleRow;
+        const id = String(vehicle.id);
+        const label = vehicle.name || `vehicle ${id}`;
+        const queued = queuedDeleteVehicleIds?.has(id) ?? false;
+        const storedDelete = canDeleteStoredVehicle && vehicle.lifecycle_state === "VehicleRecovery";
+        const blockedReason = storedDelete ? "" : DELETE_BLOCKED_REASONS[String(vehicle.lifecycle_state || "")];
+        return queued
+          ? <span className="vehicles-queued-delete" title="Delete queued — applies when this map next restarts or stops">
+              <Trash2 size={16} aria-label={`Delete queued for ${label}`} />
+              <button
+                className="icon-toggle-button vehicles-queued-delete-cancel"
+                title="Cancel Queued Delete"
+                aria-label={`Cancel queued delete for ${label}`}
+                disabled={cancelingDeleteId === id}
+                onClick={(event) => { event.stopPropagation(); onCancelQueuedDelete?.(vehicle); }}
+              ><X size={14} /></button>
+            </span>
+          : <button
+              className="icon-toggle-button danger"
+              title={blockedReason || (storedDelete ? "Delete Stored Vehicle" : "Delete Vehicle")}
+              aria-label={blockedReason ? `Cannot delete ${label}: ${blockedReason}` : `Delete ${storedDelete ? "stored vehicle " : ""}${label}`}
+              // aria-disabled keeps the button focusable, so the reason is
+              // reachable by keyboard.
+              aria-disabled={blockedReason ? true : undefined}
+              disabled={deletingId === id}
+              onClick={(event) => { event.stopPropagation(); if (!blockedReason) onDeleteVehicle?.(vehicle); }}
+            ><Trash2 size={16} /></button>;
+      } : undefined}
+      secondaryActionPosition="start"
+      secondaryActionLabel=""
+      secondaryActionClassName="vehicles-expand-column"
+      secondaryAction={(row) => {
+        const vehicle = row as VehicleRow;
+        const id = String(vehicle.id);
+        const isExpanded = expandedId === id;
+        const label = `${isExpanded ? "Collapse" : "Show"} components for ${vehicle.name || `vehicle ${id}`}`;
+        return <button className="vehicles-expand-button" title={label} aria-label={label} aria-expanded={isExpanded} onClick={(event) => { event.stopPropagation(); toggleExpanded(id); }}>{isExpanded ? <ChevronUp size={14} className="vehicles-expand-chevron" /> : <ChevronDown size={14} className="vehicles-expand-chevron" />}</button>;
+      }}
+      rowKey={(row) => String((row as VehicleRow).id)}
+      onRowClick={(row) => toggleExpanded(String((row as VehicleRow).id))}
+      isRowExpanded={(row) => expandedId === String((row as VehicleRow).id)}
+      renderExpandedRow={(row) => {
+        const vehicle = row as VehicleRow;
+        const id = String(vehicle.id);
+        const modules: VehicleModule[] = Array.isArray(vehicle.modules) ? vehicle.modules : [];
+        // A vehicle has exactly one cargo hold, on the vehicle actor itself --
+        // not one per module (dune.inventories.vehicle_module_id is empty in
+        // production; see duneDb.vehicleStorage). So this is a single control
+        // on the header rather than a button per storage card, which would
+        // open the same contents twice on a hypothetical two-module vehicle.
+        // The fitted storage module is still what gates it: a vehicle with no
+        // hold has a 0/0 inventory row and nothing worth opening.
+        const hasStorage = modules.some((module) => module.isStorage);
+        const componentsPanel = <div className="vehicles-expanded">
+          <div className="vehicles-expanded-header-row">
+            <p className="vehicles-expanded-header">{modules.length} component{modules.length === 1 ? "" : "s"}</p>
+            {storageSupported && hasStorage && <button
+              className="bases-inventory-view-contents"
+              // Stops the row's own onRowClick from collapsing the panel out
+              // from under the modal. The permissions branch below wraps its
+              // content in the same guard; the no-permissions branch does not,
+              // so it has to live on the button.
+              onClick={(event) => { event.stopPropagation(); setStorageFor(vehicle); }}
+            ><Boxes size={14} aria-hidden="true" /> View Contents</button>}
+          </div>
+          {modules.length === 0 ? <p className="muted">No components fitted.</p> : <div className="vehicles-component-grid">{modules.map(renderComponent)}</div>}
+        </div>;
+        // tabIndex=-1 makes this programmatically focusable (see the
+        // expandedId effect above) without adding it to the normal Tab
+        // order -- it is a landing point, not a control.
+        if (!canEditPermissions) return <div ref={expandedContentRef} tabIndex={-1}>{componentsPanel}</div>;
+        return (
+          <div ref={expandedContentRef} tabIndex={-1} onClick={(event) => event.stopPropagation()}>
+            <div className="vehicles-expanded-tablist" role="tablist">
+              <button
+                role="tab"
+                id={`vehicles-tab-components-${id}`}
+                aria-selected={expandedTab === "components"}
+                aria-controls={`vehicles-panel-components-${id}`}
+                className={`vehicles-expanded-tab${expandedTab === "components" ? " active" : ""}`}
+                onClick={() => setExpandedTab("components")}
+              >Components</button>
+              <button
+                role="tab"
+                id={`vehicles-tab-permissions-${id}`}
+                aria-selected={expandedTab === "permissions"}
+                aria-controls={`vehicles-panel-permissions-${id}`}
+                className={`vehicles-expanded-tab${expandedTab === "permissions" ? " active" : ""}`}
+                onClick={() => setExpandedTab("permissions")}
+              >Permissions</button>
+            </div>
+            {expandedTab === "components"
+              ? <div role="tabpanel" id={`vehicles-panel-components-${id}`} aria-labelledby={`vehicles-tab-components-${id}`}>{componentsPanel}</div>
+              : <div role="tabpanel" id={`vehicles-panel-permissions-${id}`} aria-labelledby={`vehicles-tab-permissions-${id}`}>
+                  <VehiclePermissionsTab
+                    vehicleId={id}
+                    vehicleName={String(vehicle.name || `vehicle ${id}`)}
+                    onSaved={() => onPermissionsSaved?.()}
+                    confirmAction={confirmAction}
+                    deletePending={queuedDeleteVehicleIds?.has(id) ?? false}
+                  />
+                </div>}
+          </div>
+        );
+      }}
+      emptyMessage={emptyMessage}
+    />
+    {storageFor && <VehicleStorageOverlay
+      vehicleId={String(storageFor.id)}
+      vehicleName={String(storageFor.name || `vehicle ${storageFor.id}`)}
+      onClose={() => setStorageFor(null)}
+      confirmAction={confirmAction}
+      onError={onError}
+    />}
+    </>
+  );
+}

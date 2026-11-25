@@ -6,17 +6,36 @@ cd "$(dirname "$0")/../.."
 mkdir -p runtime/generated
 
 [ -f .env ] && . ./.env
-[ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 source runtime/scripts/runtime-env.sh
+source runtime/scripts/image-tags.sh
+[ -r runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
 
 SERVER_REGION="$(resolve_server_region)"
 SERVER_IP="$(resolve_server_ip)"
 export SERVER_REGION SERVER_IP
+catalog_extract_timeout_seconds="${DUNE_CATALOG_EXTRACT_TIMEOUT_SECONDS:-120}"
+catalog_output="runtime/generated/partition-catalog.json"
+catalog_tmp="$(mktemp "${catalog_output}.tmp.XXXXXX")"
+orchestrator_container="$(dune_compose_running_service_container "$DUNE_COMPOSE_PROJECT_NAME" orchestrator 2>/dev/null || true)"
 
-engine exec -i dune-orchestrator python3 - <<'PY'
-from pathlib import Path
+if [ -z "$orchestrator_container" ]; then
+  echo "The orchestrator container is not running; cannot extract the partition catalog." >&2
+  exit 1
+fi
+
+cleanup_catalog_tmp() {
+  rm -f -- "$catalog_tmp"
+}
+trap cleanup_catalog_tmp EXIT
+
+echo "Extracting partition catalog from world-template.yaml..."
+
+timeout --kill-after=2s "${catalog_extract_timeout_seconds}s" docker exec -i "$orchestrator_container" python3 - > "$catalog_tmp" <<'PY'
 import json
 import re
+import sys
+from pathlib import Path
 import yaml
 
 src = Path("/srv/dune/server/scripts/setup/templates/world-template.yaml")
@@ -51,21 +70,42 @@ for wp in world_partitions:
             "maxY": p.get("maxY"),
         })
 
-out = Path("/work/partition-catalog.json")
-out.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+json.dump(rows, sys.stdout, indent=2)
+sys.stdout.write("\n")
 
-print(f"partitions: {len(rows)}")
+print(f"partitions: {len(rows)}", file=sys.stderr)
 for r in rows:
     print(
         f"id={str(r['id']).rjust(3)} "
         f"map={r['map']} "
         f"dim={r['dimension']} "
         f"disabled={r['disable']} "
-        f"box=({r['minX']},{r['minY']})-({r['maxX']},{r['maxY']})"
+        f"box=({r['minX']},{r['minY']})-({r['maxX']},{r['maxY']})",
+        file=sys.stderr,
     )
 PY
 
-engine exec dune-orchestrator cat /work/partition-catalog.json > runtime/generated/partition-catalog.json
+if [ ! -s "$catalog_tmp" ]; then
+  echo "Generated partition catalog is empty." >&2
+  exit 1
+fi
+
+# Seasonal maps follow the official template. The Scourge fallback has ended;
+# stale packaged assets must not automatically reintroduce a retired event.
+# Validate before publishing so an invalid/empty extraction keeps the old catalog.
+python3 - "$catalog_tmp" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+rows = json.loads(Path(sys.argv[1]).read_text())
+if not isinstance(rows, list) or not rows:
+    raise ValueError("Cannot publish an empty or invalid partition catalog")
+PY
+
+chmod 0644 "$catalog_tmp"
+mv -f -- "$catalog_tmp" "$catalog_output"
+trap - EXIT
 
 echo
-echo "Wrote runtime/generated/partition-catalog.json"
+echo "Wrote $catalog_output"

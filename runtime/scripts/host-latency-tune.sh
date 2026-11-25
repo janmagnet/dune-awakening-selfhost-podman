@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 [ -f .env ] && . ./.env
-[ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
-[ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+[ -r runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
 
 source runtime/scripts/runtime-env.sh
 source runtime/scripts/image-tags.sh
@@ -15,7 +15,7 @@ HELPER_IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server:${WORLD_IMA
 
 run_helper() {
   local script="$1"
-  engine run --rm \
+  docker run --rm \
     --privileged \
     --network host \
     --pid host \

@@ -1,0 +1,38 @@
+# Gitleaks configuration for dune-awakening-selfhost-docker
+# The built-in fallback token is intentionally hardcoded
+# to match the game server's expected default.
+# See: console/api/src/rmq.js BUILTIN_COMMAND_AUTH_TOKEN
+
+# Keep Gitleaks' maintained detection rules when this repository config is
+# selected explicitly (for example, by tests/security-pr-checks.sh).
+[extend]
+  useDefault = true
+
+# The allowlist must be the singular [allowlist] table for the gitleaks release this project pins in CI
+# (v8.24.3). That release has no top-level [[allowlists]] (plural) field: it silently drops the key, so a
+# plural block here has zero effect (verified: with it, the intentionally hardcoded fallback below is still
+# flagged). Newer gitleaks releases still accept the singular table (with a deprecation notice), so this is
+# valid on both. If the pin moves past v8.25, re-check whether [[allowlists]] works before switching back.
+# The regexes are matched against the extracted SECRET and are ANCHORED (^...$), so only a value that IS the
+# placeholder is allowed. An unanchored literal would also hide any real token that merely contains it
+# (verified: a token prefixed with the literal passed the scan until anchoring was added).
+[allowlist]
+  description = "Known command-auth fallback shared by game server, and a documentation placeholder"
+  regexes = [
+    "^Nu6VmPWUMvdPMeB7qErr$",
+    # docs/integrations/discord-control-bot/admin-guide.md's curl example
+    # ("Authorization: Bearer local-dev-bot-api"): a documentation placeholder, not a credential.
+    "^local-dev-bot-api$",
+  ]
+
+# NOTE: tests/db-system-backup-test.sh's synthetic secret fixtures
+# (admin-pw-8f2a-real, etc.) do NOT need an allowlist entry here --
+# confirmed directly: `gitleaks detect --source
+# tests/db-system-backup-test.sh` with the built-in default rules (and no
+# fixture-specific allowlist at all) already produces zero findings, since
+# these fixtures' variable names (SECRET_ADMIN_PASSWORD=, TEST_PASSPHRASE=)
+# don't match any built-in rule's keyword+pattern requirements. A broad,
+# permanent, repo-wide allowlist entry for these exact literal strings was
+# added defensively in an earlier revision without verifying this -- an
+# unverified assumption, not a fact, per this account's own review
+# discipline. Removed rather than kept "just in case."

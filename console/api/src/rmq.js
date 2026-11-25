@@ -1,0 +1,573 @@
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { closeSync, existsSync, fstatSync, openSync, readSync } from "node:fs";
+import { resolve } from "node:path";
+import { redact } from "./redact.js";
+
+const RMQ_CONTAINER = "dune-rmq-game";
+const BUILTIN_COMMAND_AUTH_TOKEN = "Nu6VmPWUMvdPMeB7qErr";
+
+const cachedRmqCreds = new Map();
+const cachedReadyQueues = new Map();
+let transportCredentials;
+let transportRevision = 0;
+
+function transportKey(config) {
+  const user = process.env.DUNE_RMQ_ADMIN_USER || '';
+  const password = process.env.DUNE_RMQ_ADMIN_PASSWORD || '';
+  if (!transportCredentials || transportCredentials.user !== user || transportCredentials.password !== password) {
+    transportCredentials = { user, password };
+    transportRevision++;
+    cachedRmqCreds.clear();
+    cachedReadyQueues.clear();
+  }
+  // Opaque process-local revision: no password-derived hash or secret in keys.
+  // In-flight responses keep their old revision after credentials change.
+  return JSON.stringify([
+    resolve(config?.repoRoot || process.cwd()), resolveRmqGameHttpBaseUrl(),
+    transportRevision
+  ]);
+}
+
+function rememberTransport(cache, key, value) {
+  if (!cache.has(key) && cache.size >= 16) cache.delete(cache.keys().next().value);
+  cache.set(key, value);
+}
+
+function readBoundedLogText(filePath, maxEdgeBytes = 128 * 1024) {
+  let fd = null;
+  try {
+    fd = openSync(filePath, "r");
+    const size = fstatSync(fd).size;
+    if (size <= 0) return "";
+    if (size <= maxEdgeBytes * 2) {
+      const buf = Buffer.allocUnsafe(size);
+      const bytesRead = readSync(fd, buf, 0, size, 0);
+      return buf.subarray(0, bytesRead).toString("utf8");
+    }
+    const headBuf = Buffer.allocUnsafe(maxEdgeBytes);
+    const tailBuf = Buffer.allocUnsafe(maxEdgeBytes);
+    const headRead = readSync(fd, headBuf, 0, maxEdgeBytes, 0);
+    const tailRead = readSync(fd, tailBuf, 0, maxEdgeBytes, size - maxEdgeBytes);
+    return `${headBuf.subarray(0, headRead).toString("utf8")}\n${tailBuf.subarray(0, tailRead).toString("utf8")}`;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Ignore close errors.
+      }
+    }
+  }
+}
+
+function resolveRmqAdminCreds(repoRoot, key, now) {
+  const cached = cachedRmqCreds.get(key);
+  if (cached?.expiresAt > now) return cached.credentials;
+  const envUser = String(process.env.DUNE_RMQ_ADMIN_USER || "").trim();
+  const envPass = String(process.env.DUNE_RMQ_ADMIN_PASSWORD || "").trim();
+  if (envUser && envPass) {
+    const credentials = { user: envUser, pass: envPass };
+    rememberTransport(cachedRmqCreds, key, { credentials, expiresAt: now + 300_000 });
+    return credentials;
+  }
+  const logFile = resolve(repoRoot || process.cwd(), "runtime/text-router/director-current.log");
+  try {
+    if (existsSync(logFile)) {
+      const text = readBoundedLogText(logFile);
+      const patterns = [
+        /Generated new admin credentials:\s*(bgd\.[^/\s]+\.admin)\s*\/\s*([A-Za-z0-9+/=]+)/g,
+        /(bgd\.[^/\s]+\.admin)\/([A-Za-z0-9+/=]+) => allow administrator/g
+      ];
+      let found = null;
+      let latestPosition = -1;
+      for (const pattern of patterns) {
+        let match;
+        while ((match = pattern.exec(text)) !== null) {
+          if (match.index > latestPosition) {
+            found = { user: match[1], pass: match[2] };
+            latestPosition = match.index;
+          }
+        }
+      }
+      if (found) {
+        rememberTransport(cachedRmqCreds, key, { credentials: found, expiresAt: now + 60_000 });
+        return found;
+      }
+    }
+  } catch {
+    // Fallback to dockerExec if credentials cannot be read from log.
+  }
+  return null;
+}
+
+function resolveRmqGameHttpBaseUrl() {
+  if (process.env.DUNE_RMQ_GAME_HTTP_URL) return process.env.DUNE_RMQ_GAME_HTTP_URL.replace(/\/+$/, "");
+  const port = Number(process.env.RMQ_GAME_LOCAL_HTTP_PORT || 15672) || 15672;
+  return `http://127.0.0.1:${port}`;
+}
+
+// Shared management connection for the opt-in chat recorder. Never include
+// broker responses, URLs or credentials in caller-visible errors.
+export async function requestRmqGameHttp(config, method, path, body, { fetchImpl = globalThis.fetch, now = Date.now } = {}) {
+  if (process.env.DUNE_RMQ_TRANSPORT === "exec") throw new Error("Chat collection needs the RabbitMQ management connection.");
+  const key = transportKey(config);
+  let creds = resolveRmqAdminCreds(config?.repoRoot, key, now());
+  // The publisher's director-current.log is a rotating tail: startup credentials
+  // can scroll out. Use the same bounded, streamed director-log fallback as
+  // runtime/scripts/lib/rabbitmq.sh; never send its output to logs or errors.
+  if (!creds) {
+    creds = await readDirectorRmqCredentials();
+    if (creds) rememberTransport(cachedRmqCreds, key, { credentials: creds, expiresAt: now() + 60_000 });
+  }
+  if (!creds) throw new Error("Chat collection needs the RabbitMQ management connection.");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetchImpl(`${resolveRmqGameHttpBaseUrl()}${path}`, {
+      method, redirect: "error", signal: controller.signal,
+      headers: { Authorization: `Basic ${Buffer.from(`${creds.user}:${creds.pass}`).toString("base64")}`, "Content-Type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) })
+    });
+    if ([401, 403].includes(response.status)) cachedRmqCreds.delete(key);
+    if (!response.ok) throw Object.assign(new Error("Chat collection could not reach its RabbitMQ queue."), { statusCode: response.status });
+    if (response.status === 204 || method === "DELETE") return null;
+    // Poll responses are bounded by count/truncate at the broker as well.
+    let bytes = 0;
+    const chunks = [];
+    for await (const chunk of response.body) {
+      bytes += chunk.length;
+      if (bytes > 2 * 1024 * 1024) throw new Error("Chat response exceeded its size limit.");
+      chunks.push(chunk);
+    }
+    const text = Buffer.concat(chunks).toString("utf8");
+    return text ? JSON.parse(text) : null;
+  } catch (error) {
+    throw Object.assign(new Error("Chat collection is unavailable. Check the RabbitMQ management connection."), { brokerStatus: error.statusCode });
+  } finally { clearTimeout(timer); }
+}
+
+export function readDirectorRmqCredentials({ spawnImpl = spawn } = {}) {
+  return new Promise(resolveResult => {
+    let child, text = "", finished = false;
+    const timer = setTimeout(() => finish(null), 3000);
+    function finish(value) {
+      if (finished) return;
+      finished = true; clearTimeout(timer);
+      child?.kill("SIGTERM"); resolveResult(value);
+    }
+    try {
+      child = spawnImpl("docker", ["logs", "dune-director"], { stdio: ["ignore", "pipe", "ignore"] });
+      child.on("error", () => finish(null));
+      child.on("close", () => finish(null));
+      child.stdout.on("data", chunk => {
+        text += chunk.toString("utf8");
+        const match = /Generated new admin credentials:\s*(bgd\.[^/\s]{1,180}\.admin)\s*\/\s*([A-Za-z0-9+/=]{1,512})(?=\s|$)/.exec(text);
+        if (match && /\s/.test(text.slice(match.index + match[0].length, match.index + match[0].length + 1))) finish({ user: match[1], pass: match[2] });
+        else if (Buffer.byteLength(text) >= 1024 * 1024) finish(null);
+      });
+    } catch { finish(null); }
+  });
+}
+
+async function tryRmqGameHttpGet(config, path, key, now, fetchImpl) {
+  if (globalThis.__testSpawn || process.env.DUNE_RMQ_TRANSPORT === "exec") return null;
+  const creds = resolveRmqAdminCreds(config?.repoRoot, key, now);
+  if (!creds) return null;
+  const auth = Buffer.from(`${creds.user}:${creds.pass}`, "utf8").toString("base64");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.min(config?.commandTimeoutMs || 5000, 5000));
+  try {
+    const response = await fetchImpl(`${resolveRmqGameHttpBaseUrl()}${path}`, {
+      method: "GET",
+      headers: { Authorization: `Basic ${auth}`, Accept: "application/json" },
+      signal: controller.signal
+    });
+    if (response.status === 401 || response.status === 403) {
+      cachedRmqCreds.delete(key);
+      return null;
+    }
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export function validateBroadcastMessage(message) {
+  const raw = String(message || "").trim();
+  if (raw.length < 1 || raw.length > 500 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(raw)) {
+    throw new Error("Message must be 1-500 printable characters");
+  }
+  return raw;
+}
+
+export function isValidWhisperIdentity(value) {
+  const raw = String(value || "").trim();
+  return raw.length >= 1 && raw.length <= 180 && !/[\u0000-\u001f\u007f]/.test(raw);
+}
+
+export function isValidHexFlsId(value) {
+  return /^[A-Fa-f0-9]{15,64}$/.test(String(value || "").trim());
+}
+
+export function formatChatBodyMessage(message) {
+  const text = validateBroadcastMessage(message).replace(/\r\n?/g, "\n");
+  return text.split("\n").map((line) => line.trim()).filter(Boolean).join(" ");
+}
+
+export function buildBroadcastCommand({ message, title = "Admin Broadcast", durationSec = 30, texts } = {}) {
+  const localizedText = validateLocalizedTexts(texts, message, title);
+  const duration = validateInteger(durationSec, 1, 3600, "durationSec");
+  return {
+    ServerCommand: "ServiceBroadcast",
+    BroadcastType: "Generic",
+    BroadcastPayload: {
+      BroadcastDuration: duration,
+      LocalizedText: localizedText
+    }
+  };
+}
+
+export function validateLocalizedTexts(texts, message, title = "Admin Broadcast") {
+  if (Array.isArray(texts) && texts.length > 0) {
+    if (texts.length > 10) throw new Error("texts must contain 1-10 entries");
+    return texts.map((entry) => ({
+      Key: validateLocaleKey(entry?.Key || "en"),
+      Title: validateLocalizedTextField(entry?.Title || title || "Admin Broadcast", "Title", 80),
+      Body: validateBroadcastMessage(entry?.Body)
+    }));
+  }
+  const validatedTitle = validateLocalizedTextField(title || "Admin Broadcast", "Title", 80);
+  const validatedBody = validateBroadcastMessage(message);
+  return ["en", "en-US"].map((key) => ({
+    Key: key,
+    Title: validatedTitle,
+    Body: validatedBody
+  }));
+}
+
+export function buildShutdownBroadcastCommand({ shutdownType = "Restart", delayMinutes = 15, frequency = 60, duration = 30, cancel = false }) {
+  const type = validateShutdownType(shutdownType);
+  const delay = validateInteger(delayMinutes, 0, 1440, "delayMinutes");
+  const freq = validateInteger(frequency, 1, 3600, "frequency");
+  const dur = validateInteger(duration, 1, 3600, "duration");
+  const timestamp = Math.floor(Date.now() / 1000) + delay * 60;
+  return {
+    ServerCommand: "ServiceBroadcast",
+    BroadcastType: "ServerShutdown",
+    BroadcastPayload: {
+      ShutdownType: type,
+      ShouldCancel: Boolean(cancel),
+      ShutdownTimestamp: timestamp,
+      BroadcastFrequency: freq,
+      ShutdownDuration: dur,
+      DateTimestamp: timestamp
+    }
+  };
+}
+
+export function buildCarePackageWhisperPayload({ recipientFuncomId, recipientCharacterName, senderFuncomId, senderDisplayName = "", message, now = new Date(), messageId } = {}) {
+  const recipientId = validateWhisperIdentity(recipientFuncomId, "recipient Funcom ID");
+  const recipientName = validateWhisperName(recipientCharacterName, "recipient character name");
+  const senderId = validateWhisperIdentity(senderFuncomId, "sender Funcom ID");
+  const spoofedName = validateOptionalSpoofedName(senderDisplayName);
+  const text = formatChatBodyMessage(message);
+  const id = validateMessageId(messageId || randomUUID());
+  const timestamp = formatMapChatTimestamp(now);
+  const inner = {
+    m_Id: id,
+    m_ChannelType: "Whispers",
+    m_SubChannelId: recipientId,
+    m_bUseSpoofedUserName: Boolean(spoofedName),
+    m_SpoofedUserNameFrom: {
+      m_TableId: "",
+      m_Key: "",
+      m_UnlocalizedName: spoofedName
+    },
+    m_FuncomIdFrom: senderId,
+    m_UserNameTo: recipientName,
+    m_Message: {
+      m_UnlocalizedMessage: text,
+      m_LocalizedMessage: {
+        m_TableId: "",
+        m_Key: "",
+        m_FormatArgs: []
+      }
+    },
+    m_Timestamp: timestamp,
+    m_OriginLocation: { X: 0, Y: 0, Z: 0 },
+    m_HasSeenMessage: false
+  };
+  return {
+    inner,
+    outer: {
+      Content: JSON.stringify(inner),
+      Type: "TextChat"
+    }
+  };
+}
+
+export function buildMapChatPayload({ senderFuncomId, senderDisplayName = "", message, now = new Date(), messageId } = {}) {
+  const senderId = validateWhisperIdentity(senderFuncomId, "sender Funcom ID");
+  const spoofedName = validateOptionalSpoofedName(senderDisplayName);
+  const text = formatChatBodyMessage(message);
+  const id = validateMessageId(messageId || randomUUID());
+  const timestamp = formatMapChatTimestamp(now);
+  const inner = {
+    m_Id: id,
+    m_ChannelType: "Map",
+    m_bUseSpoofedUserName: Boolean(spoofedName),
+    m_SpoofedUserNameFrom: {
+      m_TableId: "",
+      m_Key: "",
+      m_UnlocalizedName: spoofedName
+    },
+    m_FuncomIdFrom: senderId,
+    m_UserNameTo: "",
+    m_Message: {
+      m_UnlocalizedMessage: text,
+      m_LocalizedMessage: {
+        m_TableId: "",
+        m_Key: "",
+        m_FormatArgs: []
+      }
+    },
+    m_Timestamp: timestamp,
+    m_OriginLocation: { X: 0, Y: 0, Z: 0 },
+    m_HasSeenMessage: false
+  };
+  return {
+    inner,
+    outer: {
+      // Map chat uses the protocol's lowercase field, unlike whisper envelopes.
+      content: JSON.stringify(inner),
+      Type: "TextChat"
+    }
+  };
+}
+
+export async function publishCarePackageWhisper(config, fields) {
+  const senderHexFlsId = validateHexFlsId(fields?.senderHexFlsId);
+  const amqpUserId = validateHexFlsId(fields?.amqpUserId || senderHexFlsId);
+  const directQueue = fields?.recipientQueue ? validateQueueName(fields.recipientQueue, "recipient queue") : "";
+  const routingKey = directQueue || validateWhisperIdentity(fields?.recipientFuncomId, "recipient Funcom ID");
+  const exchange = directQueue ? "" : "chat.whispers";
+  const exchangeLabel = directQueue ? "default" : "chat.whispers";
+  const payload = buildCarePackageWhisperPayload(fields);
+  const outerB64 = Buffer.from(JSON.stringify(payload.outer), "utf8").toString("base64");
+  const routingB64 = Buffer.from(routingKey, "utf8").toString("base64");
+  const senderB64 = Buffer.from(amqpUserId, "utf8").toString("base64");
+  const exchangeB64 = Buffer.from(exchange, "utf8").toString("base64");
+  const exchangeLabelB64 = Buffer.from(exchangeLabel, "utf8").toString("base64");
+  const evalCode = `Outer = base64:decode(<<"${outerB64}">>), Routing = base64:decode(<<"${routingB64}">>), Sender = base64:decode(<<"${senderB64}">>), Exchange = base64:decode(<<"${exchangeB64}">>), ExchangeLabel = base64:decode(<<"${exchangeLabelB64}">>), XName = rabbit_misc:r(<<"/">>, exchange, Exchange), X = rabbit_exchange:lookup_or_die(XName), MsgId = list_to_binary("web-care-package-whisper-" ++ integer_to_list(erlang:system_time(millisecond))), P = {list_to_atom("P_basic"), <<"Content">>, undefined, [], undefined, undefined, undefined, undefined, undefined, MsgId, undefined, <<"text_chat">>, Sender, <<"fls_backend">>, undefined}, Content = rabbit_basic:build_content(P, Outer), {ok, Msg} = rabbit_basic:message(XName, Routing, Content), Result = rabbit_queue_type:publish_at_most_once(X, Msg), io:format("publish=~p exchange=~s routing=~s type=text_chat user_id=~s app_id=fls_backend~n", [Result, ExchangeLabel, Routing, Sender]).`;
+  const output = await dockerExec(["exec", RMQ_CONTAINER, "rabbitmqctl", "eval", evalCode], config.commandTimeoutMs);
+  if (!/publish=ok/.test(output.stdout)) throw new Error("RabbitMQ whisper publish did not report publish=ok");
+  return {
+    ...output,
+    stdout: `${output.stdout}outer=${JSON.stringify(payload.outer)}\ninner=${payload.outer.Content}\n`,
+    payload,
+    amqp: {
+      exchange: exchangeLabel,
+      routingKey,
+      type: "text_chat",
+      userId: amqpUserId,
+      senderHexFlsId,
+      appId: "fls_backend"
+    }
+  };
+}
+
+export async function listReadyRabbitQueues(config, { fetchImpl = globalThis.fetch, exec = dockerExec, now = Date.now } = {}) {
+  const key = transportKey(config);
+  if (!globalThis.__testSpawn) {
+    const cached = cachedReadyQueues.get(key);
+    if (cached?.expiresAt > now()) {
+      return new Set(cached.queues);
+    }
+    const httpQueues = await tryRmqGameHttpGet(config, "/api/queues/%2F?columns=name,consumers,state", key, now(), fetchImpl);
+    if (Array.isArray(httpQueues)) {
+      const ready = new Set();
+      for (const row of httpQueues) {
+        const name = String(row?.name || "").trim();
+        const consumers = Number(row?.consumers);
+        const state = String(row?.state || "").trim();
+        if (name && Number.isInteger(consumers) && consumers > 0 && (!state || state === "running")) {
+          ready.add(name);
+        }
+      }
+      rememberTransport(cachedReadyQueues, key, { queues: new Set(ready), expiresAt: now() + 5000 });
+      return new Set(ready);
+    }
+  }
+  const output = await exec(
+    ["exec", RMQ_CONTAINER, "rabbitmqctl", "-q", "list_queues", "name", "consumers", "state"],
+    config.commandTimeoutMs
+  );
+  const ready = new Set();
+  for (const line of output.stdout.split(/\r?\n/)) {
+    const [name = "", consumersText = "", state = ""] = line.trim().split(/\s+/);
+    const consumers = Number(consumersText);
+    if (name && Number.isInteger(consumers) && consumers > 0 && (!state || state === "running")) ready.add(name);
+  }
+  if (!globalThis.__testSpawn) {
+    rememberTransport(cachedReadyQueues, key, { queues: new Set(ready), expiresAt: now() + 5000 });
+  }
+  return ready;
+}
+
+export async function publishMapChat(config, fields) {
+  const senderHexFlsId = validateHexFlsId(fields?.senderHexFlsId);
+  const amqpUserId = validateHexFlsId(fields?.amqpUserId || senderHexFlsId);
+  const mapName = validateMapChatMap(fields?.mapName || fields?.region || "HaggaBasin");
+  const dimension = validateInteger(fields?.dimension ?? 0, 0, 9999, "dimension");
+  const directQueue = fields?.recipientQueue ? validateQueueName(fields.recipientQueue, "recipient queue") : "";
+  const routingKey = directQueue || `${mapName}.${dimension}`;
+  const exchange = directQueue ? "" : "chat.map";
+  const exchangeLabel = directQueue ? "default" : "chat.map";
+  const payload = buildMapChatPayload(fields);
+  const outerB64 = Buffer.from(JSON.stringify(payload.outer), "utf8").toString("base64");
+  const routingB64 = Buffer.from(routingKey, "utf8").toString("base64");
+  const senderB64 = Buffer.from(amqpUserId, "utf8").toString("base64");
+  const exchangeB64 = Buffer.from(exchange, "utf8").toString("base64");
+  const exchangeLabelB64 = Buffer.from(exchangeLabel, "utf8").toString("base64");
+  const evalCode = `Outer = base64:decode(<<"${outerB64}">>), Routing = base64:decode(<<"${routingB64}">>), Sender = base64:decode(<<"${senderB64}">>), Exchange = base64:decode(<<"${exchangeB64}">>), ExchangeLabel = base64:decode(<<"${exchangeLabelB64}">>), XName = rabbit_misc:r(<<"/">>, exchange, Exchange), X = rabbit_exchange:lookup_or_die(XName), MsgId = list_to_binary("web-map-chat-" ++ integer_to_list(erlang:system_time(millisecond))), P = {list_to_atom("P_basic"), <<"Content">>, undefined, [], undefined, undefined, undefined, undefined, undefined, MsgId, undefined, <<"text_chat">>, Sender, <<"fls_backend">>, undefined}, Content = rabbit_basic:build_content(P, Outer), {ok, Msg} = rabbit_basic:message(XName, Routing, Content), Result = rabbit_queue_type:publish_at_most_once(X, Msg), io:format("publish=~p exchange=~s routing=~s type=text_chat user_id=~s app_id=fls_backend~n", [Result, ExchangeLabel, Routing, Sender]).`;
+  const output = await dockerExec(["exec", RMQ_CONTAINER, "rabbitmqctl", "eval", evalCode], config.commandTimeoutMs);
+  if (!/publish=ok/.test(output.stdout)) throw new Error("RabbitMQ map chat publish did not report publish=ok");
+  return {
+    ...output,
+    stdout: `${output.stdout}outer=${JSON.stringify(payload.outer)}\ninner=${payload.outer.content}\n`,
+    payload,
+    amqp: {
+      exchange: exchangeLabel,
+      routingKey,
+      type: "text_chat",
+      userId: amqpUserId,
+      senderHexFlsId,
+      appId: "fls_backend"
+    }
+  };
+}
+
+export async function publishServerCommand(config, fields, label = "web-admin") {
+  const safeLabel = validatePublishLabel(label);
+  const inner = JSON.stringify(fields);
+  const outer = JSON.stringify({
+    Version: 2,
+    AuthToken: commandAuthToken(config.repoRoot),
+    MessageContent: inner
+  });
+  const outerB64 = Buffer.from(outer, "utf8").toString("base64");
+  const evalCode = `Outer = base64:decode(<<"${outerB64}">>), XName = rabbit_misc:r(<<"/">>, exchange, <<"heartbeats">>), X = rabbit_exchange:lookup_or_die(XName), MsgId = list_to_binary("web-${safeLabel}-" ++ integer_to_list(erlang:system_time(millisecond))), P = {list_to_atom("P_basic"), <<"Content">>, undefined, [], undefined, undefined, undefined, undefined, undefined, MsgId, undefined, undefined, <<"fls">>, <<"fls_backend">>, undefined}, Content = rabbit_basic:build_content(P, Outer), {ok, Msg} = rabbit_basic:message(XName, <<"notifications">>, Content), Result = rabbit_queue_type:publish_at_most_once(X, Msg), io:format("publish=~p exchange=heartbeats routing=notifications app_id=fls_backend user_id=fls label=${safeLabel}~n", [Result]).`;
+  const output = await dockerExec(["exec", RMQ_CONTAINER, "rabbitmqctl", "eval", evalCode], config.commandTimeoutMs);
+  if (!/publish=ok/.test(output.stdout)) throw new Error("RabbitMQ publish did not report publish=ok");
+  return output;
+}
+
+export function validatePublishLabel(value) {
+  const raw = String(value || "").trim();
+  if (/^[A-Za-z0-9_-]{1,80}$/.test(raw)) return raw;
+  throw new Error("Invalid RabbitMQ publish label");
+}
+
+export function commandAuthToken(repoRoot) {
+  if (process.env.DUNE_COMMAND_AUTH_TOKEN) return process.env.DUNE_COMMAND_AUTH_TOKEN;
+  return BUILTIN_COMMAND_AUTH_TOKEN;
+}
+
+function dockerExec(args, timeoutMs = 30000) {
+  return new Promise((resolvePromise, reject) => {
+    const spawnFn = globalThis.__testSpawn || spawn;
+    const child = spawnFn("docker", args, { shell: false, env: { ...process.env } });
+    const timeout = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += redact(chunk.toString()); });
+    child.stderr.on("data", (chunk) => { stderr += redact(chunk.toString()); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      const result = { code, stdout, stderr, args: ["docker", ...args] };
+      if (code === 0) resolvePromise(result);
+      else reject(Object.assign(new Error(`docker ${args.slice(0, 3).join(" ")} failed with exit ${code}: ${stderr || stdout}`), result));
+    });
+  });
+}
+
+function validateInteger(value, min, max, label) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${label} must be an integer ${min}-${max}`);
+  return n;
+}
+
+function validateLocalizedTextField(value, label, maxLength) {
+  const raw = String(value || "").trim();
+  if (raw.length < 1 || raw.length > maxLength || /[\u0000-\u001f]/.test(raw)) {
+    throw new Error(`${label} must be 1-${maxLength} printable characters`);
+  }
+  return raw;
+}
+
+function validateLocaleKey(value) {
+  const raw = String(value || "").trim();
+  if (/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(raw)) return raw;
+  throw new Error("LocalizedText Key must be a locale key like en or en-US");
+}
+
+function validateShutdownType(value) {
+  const raw = String(value || "").trim();
+  if (["Restart", "Maintenance", "Update"].includes(raw)) return raw;
+  throw new Error("shutdownType must be Restart, Maintenance, or Update");
+}
+
+function validateWhisperIdentity(value, label) {
+  const raw = String(value || "").trim();
+  if (isValidWhisperIdentity(raw)) return raw;
+  throw new Error(`Care Package message whisper cannot be sent: ${label} is unavailable or invalid`);
+}
+
+function validateWhisperName(value, label) {
+  const raw = String(value || "").trim();
+  if (raw.length >= 1 && raw.length <= 80 && !/[\u0000-\u001f]/.test(raw)) return raw;
+  throw new Error(`Care Package message whisper cannot be sent: ${label} is unavailable or invalid`);
+}
+
+function validateHexFlsId(value) {
+  const raw = String(value || "").trim();
+  if (isValidHexFlsId(raw)) return raw;
+  throw new Error("Care Package message whisper cannot be sent: sender hex FLS ID is unavailable or invalid");
+}
+
+function validateQueueName(value, label) {
+  const raw = String(value || "").trim();
+  if (/^[A-Za-z0-9_.:+/-]{1,220}$/.test(raw)) return raw;
+  throw new Error(`Care Package message whisper cannot be sent: ${label} is unavailable or invalid`);
+}
+
+function validateMapChatMap(value) {
+  const raw = String(value || "").trim();
+  if (/^[A-Za-z0-9_]{1,80}$/.test(raw)) return raw;
+  throw new Error("Map chat region must be a map key like HaggaBasin, Overmap, or DeepDesert");
+}
+
+function validateOptionalSpoofedName(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^[^\u0000-\u001f]{1,80}$/.test(raw)) return raw;
+  throw new Error("Spoofed sender name must be 1-80 printable characters");
+}
+
+function validateMessageId(value) {
+  const raw = String(value || "").trim();
+  if (/^[A-Za-z0-9_.:-]{1,120}$/.test(raw)) return raw;
+  throw new Error("Invalid whisper message id");
+}
+
+function formatMapChatTimestamp(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error("Invalid map chat timestamp");
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}.${pad(date.getUTCMonth() + 1)}.${pad(date.getUTCDate())}-${pad(date.getUTCHours())}.${pad(date.getUTCMinutes())}.${pad(date.getUTCSeconds())}`;
+}

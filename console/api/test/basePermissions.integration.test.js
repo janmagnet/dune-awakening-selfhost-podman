@@ -1,0 +1,517 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import pg from "pg";
+import { setBasePermissions, listBasePermissions, basePermissionCandidates, baseMapLocation, transferBaseToSystemCustodian } from "../src/duneDb.js";
+import { pgConnectionConfig, pgTransactionalDb, withIsolatedDatabase } from "../test-support/pgIntegrationDb.js";
+
+const { Client } = pg;
+
+// The mocked suite in basePermissions.test.js string-matches SQL and can prove
+// what we *intend* to send. It cannot catch the failures that only a real
+// PostgreSQL round trip surfaces, and this feature has three of them:
+//
+//   1. Transposed arguments. permission_set_player_rank(actor_id, player_id, ..)
+//      takes two bigints; swapping them is invisible to a mock and writes a rank
+//      row keyed on the wrong column against a live database.
+//   2. search_path. The shipped procedures reference their tables unqualified
+//      and carry no `SET search_path`, so they resolve only because the console
+//      connects as a role whose default path reaches the dune schema.
+//   3. The notify payload. permission_set_player_rank interpolates its map
+//      argument into JSON *unquoted*, so passing a map name rather than the
+//      numeric dune.map_names id emits malformed JSON to the game server.
+//
+// The procedure bodies below are transcribed from the shipped schema so those
+// three can be exercised for real. permission_actor_create_or_update_base_marker
+// is stubbed: the real one rebuilds map markers, which is the game's concern,
+// not ours -- what matters here is that our call reaches the procedure with the
+// right arguments and that the notification it emits is well formed.
+const OWNER_RANK = 1;
+const CO_OWNER_RANK = 2;
+const ASSOCIATE_RANK = 3;
+
+// Deliberately different values, mirroring production where the displayed base
+// id and the permission actor id never match.
+const BASE_ID = 1006;
+const ACTOR_ID = 1004;
+const ENTITY_ID = 5001;
+const MAP_NAME = "DeepDesert";
+const MAP_NAME_ID = 7;
+
+// A second base carrying every structural row the actor resolution walks and no
+// dune.permission_actor row -- an unclaimed base, which the Bases panel lists
+// like any other because listBases only hides the ones that are *also*
+// registered in base_backup_linked_actors.
+const UNCLAIMED_BASE_ID = 2006;
+const UNCLAIMED_ACTOR_ID = 2004;
+const UNCLAIMED_ENTITY_ID = 6001;
+
+const SCHEMA = `
+  create schema dune;
+
+  create table dune.buildings (id bigint primary key);
+  -- owner_entity_id is nullable in production: it carries an
+  -- ON DELETE SET NULL foreign key against fgl_entities. instance_id is the
+  -- per-piece tiebreak basePermissionActor/baseMapLocation order by.
+  create table dune.building_instances (building_id bigint not null, instance_id integer not null, owner_entity_id bigint);
+  create table dune.actor_fgl_entities (entity_id bigint not null, actor_id bigint not null);
+  create table dune.actors (id bigint primary key, map text, partition_id bigint, owner_account_id bigint);
+  -- baseMapLocation falls back to the claim's pieces when the totem's own
+  -- partition_id is NULL; columns match baseDelete.integration.test.js.
+  create table dune.placeables (
+    id bigint primary key references dune.actors(id) on delete cascade,
+    owner_entity_id bigint,
+    building_type text
+  );
+  create table dune.map_names (map_name_id smallint primary key, map_name text not null);
+  create table dune.permission_actor (actor_id bigint primary key, actor_name text);
+  -- The foreign key is production's, transcribed from the shipped schema the
+  -- same way the procedure bodies below are, and matching the one
+  -- baseDelete.integration.test.js already declares. Without it this file
+  -- silently accepted a rank row for an unclaimed base -- the exact write that
+  -- fails against a real server with
+  -- "violates foreign key constraint permission_actor_rank_permission_actor_id_fkey".
+  create table dune.permission_actor_rank (
+    permission_actor_id bigint not null references dune.permission_actor(actor_id) on delete cascade,
+    player_id bigint not null,
+    rank smallint not null
+  );
+  create table dune.player_state (account_id bigint, player_controller_id bigint, player_pawn_id bigint, character_name text);
+  create table dune.encrypted_player_state (
+    account_id bigint,
+    player_controller_id bigint,
+    player_state_id bigint,
+    player_pawn_id bigint,
+    encrypted_character_name bytea
+  );
+
+  create function dune.decrypt_user_data(value bytea)
+  returns text language sql immutable as $$ select convert_from(value, 'UTF8') $$;
+
+  create function dune.permission_actor_create_or_update_base_marker(in_actor_id bigint, in_player_id bigint, in_rank smallint)
+  returns void language plpgsql as $$ begin return; end $$;
+
+  create function dune.permission_set_player_rank(in_actor_id bigint, in_player_id bigint, in_rank smallint, in_map_id text)
+  returns void language plpgsql as $$
+  declare found_actor_id bigint;
+  begin
+    select permission_actor_id from permission_actor_rank
+      where permission_actor_id = in_actor_id and player_id = in_player_id into found_actor_id;
+    if not found then
+      insert into permission_actor_rank(permission_actor_id, player_id, rank) values(in_actor_id, in_player_id, in_rank);
+    else
+      update permission_actor_rank set rank = in_rank
+        where permission_actor_rank.permission_actor_id = in_actor_id and player_id = in_player_id;
+    end if;
+    perform permission_actor_create_or_update_base_marker(in_actor_id, in_player_id, in_rank);
+    perform pg_notify('permission_notify_channel',
+      format('set_rank#{"ActorId" : %s , "PlayerId" : %s, "PlayerGuildId" : %s, "Rank" : %s, "Map" : %s}',
+             in_actor_id, in_player_id, 0, in_rank, in_map_id));
+  end $$;
+
+  create function dune.permission_remove_player_rank(in_actor_id bigint, in_player_id bigint)
+  returns void language plpgsql as $$
+  begin
+    delete from permission_actor_rank where permission_actor_id = in_actor_id and player_id = in_player_id;
+    perform pg_notify('permission_notify_channel',
+      format('remove_rank#{"ActorId" : %s , "PlayerId" : %s}', in_actor_id, in_player_id));
+  end $$;
+`;
+
+const SEED = `
+  insert into dune.buildings (id) values (${BASE_ID});
+  insert into dune.building_instances (building_id, instance_id, owner_entity_id) values (${BASE_ID}, 0, ${ENTITY_ID});
+  insert into dune.actor_fgl_entities (entity_id, actor_id) values (${ENTITY_ID}, ${ACTOR_ID});
+  insert into dune.actors (id, map, partition_id, owner_account_id) values (${ACTOR_ID}, '${MAP_NAME}', 8, null);
+  insert into dune.map_names (map_name_id, map_name) values (${MAP_NAME_ID}, '${MAP_NAME}');
+  insert into dune.permission_actor (actor_id, actor_name) values (${ACTOR_ID}, 'DD Test');
+
+  insert into dune.buildings (id) values (${UNCLAIMED_BASE_ID});
+  insert into dune.building_instances (building_id, instance_id, owner_entity_id) values (${UNCLAIMED_BASE_ID}, 0, ${UNCLAIMED_ENTITY_ID});
+  insert into dune.actor_fgl_entities (entity_id, actor_id) values (${UNCLAIMED_ENTITY_ID}, ${UNCLAIMED_ACTOR_ID});
+  insert into dune.actors (id, map, partition_id, owner_account_id) values (${UNCLAIMED_ACTOR_ID}, '${MAP_NAME}', 8, null);
+  -- Deliberately no dune.permission_actor row for ${UNCLAIMED_ACTOR_ID}.
+
+  -- Account 2 owns three actor rows; only player_controller_id 4 is a real
+  -- permission holder. Ids 5 and 6 exist to prove they are rejected.
+  insert into dune.actors (id, owner_account_id) values (4, 2), (5, 2), (6, 2), (23, 6), (29, 8);
+  insert into dune.player_state (account_id, player_controller_id, player_pawn_id, character_name)
+    values
+      (2, 4, 4, 'DarkShark'),
+      (6, 23, 23, 'Furizu'),
+      (8, 29, 29, 'Yaida'),
+      (9000002, 900000201, 900000203, 'Server'),
+      (100, 900000202, 900000103, 'GM'),
+      (101, 900000103, 900000203, 'Reserved GM Controller');
+
+  insert into dune.permission_actor_rank (permission_actor_id, player_id, rank) values (${ACTOR_ID}, 4, ${OWNER_RANK});
+  insert into dune.encrypted_player_state
+    (account_id, player_controller_id, player_state_id, player_pawn_id, encrypted_character_name)
+    values (9000001, 900000101, 900000102, 900000103, convert_to('GM', 'UTF8'));
+`;
+
+async function withDatabase(t, run) {
+  return withIsolatedDatabase(t, {
+    namePrefix: "dune_perms",
+    unavailableLabel: "the base permission integration test"
+  }, async (pool, database) => {
+    await pool.query(SCHEMA);
+    await pool.query(SEED);
+    return run(pool, database);
+  });
+}
+
+async function ranks(pool) {
+  const result = await pool.query(
+    "select player_id::text as player_id, rank::int as rank from dune.permission_actor_rank where permission_actor_id = $1 order by rank, player_id",
+    [ACTOR_ID]);
+  return result.rows.map((row) => ({ playerId: row.player_id, rank: row.rank }));
+}
+
+// The regression this file was extended for. Every one of these assertions is
+// one only a real database can make: a mock has no foreign key to violate, and
+// the mocked suite proves the guard fires without proving there is anything to
+// guard against.
+test("real PostgreSQL: an unclaimed base is refused rather than violating the permission_actor foreign key", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const db = pgTransactionalDb(pool);
+
+    // First, the constraint really is there and really does reject this write.
+    // Without this the guard below could be passing against a schema that would
+    // have accepted the row anyway -- which is exactly how the bug shipped.
+    await assert.rejects(
+      () => pool.query(
+        "insert into dune.permission_actor_rank (permission_actor_id, player_id, rank) values ($1, 4, $2)",
+        [UNCLAIMED_ACTOR_ID, OWNER_RANK]),
+      /permission_actor_rank_permission_actor_id_fkey/);
+
+    await assert.rejects(
+      () => setBasePermissions(db, UNCLAIMED_BASE_ID, [{ playerId: "4", rank: OWNER_RANK }], 32),
+      /not claimed/);
+    await assert.rejects(
+      () => transferBaseToSystemCustodian(db, UNCLAIMED_BASE_ID, 32),
+      /not claimed/);
+
+    // The rejection must be ours, not PostgreSQL's: an FK error escaping here
+    // would still leave the operator reading constraint names.
+    await assert.rejects(
+      () => setBasePermissions(db, UNCLAIMED_BASE_ID, [{ playerId: "4", rank: OWNER_RANK }], 32),
+      (error) => !/foreign key|fkey/i.test(error.message));
+
+    const written = await pool.query(
+      "select count(*)::int as count from dune.permission_actor_rank where permission_actor_id = $1",
+      [UNCLAIMED_ACTOR_ID]);
+    assert.equal(written.rows[0].count, 0);
+  });
+});
+
+test("real PostgreSQL: an unclaimed base still reads, flagged, so the editor can explain itself", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const db = pgTransactionalDb(pool);
+    const unclaimed = await listBasePermissions(db, UNCLAIMED_BASE_ID);
+    assert.equal(unclaimed.claimed, false);
+    assert.match(unclaimed.unclaimedReason, /not claimed/);
+    assert.deepEqual(unclaimed.entries, []);
+
+    const claimed = await listBasePermissions(db, BASE_ID);
+    assert.equal(claimed.claimed, true);
+    assert.equal(claimed.unclaimedReason, "");
+  });
+});
+
+test("real PostgreSQL: a roster save writes through the shipped procedures with the right argument order", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const db = pgTransactionalDb(pool);
+    const result = await setBasePermissions(db, BASE_ID, [
+      { playerId: "4", rank: OWNER_RANK },
+      { playerId: "23", rank: ASSOCIATE_RANK }
+    ], 32);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.actorId, String(ACTOR_ID));
+    // Transposed arguments would key the row on the player and store the actor
+    // id in player_id -- this is the assertion a mocked test cannot make.
+    assert.deepEqual(await ranks(pool), [
+      { playerId: "4", rank: OWNER_RANK },
+      { playerId: "23", rank: ASSOCIATE_RANK }
+    ]);
+  });
+});
+
+test("real PostgreSQL: promoting swaps the owner without ever leaving two", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const db = pgTransactionalDb(pool);
+    await setBasePermissions(db, BASE_ID, [
+      { playerId: "4", rank: OWNER_RANK },
+      { playerId: "23", rank: CO_OWNER_RANK }
+    ], 32);
+    await setBasePermissions(db, BASE_ID, [
+      { playerId: "23", rank: OWNER_RANK },
+      { playerId: "4", rank: CO_OWNER_RANK }
+    ], 32);
+
+    const rows = await ranks(pool);
+    assert.deepEqual(rows, [
+      { playerId: "23", rank: OWNER_RANK },
+      { playerId: "4", rank: CO_OWNER_RANK }
+    ]);
+    assert.equal(rows.filter((row) => row.rank === OWNER_RANK).length, 1);
+  });
+});
+
+test("real PostgreSQL: removing a player deletes only that rank row", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const db = pgTransactionalDb(pool);
+    await setBasePermissions(db, BASE_ID, [
+      { playerId: "4", rank: OWNER_RANK },
+      { playerId: "23", rank: ASSOCIATE_RANK },
+      { playerId: "29", rank: ASSOCIATE_RANK }
+    ], 32);
+    const result = await setBasePermissions(db, BASE_ID, [
+      { playerId: "4", rank: OWNER_RANK },
+      { playerId: "29", rank: ASSOCIATE_RANK }
+    ], 32);
+
+    assert.equal(result.removed, 1);
+    assert.deepEqual(await ranks(pool), [
+      { playerId: "4", rank: OWNER_RANK },
+      { playerId: "29", rank: ASSOCIATE_RANK }
+    ]);
+  });
+});
+
+// The procedure interpolates its map argument into the payload unquoted. A text
+// map name produces `"Map" : DeepDesert}`, which is not parseable -- so the
+// notification the game receives is only valid if we pass the numeric id.
+test("real PostgreSQL: the emitted notification payload is well-formed JSON carrying the numeric map id", async (t) => {
+  await withDatabase(t, async (pool, database) => {
+    const listener = new Client(pgConnectionConfig(database));
+    const received = [];
+    await listener.connect();
+    listener.on("notification", (message) => received.push(message.payload));
+    await listener.query("listen permission_notify_channel");
+
+    const db = pgTransactionalDb(pool);
+    await setBasePermissions(db, BASE_ID, [
+      { playerId: "4", rank: OWNER_RANK },
+      { playerId: "23", rank: ASSOCIATE_RANK }
+    ], 32);
+
+    // NOTIFY is delivered on commit; give the listener a moment to drain.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await listener.query("select 1");
+    await listener.end();
+
+    const setRank = received.find((payload) => payload.startsWith("set_rank#"));
+    assert.ok(setRank, `expected a set_rank notification, got ${JSON.stringify(received)}`);
+    const body = JSON.parse(setRank.slice("set_rank#".length));
+    assert.equal(body.ActorId, ACTOR_ID);
+    assert.equal(body.PlayerId, 23);
+    assert.equal(body.Rank, ASSOCIATE_RANK);
+    assert.equal(body.Map, MAP_NAME_ID);
+  });
+});
+
+// A rank row written against a non-canonical actor id is accepted by the
+// procedure and then ignored by the game -- a silent no-op that looks like a
+// successful save. Confirmed against a live server before this guard existed.
+test("real PostgreSQL: a player id that is not a player_controller_id is refused", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const db = pgTransactionalDb(pool);
+    await assert.rejects(
+      () => setBasePermissions(db, BASE_ID, [
+        { playerId: "4", rank: OWNER_RANK },
+        { playerId: "5", rank: ASSOCIATE_RANK }
+      ], 32),
+      /not a known player character/);
+    // The rejection must leave the roster untouched, not half-applied.
+    assert.deepEqual(await ranks(pool), [{ playerId: "4", rank: OWNER_RANK }]);
+  });
+});
+
+test("real PostgreSQL: the roster reads back with resolved names and rank labels", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const db = pgTransactionalDb(pool);
+    await setBasePermissions(db, BASE_ID, [
+      { playerId: "4", rank: OWNER_RANK },
+      { playerId: "29", rank: CO_OWNER_RANK }
+    ], 32);
+
+    const roster = await listBasePermissions(db, BASE_ID);
+    assert.equal(roster.actorId, String(ACTOR_ID));
+    assert.equal(roster.mapNameId, MAP_NAME_ID);
+    assert.deepEqual(roster.entries.map((entry) => [entry.name, entry.label, entry.canonical]), [
+      ["DarkShark", "Owner", true],
+      ["Yaida", "Co-Owner", true]
+    ]);
+  });
+});
+
+// listBasePermissions must not silently drop a row the game ignores -- it is the
+// one roster state the console can see and the game client cannot.
+test("real PostgreSQL: a rank row on a non-canonical actor is surfaced, not hidden", async (t) => {
+  await withDatabase(t, async (pool) => {
+    await pool.query("insert into dune.permission_actor_rank (permission_actor_id, player_id, rank) values ($1, 5, $2)",
+      [ACTOR_ID, ASSOCIATE_RANK]);
+    const roster = await listBasePermissions(pgTransactionalDb(pool), BASE_ID);
+    const orphan = roster.entries.find((entry) => entry.playerId === "5");
+    assert.ok(orphan, "the ignored row must still be listed");
+    assert.equal(orphan.canonical, false);
+    // The name still resolves through the account, which is why the console can
+    // show it meaningfully rather than as a bare id.
+    assert.equal(orphan.name, "DarkShark");
+  });
+});
+
+// building_instances.owner_entity_id is nullable in production (ON DELETE SET
+// NULL against fgl_entities), so a base can exist in dune.buildings while its
+// owning entity link is broken. That must surface a distinct, clear error --
+// not the same "not found" message a genuinely deleted base id gets, which
+// would read as a client-side glitch to an operator looking at a base that is
+// plainly visible in the table.
+test("real PostgreSQL: a base with a broken owner-entity link gets a clear error, not 'not found'", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const orphanBaseId = 2000;
+    await pool.query("insert into dune.buildings (id) values ($1)", [orphanBaseId]);
+    await pool.query("insert into dune.building_instances (building_id, instance_id, owner_entity_id) values ($1, 0, null)", [orphanBaseId]);
+
+    const db = pgTransactionalDb(pool);
+    await assert.rejects(
+      () => listBasePermissions(db, orphanBaseId),
+      /no resolvable owner entity/);
+    // A genuinely nonexistent base id must still get the original message --
+    // the left-join restructuring must not blur the two cases together.
+    await assert.rejects(
+      () => listBasePermissions(db, 999999),
+      /That base was not found/);
+  });
+});
+
+// A base can legitimately have several building_instances rows ("pieces") --
+// listBases' piece_count and exportBaseAsBlueprint's multi-piece fetch both
+// depend on that. Before the left-join fix's order by, an orphaned piece
+// could nondeterministically beat a sibling piece that resolves fine. This
+// seeds one orphaned piece alongside the SEED's already-valid piece on the
+// same base and proves resolution is stable regardless of insertion order.
+test("real PostgreSQL: a base with one orphaned piece and one valid piece still resolves the valid one", async (t) => {
+  await withDatabase(t, async (pool) => {
+    // instance_id 1, inserted after the SEED's valid instance_id 0 -- if the
+    // missing order by regressed, an unordered LIMIT 1 could return this one.
+    await pool.query("insert into dune.building_instances (building_id, instance_id, owner_entity_id) values ($1, 1, null)", [BASE_ID]);
+
+    const db = pgTransactionalDb(pool);
+    const roster = await listBasePermissions(db, BASE_ID);
+    assert.equal(roster.actorId, String(ACTOR_ID));
+
+    const location = await baseMapLocation(db, BASE_ID);
+    assert.equal(location.map, MAP_NAME);
+  });
+});
+
+test("real PostgreSQL: baseMapLocation distinguishes a broken owner-entity link from a missing base id", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const orphanBaseId = 2001;
+    await pool.query("insert into dune.buildings (id) values ($1)", [orphanBaseId]);
+    await pool.query("insert into dune.building_instances (building_id, instance_id, owner_entity_id) values ($1, 0, null)", [orphanBaseId]);
+
+    const db = pgTransactionalDb(pool);
+    await assert.rejects(
+      () => baseMapLocation(db, orphanBaseId),
+      /no resolvable owner entity/);
+    await assert.rejects(
+      () => baseMapLocation(db, 999999),
+      /That base was not found/);
+    // The unbroken case is unaffected.
+    const location = await baseMapLocation(db, BASE_ID);
+    assert.equal(location.map, MAP_NAME);
+  });
+});
+
+// A live totem can lose its partition_id (ON DELETE SET NULL against
+// world_partition) while its pieces keep the real one. Reading that as
+// partition 0 made every queued refill "write-safe" and it was applied into the
+// running map, which then overwrote it.
+async function seedNullPartitionBase(pool, { piecePartitions }) {
+  const baseId = 3001;
+  const claimActor = 3004;
+  const entity = 7001;
+  await pool.query("insert into dune.buildings (id) values ($1)", [baseId]);
+  await pool.query("insert into dune.building_instances (building_id, instance_id, owner_entity_id) values ($1, 0, $2)", [baseId, entity]);
+  await pool.query("insert into dune.actor_fgl_entities (entity_id, actor_id) values ($1, $2)", [entity, claimActor]);
+  await pool.query("insert into dune.actors (id, map, partition_id) values ($1, 'HaggaBasin', null)", [claimActor]);
+  for (const [index, partitionId] of piecePartitions.entries()) {
+    const pieceId = 3010 + index;
+    await pool.query("insert into dune.actors (id, map, partition_id) values ($1, 'HaggaBasin', $2)", [pieceId, partitionId]);
+    await pool.query("insert into dune.placeables (id, owner_entity_id, building_type) values ($1, $2, 'fuelgenerator_placeable')", [pieceId, entity]);
+  }
+  return baseId;
+}
+
+test("real PostgreSQL: baseMapLocation falls back to the pieces' partition when the totem's is NULL", async (t) => {
+  await withDatabase(t, async (pool) => {
+    // The majority partition wins, so one stray piece cannot pick the target.
+    const baseId = await seedNullPartitionBase(pool, { piecePartitions: [1, 1, 37, null] });
+    const location = await baseMapLocation(pgTransactionalDb(pool), baseId);
+    assert.deepEqual(location, { map: "HaggaBasin", partitionId: 1 });
+  });
+});
+
+test("real PostgreSQL: baseMapLocation keeps partition 0 when no piece has a partition either", async (t) => {
+  await withDatabase(t, async (pool) => {
+    // A base backup nulls every actor's partition; it is genuinely unsimulated.
+    const baseId = await seedNullPartitionBase(pool, { piecePartitions: [null, null] });
+    const location = await baseMapLocation(pgTransactionalDb(pool), baseId);
+    assert.equal(location.partitionId, 0);
+  });
+});
+
+test("real PostgreSQL: baseMapLocation prefers the totem's own partition over its pieces", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const baseId = await seedNullPartitionBase(pool, { piecePartitions: [1, 1] });
+    await pool.query("update dune.actors set partition_id = 36 where id = 3004");
+    const location = await baseMapLocation(pgTransactionalDb(pool), baseId);
+    assert.equal(location.partitionId, 36);
+  });
+});
+
+test("real PostgreSQL: the candidate picker returns player_controller_ids and excludes system accounts", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const candidates = await basePermissionCandidates(pgTransactionalDb(pool), { limit: 50 });
+    const ids = candidates.map((row) => row.playerId);
+    assert.deepEqual(ids.sort(), ["23", "29", "4"].sort());
+    assert.ok(!candidates.some((row) => row.name === "Server"), "system accounts must not be offered");
+    assert.ok(!candidates.some((row) => row.name === "GM"), "the reserved GM pawn must not be offered");
+    assert.ok(!candidates.some((row) => row.name === "Reserved GM Controller"), "the reserved GM controller must not be offered");
+    // 5 and 6 belong to the same account as 4 but are not controller ids.
+    assert.ok(!ids.includes("5") && !ids.includes("6"));
+  });
+});
+
+test("real PostgreSQL: Server can own a base while the previous roster is preserved", async (t) => {
+  await withDatabase(t, async (pool) => {
+    const db = pgTransactionalDb(pool);
+    const result = await transferBaseToSystemCustodian(db, BASE_ID);
+    assert.equal(result.systemCustodian.playerId, "900000201");
+    assert.deepEqual(await ranks(pool), [
+      { playerId: "900000201", rank: OWNER_RANK },
+      { playerId: "4", rank: CO_OWNER_RANK }
+    ]);
+  });
+});
+
+test("real PostgreSQL: encrypted Funcom GM is used when Server is absent", async (t) => {
+  await withDatabase(t, async (pool) => {
+    await pool.query("delete from dune.player_state where character_name = 'Server'");
+    const db = pgTransactionalDb(pool);
+    const result = await transferBaseToSystemCustodian(db, BASE_ID);
+    assert.deepEqual(result.systemCustodian, { available: true, playerId: "900000101", name: "GM" });
+    assert.match(result.message, /GM system custodian/);
+    assert.deepEqual(await ranks(pool), [
+      { playerId: "900000101", rank: OWNER_RANK },
+      { playerId: "4", rank: CO_OWNER_RANK }
+    ]);
+
+    const roster = await listBasePermissions(db, BASE_ID);
+    const owner = roster.entries.find((entry) => entry.rank === OWNER_RANK);
+    assert.deepEqual([owner.name, owner.playerId, owner.canonical], ["GM", "900000101", true]);
+  });
+});
