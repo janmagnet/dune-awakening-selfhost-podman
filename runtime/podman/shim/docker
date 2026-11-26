@@ -297,6 +297,15 @@ translate_builder() {
   run_podman "${out[@]}"
 }
 
+# `docker volume create` returns the existing volume when the name is taken, and
+# upstream relies on that: start-postgres.sh creates dune-postgres-data on every
+# start. Podman fails unless it is given --ignore (Podman 4.4 and later).
+translate_volume() {
+  [ "${2:-}" = "create" ] || run_podman "$@"
+  shift 2
+  run_podman volume create --ignore "$@"
+}
+
 # Docker reports BuildKit's cache as a "Build Cache" row, and upstream's storage
 # diagnostics require that row. Podman has no separate build cache.
 system_df() {
@@ -364,6 +373,7 @@ main() {
       fi
       ;;
     builder) translate_builder "$@" ;;
+    volume) translate_volume "$@" ;;
     rm | stop | kill | start | restart | pause | unpause) per_container 1 "$@" ;;
     container)
       case "${2:-}" in

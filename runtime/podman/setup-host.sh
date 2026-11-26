@@ -49,7 +49,7 @@ podman_version="$(podman version --format '{{.Client.Version}}' 2>/dev/null || t
 
 step "Podman"
 info "podman $podman_version (rootful)"
-version_at_least "$podman_version" 4.4.0 || info "WARN: Podman 4.4 or newer is recommended."
+version_at_least "$podman_version" 4.4.0 || info "WARN: Podman 4.4 or newer is required; older releases cannot start the stack."
 command -v python3 >/dev/null 2>&1 || info "WARN: python3 is missing; the stack's scripts need it (Fedora CoreOS: rpm-ostree install python3)."
 
 step "Installation owner"

@@ -43,6 +43,7 @@ rewrites those mounts and passes everything else to the image's docker CLI.
 | `sha256:` image IDs from `inspect .Image`, `image inspect .Id` and `image ls --no-trunc` | Bare IDs from `inspect`; upstream compares them to protect in-use images | Adds the `sha256:` prefix |
 | `rm`/`stop`/`kill`/`start`/`restart` act on every named container that exists | The whole batch is skipped when one name is missing | Runs them one container at a time |
 | `builder prune --all` clears the build cache | Deletes every unused tagged image, including the game images | Prunes dangling images only |
+| `volume create` returns the existing volume when the name is taken (`start-postgres.sh` relies on it) | Fails with "volume already exists" | Adds `--ignore` (Podman 4.4+) |
 | `system df` has a `Build Cache` row | No such row; upstream's storage checks need it | Adds an empty row |
 | `docker compose` | Not available | `lib/compose.sh` |
 | Non-root access through the `docker` group | Would silently use the user's rootless Podman | Refuses unless the rootful socket is writable |

@@ -38,6 +38,7 @@ cleanup() {
     podman volume rm --force "${PROJECT}_${volume}" >/dev/null 2>&1 || true
   done
   podman rmi --force localhost/dune-shim-prune-probe:1 >/dev/null 2>&1 || true
+  podman volume rm dune-shim-volume-probe >/dev/null 2>&1 || true
 }
 owner_check_started=0
 owner_repo=""
@@ -98,6 +99,12 @@ docker builder prune --force --all >/dev/null
 check "builder prune keeps tagged images" podman image exists localhost/dune-shim-prune-probe:1
 check "system df reports a Build Cache row" sh -c 'docker system df --format "{{.Type}}|{{.Reclaimable}}" | grep -q "^Build Cache|"'
 check "upstream storage diagnostics run on Podman" runtime/scripts/storage.sh diagnostics
+
+# start-postgres.sh creates dune-postgres-data on every start.
+docker volume create dune-shim-volume-probe >/dev/null
+check "volume create returns an existing volume like Docker" \
+  test "$(docker volume create dune-shim-volume-probe)" = "dune-shim-volume-probe"
+podman volume rm dune-shim-volume-probe >/dev/null
 
 docker create --name dune-shim-restore-probe --restart unless-stopped --entrypoint sleep dune-orchestrator:dev 600 >/dev/null
 runtime/podman/restore-containers.sh >/dev/null

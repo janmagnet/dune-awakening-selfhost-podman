@@ -144,6 +144,14 @@ assert_logged "[image][prune][--force]" "builder prune maps to a dangling-image 
 assert_not_logged "[--all]" "builder prune never removes tagged images"
 
 reset_log
+"$SHIM" volume create dune-postgres-data >/dev/null
+assert_logged "[volume][create][--ignore][dune-postgres-data]" "volume create returns an existing volume like Docker"
+
+reset_log
+"$SHIM" volume inspect -f '{{ .Mountpoint }}' dune-postgres-data >/dev/null
+assert_logged "[volume][inspect][-f][{{ .Mountpoint }}][dune-postgres-data]" "other volume commands pass through"
+
+reset_log
 "$SHIM" rm -f dune-server-overmap dune-server-survival-1
 assert_logged "[rm][-f][dune-server-overmap]" "multi-container rm runs per container"
 assert_logged "[rm][-f][dune-server-survival-1]" "multi-container rm reaches every container"
