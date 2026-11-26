@@ -123,6 +123,19 @@ cat >"$TIMER_DROPIN" <<EOF
 Environment=PATH=$SHIM_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
 info "dune-awakening-*.service units use $SHIM_DIR first on PATH."
+docker_can_start=0
+for unit in docker.socket docker.service; do
+  if systemctl cat "$unit" >/dev/null 2>&1 \
+    && [ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" != "masked" ]; then
+    docker_can_start=1
+  fi
+done
+if [ "$docker_can_start" = 1 ]; then
+  info "NOTE: those units also declare Wants=docker.service, so they can start this host's Docker,"
+  info "which the stack does not use. If nothing else uses it, turn it off with the command below."
+  info "Mask both units: with only docker.service masked, docker.socket fails to start at each boot."
+  info "  sudo systemctl mask --now docker.socket docker.service"
+fi
 
 step "Quadlet units from the previous Podman port"
 removed=0

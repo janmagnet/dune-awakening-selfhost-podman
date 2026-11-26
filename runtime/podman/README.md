@@ -22,16 +22,22 @@ CoreOS ships one) is not used or changed.
 | `restore-containers.sh` | Restarts the stack after a reboot on Podman before 5.8.2. |
 | `tests/` | Shim unit tests and an integration test against real rootful Podman. |
 
-Containers that run upstream scripts themselves (the autoscaler, the
-orchestrator and helper containers) keep upstream's docker CLI and reach Podman
+Containers that run upstream scripts themselves (the autoscaler, the Coriolis
+coordinator and the orchestrator) keep upstream's docker CLI and reach Podman
 through its Docker-compatible API socket, which the shim mounts in place of
-`/var/run/docker.sock`.
+`/var/run/docker.sock`. The autoscaler and the coordinator also start containers
+that mount `/var/run/docker.sock`, for example when a game farm restart
+recreates the autoscaler. Podman resolves that path on the host, where it is
+Docker's socket or missing. So when the shim starts a `dune-orchestrator:dev`
+container with the socket, it also mounts itself there as
+`/usr/local/bin/docker`, in front of the image's `/usr/bin/docker`. There it only
+rewrites those mounts and passes everything else to the image's docker CLI.
 
 ## What the shim translates
 
 | Upstream relies on (Docker) | Podman difference | Shim |
 |---|---|---|
-| `-v /var/run/docker.sock:...` | That path is Docker's own socket, if any | Mounts the Podman API socket and adds its group |
+| `-v /var/run/docker.sock:...` | That path is Docker's own socket, if any | Mounts the Podman API socket and adds its group, also for containers started inside the stack's containers |
 | `inspect` `.State.StartedAt` / `.FinishedAt` in RFC 3339 | Go's default time format, which `date -d` and `logs --since` reject | Formats them as RFC 3339 UTC |
 | `sha256:` image IDs from `inspect .Image`, `image inspect .Id` and `image ls --no-trunc` | Bare IDs from `inspect`; upstream compares them to protect in-use images | Adds the `sha256:` prefix |
 | `rm`/`stop`/`kill`/`start`/`restart` act on every named container that exists | The whole batch is skipped when one name is missing | Runs them one container at a time |
@@ -58,7 +64,10 @@ working.
   Set `DUNE_PODMAN_KEEP_SELINUX_LABELS=1` to skip this;
 - adds `/etc/systemd/system/dune-awakening-.service.d/50-dune-podman.conf` so
   the timers upstream installs (auto-update, scheduled restarts, backups, IP
-  change restart) use the shim;
+  change restart) use the shim. Those units also declare `Wants=docker.service`,
+  so they start Docker on a host that has it (Fedora CoreOS); the script says so
+  and suggests masking `docker.socket` and `docker.service` when nothing else
+  uses Docker;
 - removes the Quadlet units and orchestrator image of the previous version of
   this port.
 
@@ -98,6 +107,7 @@ fork's lines when resolving them:
 | `.env.example` | `HOST_DATACENTER_ID="dune-podman"` |
 | `runtime/scripts/install-command.sh` | Root wrapper that loads the shim; runs `setup-host.sh` |
 | `runtime/scripts/self-update.sh` | Updates come from this fork's releases |
+| `runtime/scripts/dune` | `dune start` skips the web console, which is not ported |
 
 After merging:
 
@@ -105,6 +115,8 @@ After merging:
    `runtime/podman/` and `.github/workflows/podman-port.yml`.
 2. Review new `docker` usage in the merged upstream changes against the table
    above (`git diff ORIG_HEAD HEAD -G 'docker ' -- runtime/scripts orchestrator`).
+   Containers that mount `/var/run/docker.sock` and start containers themselves
+   only get the shim when they use `dune-orchestrator:dev` (see `translate_run`).
 3. If `docker-compose.yml` changed, mirror the change in `lib/compose.sh` and
    update `DUNE_COMPOSE_FILE_SHA256` (`tr -d '\r' < docker-compose.yml | sha256sum`).
 4. Run `bash runtime/podman/tests/shim-test.sh`, and on a disposable host with

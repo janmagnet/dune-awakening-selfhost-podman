@@ -3,7 +3,7 @@
 > [!CAUTION]
 > This is a very early experimental Podman port of the excellent [Dune Awakening Self-Host Docker](https://github.com/Red-Blink/dune-awakening-selfhost-docker) tool by RedBlink. If in doubt then use the original Docker tool instead of this port.
 
-This port follows upstream closely: upstream's scripts run unmodified, and a small Podman layer in [`runtime/podman/`](runtime/podman/README.md) routes their `docker` calls to rootful Podman.
+This port follows upstream closely: upstream's scripts run almost unmodified, and a small Podman layer in [`runtime/podman/`](runtime/podman/README.md) routes their `docker` calls to rootful Podman.
 
 ![Podman](https://img.shields.io/badge/Podman-ready-brightgreen)
 ![Linux](https://img.shields.io/badge/Linux-supported-brightgreen)
@@ -35,7 +35,7 @@ This project is unofficial. It is not affiliated with, endorsed by, sponsored by
 |---|---|
 | Linux server | Fedora CoreOS or any systemd Linux with rootful Podman. Ubuntu 24.04 also works. |
 | Podman 4.4+ | Podman runs the server containers as root. A Docker installation on the same host is left alone. |
-| python3 on the host | Used by setup, world/sietch state, and admin tools. Standard library only (no pip). |
+| python3 on the host | Used by setup, world/sietch state, and admin tools. Standard library only (no pip). Fedora CoreOS does not ship it: `sudo rpm-ostree install python3`, then reboot. |
 | Funcom self-host token | Required to authenticate your self-host server. |
 | CPU with AVX and AVX2 | Required by the game server. |
 | Disk space | 200 GB or more recommended. |
@@ -444,7 +444,9 @@ dune restart-schedule disable
 
 ## How The Podman Port Works
 
-The stack runs on rootful Podman. Upstream's scripts call `docker`; the `dune` command puts a small `docker` shim first on `PATH`, which runs `podman` and translates only the behaviour that differs between the two (for example, timestamp formats and batch container removal). Containers that manage the stack themselves (orchestrator, autoscaler) reach Podman through its Docker-compatible API socket. A Docker installation on the same host is never used. See [`runtime/podman/README.md`](runtime/podman/README.md) for the full list of translations.
+The stack runs on rootful Podman. Upstream's scripts call `docker`; the `dune` command puts a small `docker` shim first on `PATH`, which runs `podman` and translates only the behaviour that differs between the two (for example, timestamp formats and batch container removal). Containers that manage the stack themselves (orchestrator, autoscaler, Coriolis coordinator) reach Podman through its Docker-compatible API socket, and so do the containers they start. A Docker installation on the same host is never used. See [`runtime/podman/README.md`](runtime/podman/README.md) for the full list of translations.
+
+Fedora CoreOS ships Docker, which starts on demand. Upstream's optional systemd timers (auto-update, scheduled restarts, backups, IP-change restart) declare `Wants=docker.service`, so they start Docker when they run. If nothing else on the host uses Docker, turn it off with `sudo systemctl mask --now docker.socket docker.service`. Mask both units: with only `docker.service` masked, `docker.socket` fails to start at every boot. `sudo systemctl unmask docker.socket docker.service` undoes it.
 
 Containers use restart policies like upstream's Docker setup: they restart when they stop unexpectedly, and `podman-restart.service` (plus `dune-podman-restore.service` on Podman before 5.8.2) starts them again after a reboot.
 

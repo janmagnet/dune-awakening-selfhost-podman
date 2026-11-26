@@ -89,6 +89,37 @@ reset_log
 assert_not_logged "[--group-add]" "runs without the socket keep their groups"
 
 reset_log
+"$SHIM" run -d -v /var/run/docker.sock:/var/run/docker.sock dune-orchestrator:dev runtime/scripts/autoscaler.sh
+assert_logged "[run][--group-add][$SOCKET_GID][--volume][$SHIM:/usr/local/bin/docker:ro][--env][DUNE_PODMAN_HOST_SHIM=$SHIM][--env][DUNE_PODMAN_SOCKET=$SOCKET][--env][DUNE_PODMAN_SOCKET_GID=$SOCKET_GID][-d]" \
+  "the stack's containers get the shim as their docker command"
+
+# Inside those containers the shim is first on PATH, in front of the image's docker CLI.
+SHIM_BIN="$WORK/shim-bin"
+CONTAINER_BIN="$WORK/container-bin"
+mkdir -p "$SHIM_BIN" "$CONTAINER_BIN"
+ln -s "$SHIM" "$SHIM_BIN/docker"
+cat >"$CONTAINER_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '[%s]' image-docker "$@" >>"$FAKE_PODMAN_LOG"
+printf '\n' >>"$FAKE_PODMAN_LOG"
+EOF
+chmod 755 "$CONTAINER_BIN/docker"
+in_container() {
+  env DUNE_PODMAN_HOST_SHIM=/srv/dune/runtime/podman/shim/docker DUNE_PODMAN_SOCKET=/run/podman/podman.sock \
+    DUNE_PODMAN_SOCKET_GID=0 PATH="$SHIM_BIN:$CONTAINER_BIN:/usr/bin:/bin" docker "$@"
+}
+
+reset_log
+in_container run -d --user 1000:1000 -v /var/run/docker.sock:/var/run/docker.sock dune-orchestrator:dev runtime/scripts/autoscaler.sh
+assert_logged "[image-docker][run][--group-add][0][--volume][/srv/dune/runtime/podman/shim/docker:/usr/local/bin/docker:ro][--env][DUNE_PODMAN_HOST_SHIM=/srv/dune/runtime/podman/shim/docker][--env][DUNE_PODMAN_SOCKET=/run/podman/podman.sock][--env][DUNE_PODMAN_SOCKET_GID=0][-d][--user][1000:1000][-v][/run/podman/podman.sock:/var/run/docker.sock][dune-orchestrator:dev][runtime/scripts/autoscaler.sh]" \
+  "containers started inside a stack container mount the Podman socket's host path"
+
+reset_log
+in_container inspect -f '{{.State.StartedAt}}' dune-autoscaler
+assert_logged "[image-docker][inspect][-f][{{.State.StartedAt}}][dune-autoscaler]" \
+  "inside a container other commands reach the image's docker CLI unchanged"
+
+reset_log
 "$SHIM" inspect -f '{{.State.Running}}|{{.State.StartedAt}}' c1
 assert_logged '[inspect][-f][{{.State.Running}}|{{(.State.StartedAt.UTC.Format "2006-01-02T15:04:05.999999999Z07:00")}}][c1]' \
   "StartedAt is printed in Docker's RFC 3339 form"

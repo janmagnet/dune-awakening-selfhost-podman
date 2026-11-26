@@ -6,17 +6,26 @@
 # the upstream scripts can stay unmodified. Only behaviour that differs between
 # Docker and Podman is translated here; everything else goes to podman as is.
 # Nothing here talks to a Docker daemon that may also exist on the host.
+#
+# The stack's own containers that run upstream scripts get this file as their
+# docker command too (see translate_run). There it only routes docker.sock
+# mounts and leaves everything else to the image's docker CLI, which already
+# behaves like Docker against Podman's Docker-compatible API.
 set -euo pipefail
 
 DUNE_PODMAN_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../.." && pwd -P)"
 DUNE_PODMAN_SOCKET="${DUNE_PODMAN_SOCKET:-/run/podman/podman.sock}"
+# Set only inside the stack's containers, to this file's path on the host.
+DUNE_PODMAN_HOST_SHIM="${DUNE_PODMAN_HOST_SHIM:-}"
 
 # Nested `docker` calls (for example from upstream's compose-project.sh) must
 # come back through this shim.
-case "$PATH" in
-  "$DUNE_PODMAN_ROOT/runtime/podman/shim":*) ;;
-  *) export PATH="$DUNE_PODMAN_ROOT/runtime/podman/shim:$PATH" ;;
-esac
+if [ -z "$DUNE_PODMAN_HOST_SHIM" ]; then
+  case "$PATH" in
+    "$DUNE_PODMAN_ROOT/runtime/podman/shim":*) ;;
+    *) export PATH="$DUNE_PODMAN_ROOT/runtime/podman/shim:$PATH" ;;
+  esac
+fi
 
 # Docker prints container timestamps as RFC 3339 in UTC; Podman's templates
 # print Go's default time format, which date(1) and `logs --since` reject.
@@ -45,11 +54,30 @@ resolve_podman() {
   shim_die 125 "this stack runs on rootful Podman, which needs root. Run the dune command with sudo (for example: sudo dune status)."
 }
 
+# Inside a container this file is /usr/local/bin/docker; podman_cmd becomes the
+# image's own docker CLI, found further down PATH.
+resolve_container_docker() {
+  local dir
+  local IFS=:
+  for dir in $PATH; do
+    if [ -x "$dir/docker" ] && [ ! "$dir/docker" -ef "${BASH_SOURCE[0]}" ]; then
+      podman_cmd=("$dir/docker")
+      return 0
+    fi
+  done
+  shim_die 127 "no docker CLI was found in this container."
+}
+
 run_podman() {
   exec "${podman_cmd[@]}" "$@"
 }
 
 podman_socket_gid() {
+  if [ -n "$DUNE_PODMAN_HOST_SHIM" ]; then
+    [ -n "${DUNE_PODMAN_SOCKET_GID:-}" ] || shim_die 125 "DUNE_PODMAN_SOCKET_GID is not set in this container."
+    printf '%s' "$DUNE_PODMAN_SOCKET_GID"
+    return 0
+  fi
   if [ ! -S "$DUNE_PODMAN_SOCKET" ] && [ "$(id -u)" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
     systemctl start podman.socket >/dev/null 2>&1 || true
   fi
@@ -60,7 +88,9 @@ podman_socket_gid() {
 
 # Containers that mount Docker's socket get the Podman API socket instead. On a
 # host that also has Docker (for example Fedora CoreOS), /var/run/docker.sock is
-# Docker's own socket and must not be handed to the stack.
+# Docker's own socket and must not be handed to the stack. Podman resolves bind
+# mount sources on the host, so containers started from inside a container need
+# the same rewrite.
 rewrite_socket_volume() {
   case "$1" in
     /var/run/docker.sock:* | /run/docker.sock:*)
@@ -91,7 +121,7 @@ translate_run() {
   local words="$1"
   shift
   local -a head=("${@:1:$words}") out=()
-  local arg value rewritten socket_mounted=0 gid
+  local arg value rewritten socket_mounted=0 stack_image=0 gid host_shim
   shift "$words"
   while [ "$#" -gt 0 ]; do
     arg="$1"
@@ -131,6 +161,10 @@ translate_run() {
         fi
         out+=("--mount=$value")
         ;;
+      dune-orchestrator:dev | localhost/dune-orchestrator:dev)
+        stack_image=1
+        out+=("$arg")
+        ;;
       *) out+=("$arg") ;;
     esac
   done
@@ -139,6 +173,19 @@ translate_run() {
     # Docker's socket. Keep socket access for non-root container users.
     gid="$(podman_socket_gid)" || exit $?
     head+=(--group-add "$gid")
+    # Upstream's scripts in these containers (the autoscaler and the Coriolis
+    # coordinator) start containers that mount docker.sock themselves, for
+    # example when a game farm restart recreates the autoscaler. The image keeps
+    # its docker CLI in /usr/bin, so this shim goes in front of it.
+    if [ "$stack_image" = 1 ]; then
+      host_shim="${DUNE_PODMAN_HOST_SHIM:-$DUNE_PODMAN_ROOT/runtime/podman/shim/docker}"
+      head+=(
+        --volume "$host_shim:/usr/local/bin/docker:ro"
+        --env "DUNE_PODMAN_HOST_SHIM=$host_shim"
+        --env "DUNE_PODMAN_SOCKET=$DUNE_PODMAN_SOCKET"
+        --env "DUNE_PODMAN_SOCKET_GID=$gid"
+      )
+    fi
   fi
   run_podman "${head[@]}" "${out[@]}"
 }
@@ -286,6 +333,18 @@ system_df() {
 }
 
 main() {
+  if [ -n "$DUNE_PODMAN_HOST_SHIM" ]; then
+    resolve_container_docker
+    case "${1:-}" in
+      run | create) translate_run 1 "$@" ;;
+      container)
+        case "${2:-}" in
+          run | create) translate_run 2 "$@" ;;
+        esac
+        ;;
+    esac
+    run_podman "$@"
+  fi
   resolve_podman
   [ "$#" -gt 0 ] || run_podman
   case "$1" in

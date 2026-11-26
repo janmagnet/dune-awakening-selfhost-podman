@@ -257,7 +257,8 @@ EOF
   start)
     rm -f runtime/generated/manual-stop.env
     start_compose_service_if_available docker-compose.yml orchestrator
-    start_compose_service_if_available docker-compose.web.yml redblink-dune-docker-console web
+    # Podman port: the web console is not ported, so it must not stop the stack from starting.
+    [ -e runtime/podman/shim/docker ] || start_compose_service_if_available docker-compose.web.yml redblink-dune-docker-console web
     DUNE_IGNORE_MANUAL_STOP=1 runtime/scripts/start-all.sh
     ;;
 

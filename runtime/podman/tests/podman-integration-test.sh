@@ -69,6 +69,12 @@ check "upstream resolves the project from the emulated volumes and labels" \
   test "$(env -u COMPOSE_PROJECT_NAME bash -c '. runtime/scripts/compose-project.sh; dune_resolve_compose_project_name "$PWD"')" = "$PROJECT"
 check "a non-root container that mounts docker.sock reaches Podman" \
   sh -c 'docker run --rm --user 1000:1000 --entrypoint docker -v /var/run/docker.sock:/var/run/docker.sock dune-orchestrator:dev ps --filter "name=^/dune-orchestrator\$" --format "{{.Names}}" | grep -qx dune-orchestrator'
+# The autoscaler and the Coriolis coordinator start containers that mount
+# docker.sock from inside their own container (for example when a game farm
+# restart recreates the autoscaler).
+nested_ps='docker run --rm --entrypoint docker -v /var/run/docker.sock:/var/run/docker.sock dune-orchestrator:dev ps --filter name=^/dune-orchestrator$ --format {{.Names}}'
+check "a container started from inside a stack container reaches Podman" \
+  sh -c "docker run --rm --user 1000:1000 --entrypoint bash -v /var/run/docker.sock:/var/run/docker.sock dune-orchestrator:dev -lc '$nested_ps' | grep -qx dune-orchestrator"
 
 started="$(docker inspect -f '{{.State.StartedAt}}' dune-orchestrator)"
 check "StartedAt uses Docker's RFC 3339 form ($started)" grep -Eqx '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9.]+Z' <<<"$started"
