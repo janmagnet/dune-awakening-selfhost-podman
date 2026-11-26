@@ -64,7 +64,7 @@ The installer creates `/usr/local/bin/dune`, so you can run `dune manager` from 
 
 It also prepares the host for rootful Podman: it enables the Podman API socket, makes sure the server containers come back after a reboot, and (on SELinux hosts such as Fedora CoreOS) turns off SELinux label separation for Podman containers. It does not install a `docker` command. Re-running it is safe. See [`runtime/podman/README.md`](runtime/podman/README.md) for details.
 
-`dune` always runs as root and re-runs itself with `sudo` when needed.
+`dune` always runs as root and re-runs itself with `sudo` when needed. Because of that, the installer also makes root the owner of the checkout directory, so use `sudo` for git in it from then on (for example `sudo git pull`).
 
 Do not use upstream's `install.sh` or `bootstrap.sh`: they install Docker and upstream's web console.
 
@@ -718,6 +718,7 @@ Common problems:
 | Services stuck warming | Wait several minutes, then run `dune ready` and check Director/Gateway/map logs. |
 | Runtime map picker missing | Manager -> Updates -> Runtime Files Status, then Repair Runtime Files. |
 | Permission issues with `dune` | `dune` re-runs itself with `sudo`; reinstall it with `sudo runtime/scripts/install-command.sh`. |
+| The autoscaler keeps restarting with `touch: cannot touch 'runtime/generated/...': Permission denied` | The checkout belongs to a regular user, so upstream runs the autoscaler as that user while `dune` gives `runtime/` to root. Run `sudo runtime/scripts/install-command.sh` (it makes root the owner), then `dune stop` and `dune start`. |
 | A script reached Docker instead of Podman | Run commands through `dune`. Running `runtime/scripts/*` directly bypasses the Podman layer. |
 | `... is not supported by the Podman port` | The web console and its Compose add-ons are not ported yet. |
 | Raw logs requested | Be careful; raw logs can contain tokens or player identifiers. |

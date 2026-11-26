@@ -17,6 +17,7 @@ CoreOS ships one) is not used or changed.
 |---|---|
 | `shim/docker` | The `docker` command for the stack: runs `podman`, translating only what behaves differently (below). |
 | `lib/compose.sh` | `docker compose` for the one Compose service the stack uses: the orchestrator in `docker-compose.yml`. |
+| `lib/owner.sh` | Makes root the installation owner (used by `setup-host.sh`). |
 | `path.sh` | Puts the shim on `PATH` (sourced by the `dune` wrapper). |
 | `setup-host.sh` | Host integration, run by `install-command.sh`. |
 | `restore-containers.sh` | Restarts the stack after a reboot on Podman before 5.8.2. |
@@ -56,6 +57,13 @@ working.
 `setup-host.sh` is idempotent; `install-command.sh` runs it. It:
 
 - enables `podman.socket` and `podman-restart.service`;
+- makes root the owner of the checkout directory and its `.git`, and sets
+  `DUNE_HOST_UID` and `DUNE_HOST_GID` in `.env` to 0. Upstream runs the
+  autoscaler, the Coriolis coordinator, scheduled restarts and backups as the
+  checkout's owner, while the `dune` command here runs as root (and `dune init`
+  gives `runtime/` to root), so a checkout cloned by a regular user would leave
+  those unable to write their files or reach Podman. Upstream gives `runtime/`
+  to the new owner at the next start; game saves keep their owners;
 - on Podman before 5.8.2, installs `dune-podman-restore.service`, because those
   releases do not restart `--restart unless-stopped` containers after a reboot;
 - on SELinux hosts, disables container label separation for Podman

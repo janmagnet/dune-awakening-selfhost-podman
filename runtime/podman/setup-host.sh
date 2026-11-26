@@ -41,6 +41,8 @@ command -v podman >/dev/null 2>&1 || die "podman was not found. Install Podman 4
 if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
   die "systemd is required."
 fi
+# shellcheck source=runtime/podman/lib/owner.sh
+. "$ROOT_DIR/runtime/podman/lib/owner.sh"
 
 podman_version="$(podman version --format '{{.Client.Version}}' 2>/dev/null || true)"
 [ -n "$podman_version" ] || die "could not run 'podman version' as root."
@@ -49,6 +51,9 @@ step "Podman"
 info "podman $podman_version (rootful)"
 version_at_least "$podman_version" 4.4.0 || info "WARN: Podman 4.4 or newer is recommended."
 command -v python3 >/dev/null 2>&1 || info "WARN: python3 is missing; the stack's scripts need it (Fedora CoreOS: rpm-ostree install python3)."
+
+step "Installation owner"
+dune_podman_make_root_owner "$ROOT_DIR"
 
 step "Podman API socket"
 systemctl enable --now podman.socket >/dev/null 2>&1 \

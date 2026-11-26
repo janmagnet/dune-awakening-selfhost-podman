@@ -30,11 +30,17 @@ fi
 
 cleanup() {
   podman rm --force --time 0 dune-orchestrator dune-shim-restore-probe >/dev/null 2>&1 || true
+  if [ "$owner_check_started" = 1 ]; then
+    podman rm --force --time 0 dune-autoscaler dune-director dune-postgres >/dev/null 2>&1 || true
+  fi
+  [ -z "$owner_repo" ] || rm -rf "$owner_repo"
   for volume in dune-server dune-steam dune-cache dune-generated dune-work; do
     podman volume rm --force "${PROJECT}_${volume}" >/dev/null 2>&1 || true
   done
   podman rmi --force localhost/dune-shim-prune-probe:1 >/dev/null 2>&1 || true
 }
+owner_check_started=0
+owner_repo=""
 trap cleanup EXIT
 
 systemctl start podman.socket >/dev/null 2>&1 || true
@@ -104,6 +110,46 @@ check "boot restore leaves operator-stopped containers alone" \
 docker rm -f dune-shim-missing dune-shim-restore-probe >/dev/null 2>&1 || true
 check "rm -f removes existing containers when another named one is missing" \
   sh -c '! podman container exists dune-shim-restore-probe'
+
+# A checkout cloned by a regular user. Upstream runs the autoscaler as the owner
+# of the checkout, while dune init, which runs as root here, gives runtime/ to
+# root (DUNE_HOST_UID=0); host setup makes root the owner so that both agree.
+if podman container exists dune-autoscaler || podman container exists dune-director \
+  || podman container exists dune-postgres; then
+  echo "SKIP the autoscaler ownership checks: a dune-autoscaler, dune-director or dune-postgres container exists."
+else
+  owner_repo="$(mktemp -d)"
+  mkdir -p "$owner_repo/runtime" "$owner_repo/.git"
+  cp -a runtime/scripts runtime/podman "$owner_repo/runtime/"
+  printf 'SERVER_IP=127.0.0.1\nDUNE_HOST_UID=1000\nDUNE_HOST_GID=1000\n' >"$owner_repo/.env"
+  chown -R 1000:1000 "$owner_repo"
+  # shellcheck source=runtime/podman/lib/owner.sh
+  . runtime/podman/lib/owner.sh
+  dune_podman_make_root_owner "$owner_repo" >/dev/null
+  check "host setup makes root the owner of a user's checkout" \
+    test "$(stat -c '%u:%g' "$owner_repo" "$owner_repo/.git" | sort -u)" = "0:0"
+  check "host setup points DUNE_HOST_UID and DUNE_HOST_GID at root" \
+    test "$(grep -c -x -E 'DUNE_HOST_[UG]ID=0' "$owner_repo/.env")" = 2
+
+  owner_check_started=1
+  podman run -d --name dune-director --entrypoint sleep dune-orchestrator:dev infinity >/dev/null
+  podman run -d --name dune-postgres --entrypoint sleep dune-orchestrator:dev infinity >/dev/null
+  # shellcheck disable=SC2016 # Expanded by the inner bash.
+  check "upstream's dune init steps start the autoscaler in that checkout" \
+    bash -c 'cd "$1" && export DUNE_HOST_UID=0 DUNE_HOST_GID=0 \
+      && runtime/scripts/repair-host-runtime-permissions.sh \
+      && DUNE_RUNTIME_PERMISSIONS_REPAIRED=1 runtime/scripts/start-autoscaler.sh' _ "$owner_repo"
+  check "the autoscaler runs as root" test "$(podman inspect -f '{{.Config.User}}' dune-autoscaler 2>/dev/null)" = "0:0"
+  # The autoscaler creates its state files when it starts; this is the step
+  # that failed with Permission denied.
+  for _ in $(seq 1 30); do
+    [ ! -e "$owner_repo/runtime/generated/autoscaler-director-heal.tsv" ] || break
+    sleep 1
+  done
+  check "the autoscaler can write its runtime files" test -e "$owner_repo/runtime/generated/autoscaler-director-heal.tsv"
+  podman rm --force --time 0 dune-autoscaler dune-director dune-postgres >/dev/null
+  owner_check_started=0
+fi
 
 docker compose down >/dev/null 2>&1
 check "compose down removes the orchestrator" sh -c '! podman container exists dune-orchestrator'
