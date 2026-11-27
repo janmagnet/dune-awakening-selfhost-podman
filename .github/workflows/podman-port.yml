@@ -16,8 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Lint the Podman port scripts
-        run: shellcheck -x runtime/podman/shim/docker runtime/podman/lib/*.sh runtime/podman/*.sh runtime/podman/tests/*.sh runtime/scripts/install-command.sh
+        run: shellcheck -x runtime/podman/shim/docker runtime/podman/shim/ss runtime/podman/lib/*.sh runtime/podman/*.sh runtime/podman/tests/*.sh runtime/scripts/install-command.sh
       - name: Test the docker shim
         run: bash runtime/podman/tests/shim-test.sh
+      - name: Test the ss shim
+        run: bash runtime/podman/tests/ss-shim-test.sh
       - name: Test the docker shim against rootful Podman
         run: sudo bash runtime/podman/tests/podman-integration-test.sh

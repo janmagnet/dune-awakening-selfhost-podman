@@ -29,7 +29,7 @@ if podman container exists dune-orchestrator \
 fi
 
 cleanup() {
-  podman rm --force --time 0 dune-orchestrator dune-shim-restore-probe >/dev/null 2>&1 || true
+  podman rm --force --time 0 dune-orchestrator dune-shim-restore-probe dune-shim-port-probe >/dev/null 2>&1 || true
   if [ "$owner_check_started" = 1 ]; then
     podman rm --force --time 0 dune-autoscaler dune-director dune-postgres >/dev/null 2>&1 || true
   fi
@@ -105,6 +105,14 @@ docker volume create dune-shim-volume-probe >/dev/null
 check "volume create returns an existing volume like Docker" \
   test "$(docker volume create dune-shim-volume-probe)" = "dune-shim-volume-probe"
 podman volume rm dune-shim-volume-probe >/dev/null
+
+# Rootful Podman publishes ports without a listening socket; upstream's status
+# checks find them through the ss shim (path.sh puts it first on PATH).
+docker run -d --name dune-shim-port-probe -p 127.0.0.1:39871:80/tcp --entrypoint sleep dune-orchestrator:dev 600 >/dev/null
+check "ss lists a published TCP port as listening" sh -c 'ss -lntp | grep -q ":39871 "'
+check "ss lists each published port once" test "$(ss -lntp | grep -c ':39871 ')" = 1
+podman rm --force --time 0 dune-shim-port-probe >/dev/null
+check "ss drops the port once its container is gone" sh -c '! ss -lntp | grep -q ":39871 "'
 
 docker create --name dune-shim-restore-probe --restart unless-stopped --entrypoint sleep dune-orchestrator:dev 600 >/dev/null
 runtime/podman/restore-containers.sh >/dev/null

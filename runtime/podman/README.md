@@ -16,6 +16,7 @@ CoreOS ships one) is not used or changed.
 | File | Purpose |
 |---|---|
 | `shim/docker` | The `docker` command for the stack: runs `podman`, translating only what behaves differently (below). |
+| `shim/ss` | The `ss` command for the stack: lists ports published by running containers as listening TCP sockets (below). |
 | `lib/compose.sh` | `docker compose` for the one Compose service the stack uses: the orchestrator in `docker-compose.yml`. |
 | `lib/owner.sh` | Makes root the installation owner (used by `setup-host.sh`). |
 | `path.sh` | Puts the shim on `PATH` (sourced by the `dune` wrapper). |
@@ -46,6 +47,7 @@ rewrites those mounts and passes everything else to the image's docker CLI.
 | `volume create` returns the existing volume when the name is taken (`start-postgres.sh` relies on it) | Fails with "volume already exists" | Adds `--ignore` (Podman 4.4+) |
 | `system df` has a `Build Cache` row | No such row; upstream's storage checks need it | Adds an empty row |
 | `docker compose` | Not available | `lib/compose.sh` |
+| A published port has a listening socket (`docker-proxy`); `dune status`, `ready`, `doctor` and the ping diagnostics look for it with `ss -lntp` | Published ports are nftables forwarding rules with no socket, so those checks report them MISSING | `shim/ss` adds a LISTEN row for each TCP port a running container publishes |
 | Non-root access through the `docker` group | Would silently use the user's rootless Podman | Refuses unless the rootful socket is writable |
 
 Everything else is passed to `podman` unchanged. The compose emulation runs the

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# ss shim for the Podman port.
+#
+# Upstream's status, readiness and diagnostics scripts (status.sh, ready.sh,
+# doctor.sh, ping-diagnostics.sh, start-all.sh) decide whether a published TCP
+# port is up (RabbitMQ, Postgres, TextRouter, Director) by looking for its
+# listening socket in `ss -lntp` output. Docker's userland proxy holds such a
+# socket for every published port. Rootful Podman forwards published ports with
+# nftables rules instead, so no socket exists and those checks report the ports
+# as MISSING while they work.
+#
+# When ss is asked for listening TCP sockets, this shim adds a LISTEN row for
+# every TCP port a running container publishes that no real socket already
+# covers. Any other ss call, and the real rows, are left unchanged. The dune
+# command puts this directory first on PATH (see runtime/podman/path.sh).
+set -euo pipefail
+
+SHIM_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+
+real_ss() {
+  local dir
+  local IFS=:
+  for dir in $PATH; do
+    if [ -x "$dir/ss" ] && [ ! "$dir/ss" -ef "${BASH_SOURCE[0]}" ]; then
+      printf '%s' "$dir/ss"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# True for option-only calls that select listening TCP sockets (-lntp, -tl,
+# --listening --tcp). Calls with a filter expression or other operands are
+# left alone, because added rows would not honour the filter.
+lists_tcp_listeners() {
+  local arg listening=0 tcp=0
+  for arg in "$@"; do
+    case "$arg" in
+      --listening) listening=1 ;;
+      --tcp) tcp=1 ;;
+      --*) ;;
+      -*)
+        [[ "$arg" == *l* ]] && listening=1
+        [[ "$arg" == *t* ]] && tcp=1
+        ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$listening" = 1 ] && [ "$tcp" = 1 ]
+}
+
+# Prints "address port container" for every published TCP host port of the
+# running containers. Podman lists them as, for example,
+# "0.0.0.0:31982->5672/tcp, 127.0.0.1:7000-7001->7000-7001/tcp".
+published_tcp_ports() {
+  local name ports mapping host range address first last port
+  local -a mappings
+  "$SHIM_DIR/docker" ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null |
+    while IFS='|' read -r name ports; do
+      IFS=',' read -ra mappings <<<"$ports"
+      for mapping in "${mappings[@]}"; do
+        mapping="${mapping// /}"
+        [[ "$mapping" == *'->'*'/tcp' ]] || continue
+        host="${mapping%%->*}"
+        range="${host##*:}"
+        address="${host%:*}"
+        if [ "$address" = "$host" ] || [ -z "$address" ]; then
+          address="0.0.0.0"
+        fi
+        first="${range%-*}"
+        last="${range#*-}"
+        [[ "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ ]] || continue
+        for ((port = first; port <= last; port++)); do
+          printf '%s %s %s\n' "$address" "$port" "$name"
+        done
+      done
+    done
+}
+
+ss_bin="$(real_ss)" || {
+  printf 'ss (dune Podman shim): ss was not found in PATH.\n' >&2
+  exit 127
+}
+lists_tcp_listeners "$@" || exec "$ss_bin" "$@"
+
+status=0
+output="$("$ss_bin" "$@")" || status=$?
+[ -z "$output" ] || printf '%s\n' "$output"
+[ "$status" -eq 0 ] || exit "$status"
+
+# Without access to Podman (no root) only the real rows are printed.
+published="$(published_tcp_ports || true)"
+while read -r address port container; do
+  [ -n "$port" ] || continue
+  # Same port test as upstream's checks: a real socket already covers it.
+  grep -Eq "[:.]${port}[[:space:]]" <<<"$output" && continue
+  peer="0.0.0.0:*"
+  [[ "$address" == \[* ]] && peer="[::]:*"
+  row="$(printf 'LISTEN 0      4096   %s:%s   %s   users:(("podman",container=%s))' \
+    "$address" "$port" "$peer" "$container")"
+  printf '%s\n' "$row"
+  output+=$'\n'"$row"
+done <<<"$published"
